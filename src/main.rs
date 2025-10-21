@@ -16,7 +16,10 @@ async fn main() {
     init_tracing();
 
     let cfg = AppCfg::from_env();
-    fs::create_dir_all(&cfg.cache_dir).expect("create cache dir");
+    
+    // Create cache directories
+    fs::create_dir_all(cfg.cache_dir.join("original")).expect("create original cache dir");
+    fs::create_dir_all(cfg.cache_dir.join("processed")).expect("create processed cache dir");
 
     let bind_addr = cfg.bind_addr.clone();
     let state = AppState::new(cfg.clone());

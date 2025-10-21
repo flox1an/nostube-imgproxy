@@ -101,8 +101,9 @@ pub fn parse_rest(rest: &str) -> Result<(Directives, String), SvcError> {
         }
     }
 
-    if resize.w == 0 || resize.h == 0 {
-        return Err(SvcError::BadRequest("missing resize dimensions"));
+    // At least one dimension must be specified
+    if resize.w == 0 && resize.h == 0 {
+        return Err(SvcError::BadRequest("at least one dimension required"));
     }
 
     // Decode percent-encoded source URL
@@ -121,7 +122,7 @@ pub fn parse_rest(rest: &str) -> Result<(Directives, String), SvcError> {
     ))
 }
 
-/// Parse a resize directive like "fill:480:480" or "fit:800:600"
+/// Parse a resize directive like "fill:480:480", "fit:800:600", "fit::600", or "fit:800:"
 fn parse_resize_directive(arg: &str) -> Result<Resize, SvcError> {
     let parts: Vec<&str> = arg.split(':').collect();
     if parts.len() != 3 {
@@ -137,12 +138,22 @@ fn parse_resize_directive(arg: &str) -> Result<Resize, SvcError> {
         _ => return Err(SvcError::BadRequest("unsupported resize mode")),
     };
 
-    let w: u32 = parts[1]
-        .parse()
-        .map_err(|_| SvcError::BadRequest("bad width"))?;
-    let h: u32 = parts[2]
-        .parse()
-        .map_err(|_| SvcError::BadRequest("bad height"))?;
+    // Parse width and height, allowing empty strings (0 means "calculate from aspect ratio")
+    let w: u32 = if parts[1].is_empty() {
+        0
+    } else {
+        parts[1]
+            .parse()
+            .map_err(|_| SvcError::BadRequest("bad width"))?
+    };
+    
+    let h: u32 = if parts[2].is_empty() {
+        0
+    } else {
+        parts[2]
+            .parse()
+            .map_err(|_| SvcError::BadRequest("bad height"))?
+    };
 
     Ok(Resize { mode, w, h })
 }
@@ -150,8 +161,9 @@ fn parse_resize_directive(arg: &str) -> Result<Resize, SvcError> {
 /// Apply resize transformation based on the resize mode
 pub fn apply_resize(img: DynamicImage, resize: &Resize) -> DynamicImage {
     let (src_w, src_h) = img.dimensions();
-    let target_w = resize.w;
-    let target_h = resize.h;
+    
+    // Calculate missing dimension based on aspect ratio
+    let (target_w, target_h) = calculate_dimensions(src_w, src_h, resize.w, resize.h);
 
     // Determine the actual mode for 'auto'
     let mode = match resize.mode {
@@ -173,6 +185,26 @@ pub fn apply_resize(img: DynamicImage, resize: &Resize) -> DynamicImage {
         ResizeMode::FillDown => apply_resize_fill_down(img, target_w, target_h),
         ResizeMode::Force => apply_resize_force(img, target_w, target_h),
         ResizeMode::Auto => unreachable!(), // Already resolved above
+    }
+}
+
+/// Calculate target dimensions, filling in missing dimension based on aspect ratio
+fn calculate_dimensions(src_w: u32, src_h: u32, target_w: u32, target_h: u32) -> (u32, u32) {
+    match (target_w, target_h) {
+        (0, 0) => (src_w, src_h), // Both 0: keep original (shouldn't happen due to validation)
+        (0, h) => {
+            // Width is 0: calculate from height maintaining aspect ratio
+            let aspect = src_w as f32 / src_h as f32;
+            let w = (h as f32 * aspect).round() as u32;
+            (w, h)
+        }
+        (w, 0) => {
+            // Height is 0: calculate from width maintaining aspect ratio
+            let aspect = src_h as f32 / src_w as f32;
+            let h = (w as f32 * aspect).round() as u32;
+            (w, h)
+        }
+        (w, h) => (w, h), // Both specified: use as-is
     }
 }
 

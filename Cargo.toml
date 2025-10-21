@@ -10,7 +10,7 @@ http = "1"
 hyper = { version = "1", features = ["http1", "server"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "brotli"] }
 bytes = "1"
-image = { version = "0.25", features = ["png", "jpeg", "webp", "avif"] }
+image = { version = "0.25", features = ["png", "jpeg", "webp", "avif-native"] }
 webp = "0.3"
 ravif = "0.11"
 rgb = "0.8"
