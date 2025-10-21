@@ -1,11 +1,14 @@
-# Rust
-/target/
-Cargo.lock
+# Rust build artifacts
+target/
 **/*.rs.bk
 *.pdb
 
-# Cache directory
-/cache/
+# Cache
+cache/
+
+# Git
+.git/
+.gitignore
 
 # IDE
 .idea/
@@ -18,6 +21,9 @@ Cargo.lock
 # Environment
 .env
 .env.local
+
+# Documentation
+README.md
 
 # Test files
 *.webp

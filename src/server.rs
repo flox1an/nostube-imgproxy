@@ -8,24 +8,52 @@ use axum::{
 };
 use bytes::Bytes;
 use http::HeaderName;
+use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
     cache::{cache_path_for, original_cache_path_for, try_read_original_cache, try_serve_cache, write_cache_atomic},
     config::AppState,
     error::SvcError,
+    thumbnail::{extract_video_thumbnail, is_video_url, ThumbnailState},
     transform::{apply_resize, encode_image, parse_rest},
 };
 
-/// Create the Axum router with all routes
-pub fn create_router(state: AppState) -> Router {
-    Router::new()
-        .route("/insecure/*rest", get(handle_insecure))
-        .with_state(state)
+/// Combined state for image and video processing
+#[derive(Clone)]
+pub struct CombinedState {
+    pub app: AppState,
+    pub thumbnail: Arc<ThumbnailState>,
 }
 
-/// Main handler for /insecure/* requests
+/// Create the Axum router with all routes
+pub fn create_router(state: AppState, thumbnail_state: Arc<ThumbnailState>) -> Router {
+    let combined = CombinedState {
+        app: state,
+        thumbnail: thumbnail_state,
+    };
+
+    // CORS layer - allow all origins
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    Router::new()
+        .route("/insecure/*rest", get(handle_insecure))
+        .route("/health", get(health_check))
+        .with_state(combined)
+        .layer(cors)
+}
+
+/// Simple health check endpoint
+async fn health_check() -> &'static str {
+    "OK"
+}
+
+/// Main handler for /insecure/* requests (handles both images and videos)
 async fn handle_insecure(
-    State(state): State<AppState>,
+    State(state): State<CombinedState>,
     AxPath(rest): AxPath<String>,
 ) -> Result<Response, SvcError> {
     // full_url is the exact request path for cache keying
@@ -35,7 +63,7 @@ async fn handle_insecure(
     let (dirs, src_url) = parse_rest(&rest)?;
 
     // Derive cache file path from hash(full_request_url)
-    let cache_path = cache_path_for(&state.cfg, &full_request_url, &dirs.out_fmt);
+    let cache_path = cache_path_for(&state.app.cfg, &full_request_url, &dirs.out_fmt);
     let mime = dirs.out_fmt.mime_type();
 
     // Serve from processed cache if present
@@ -43,22 +71,38 @@ async fn handle_insecure(
         return Ok(resp);
     }
 
-    // Try to get original image from cache first, otherwise fetch it
-    let original_cache_path = original_cache_path_for(&state.cfg, &src_url);
+    // Try to get original image/video thumbnail from cache first
+    let original_cache_path = original_cache_path_for(&state.app.cfg, &src_url);
     let img_bytes = if let Some(cached) = try_read_original_cache(&original_cache_path).await? {
+        // Cache hit - use cached original (could be image or previously extracted thumbnail)
         cached
     } else {
-        // Fetch from source
-        let bytes = fetch_source(&state, &src_url).await?;
-        
-        // Ensure max size
-        if bytes.len() > state.cfg.max_image_bytes {
-            return Err(SvcError::BadRequest("image too large"));
+        // Cache miss - check if source is a video or image
+        if is_video_url(&src_url) {
+            // It's a video - extract thumbnail using FFmpeg
+            let thumbnail_bytes = extract_video_thumbnail(&src_url, &state.thumbnail.ffmpeg_semaphore).await?;
+            
+            // Ensure max size
+            if thumbnail_bytes.len() > state.app.cfg.max_image_bytes {
+                return Err(SvcError::BadRequest("thumbnail too large"));
+            }
+            
+            // Cache the extracted thumbnail as "original"
+            write_cache_atomic(&original_cache_path, &thumbnail_bytes).await?;
+            thumbnail_bytes
+        } else {
+            // It's an image - fetch normally
+            let bytes = fetch_source(&state.app, &src_url).await?;
+            
+            // Ensure max size
+            if bytes.len() > state.app.cfg.max_image_bytes {
+                return Err(SvcError::BadRequest("image too large"));
+            }
+            
+            // Cache the original image
+            write_cache_atomic(&original_cache_path, &bytes).await?;
+            bytes.to_vec()
         }
-        
-        // Cache the original
-        write_cache_atomic(&original_cache_path, &bytes).await?;
-        bytes.to_vec()
     };
 
     // Decode - use ImageReader with format guessing for AVIF/JPEG/PNG/WebP support

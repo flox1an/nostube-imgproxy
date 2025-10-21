@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.7", features = ["http1", "json"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync", "process", "signal"] }
 http = "1"
 hyper = { version = "1", features = ["http1", "server"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "brotli"] }
@@ -23,4 +25,5 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 mime = "0.3"
 walkdir = "2"
 fs2 = "0.4"
+tempfile = "3"
 

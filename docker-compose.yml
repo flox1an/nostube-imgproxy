@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  rust-imgproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rust-imgproxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persist cache across container restarts
+      - ./cache:/cache
+    environment:
+      - BIND_ADDR=0.0.0.0:8080
+      - CACHE_DIR=/cache
+      - CACHE_TTL_SECS=86400
+      - FETCH_TIMEOUT_SECS=10
+      - MAX_IMAGE_BYTES=16777216
+      - MAX_FFMPEG_CONCURRENT=8
+      - RUST_LOG=info
+    # Optional: Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
+
