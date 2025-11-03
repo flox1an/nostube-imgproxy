@@ -80,7 +80,11 @@ async fn handle_insecure(
         // Cache miss - check if source is a video or image
         if is_video_url(&src_url) {
             // It's a video - extract thumbnail using FFmpeg
-            let thumbnail_bytes = extract_video_thumbnail(&src_url, &state.thumbnail.ffmpeg_semaphore).await?;
+            let thumbnail_bytes = extract_video_thumbnail(
+                &src_url,
+                &state.thumbnail.ffmpeg_semaphore,
+                &state.app.cfg.blossom_fallback_servers,
+            ).await?;
             
             // Ensure max size
             if thumbnail_bytes.len() > state.app.cfg.max_image_bytes {
@@ -139,7 +143,32 @@ async fn handle_insecure(
     Ok(resp)
 }
 
-/// Fetch source image from URL
+/// Check if a URL is a Blossom CDN URL (has <sha256>.<ext> format)
+fn is_blossom_url(url: &str) -> bool {
+    if let Some(filename) = url.rsplit('/').next() {
+        if let Some((hash_part, _ext)) = filename.rsplit_once('.') {
+            // SHA256 hash is 64 hexadecimal characters
+            return hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit());
+        }
+    }
+    false
+}
+
+/// Extract the hash and extension from a Blossom URL
+/// Returns (hash, extension) if valid, None otherwise
+fn extract_blossom_hash(url: &str) -> Option<(&str, &str)> {
+    if let Some(filename) = url.rsplit('/').next() {
+        if let Some((hash_part, ext)) = filename.rsplit_once('.') {
+            // SHA256 hash is 64 hexadecimal characters
+            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some((hash_part, ext));
+            }
+        }
+    }
+    None
+}
+
+/// Fetch source image from URL with Blossom fallback support
 async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError> {
     // Basic allowlist: only http/https
     if !(src_url.starts_with("http://") || src_url.starts_with("https://")) {
@@ -147,11 +176,32 @@ async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError
     }
 
     let resp = state.http.get(src_url).send().await?;
-    if !resp.status().is_success() {
-        return Err(SvcError::BadRequest("upstream not ok"));
+
+    // If successful, return the bytes
+    if resp.status().is_success() {
+        let bytes = resp.bytes().await?;
+        return Ok(bytes);
     }
 
-    let bytes = resp.bytes().await?;
-    Ok(bytes)
+    // If 404 and it's a Blossom URL, try fallback servers
+    if resp.status() == reqwest::StatusCode::NOT_FOUND && is_blossom_url(src_url) {
+        if let Some((hash, ext)) = extract_blossom_hash(src_url) {
+            // Try each fallback server
+            for fallback_server in &state.cfg.blossom_fallback_servers {
+                let fallback_url = format!("{}/{}.{}", fallback_server, hash, ext);
+
+                if let Ok(fallback_resp) = state.http.get(&fallback_url).send().await {
+                    if fallback_resp.status().is_success() {
+                        if let Ok(bytes) = fallback_resp.bytes().await {
+                            return Ok(bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // All attempts failed
+    Err(SvcError::BadRequest("upstream not ok"))
 }
 

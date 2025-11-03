@@ -34,10 +34,36 @@ pub fn is_video_url(url: &str) -> bool {
         || url_lower.ends_with(".ogv")
 }
 
+/// Check if a URL is a Blossom CDN URL (has <sha256>.<ext> format)
+fn is_blossom_url(url: &str) -> bool {
+    if let Some(filename) = url.rsplit('/').next() {
+        if let Some((hash_part, _ext)) = filename.rsplit_once('.') {
+            // SHA256 hash is 64 hexadecimal characters
+            return hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit());
+        }
+    }
+    false
+}
+
+/// Extract the hash and extension from a Blossom URL
+/// Returns (hash, extension) if valid, None otherwise
+fn extract_blossom_hash(url: &str) -> Option<(&str, &str)> {
+    if let Some(filename) = url.rsplit('/').next() {
+        if let Some((hash_part, ext)) = filename.rsplit_once('.') {
+            // SHA256 hash is 64 hexadecimal characters
+            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some((hash_part, ext));
+            }
+        }
+    }
+    None
+}
+
 /// Extract a video thumbnail and return the image bytes (to be cached as "original")
 pub async fn extract_video_thumbnail(
     video_url: &str,
     semaphore: &Arc<Semaphore>,
+    blossom_fallback_servers: &[String],
 ) -> Result<Vec<u8>, SvcError> {
     info!("extracting thumbnail from video: {}", video_url);
 
@@ -49,7 +75,24 @@ pub async fn extract_video_thumbnail(
         .await
         .map_err(|_| SvcError::Io(std::io::Error::new(std::io::ErrorKind::Other, "semaphore error")))?;
 
-    extract_thumbnail_with_ffmpeg(video_url).await
+    // Try original URL first
+    let result = extract_thumbnail_with_ffmpeg(video_url).await;
+
+    // If failed and it's a Blossom URL, try fallback servers
+    if result.is_err() && is_blossom_url(video_url) {
+        if let Some((hash, ext)) = extract_blossom_hash(video_url) {
+            for fallback_server in blossom_fallback_servers {
+                let fallback_url = format!("{}/{}.{}", fallback_server, hash, ext);
+                info!("trying fallback server for video: {}", fallback_url);
+
+                if let Ok(thumbnail_bytes) = extract_thumbnail_with_ffmpeg(&fallback_url).await {
+                    return Ok(thumbnail_bytes);
+                }
+            }
+        }
+    }
+
+    result
 }
 
 /// Extract a thumbnail from a video using ffmpeg CLI
