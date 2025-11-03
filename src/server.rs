@@ -178,35 +178,89 @@ async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError
     // Try original URL first
     let result = async {
         let resp = state.http.get(src_url).send().await?;
-        if resp.status().is_success() {
+        let status = resp.status();
+        if status.is_success() {
             resp.bytes().await.map_err(Into::into)
         } else {
+            tracing::debug!("primary server returned non-success status for image {}: {}", src_url, status);
             Err(SvcError::BadRequest("upstream not ok"))
         }
     }.await;
 
     // If successful, return immediately
-    if let Ok(bytes) = result {
-        return Ok(bytes);
+    if let Ok(bytes) = &result {
+        tracing::debug!("primary server succeeded for image {}, received {} bytes", src_url, bytes.len());
+        return Ok(bytes.clone());
     }
+
+    // Log primary failure
+    tracing::debug!("primary server failed for image {}: {:?}", src_url, result);
 
     // If failed and it's a Blossom URL, try fallback servers
     if is_blossom_url(src_url) {
+        tracing::debug!("url is blossom format, attempting {} fallback servers", state.cfg.blossom_fallback_servers.len());
+
         if let Some((hash, ext)) = extract_blossom_hash(src_url) {
             // Try each fallback server
-            for fallback_server in &state.cfg.blossom_fallback_servers {
+            for (idx, fallback_server) in state.cfg.blossom_fallback_servers.iter().enumerate() {
                 let fallback_url = format!("{}/{}.{}", fallback_server, hash, ext);
-                tracing::info!("trying fallback server for image: {}", fallback_url);
+                tracing::debug!(
+                    "attempting fallback server {}/{} for image: {}",
+                    idx + 1,
+                    state.cfg.blossom_fallback_servers.len(),
+                    fallback_url
+                );
 
-                if let Ok(fallback_resp) = state.http.get(&fallback_url).send().await {
-                    if fallback_resp.status().is_success() {
-                        if let Ok(bytes) = fallback_resp.bytes().await {
-                            return Ok(bytes);
+                match state.http.get(&fallback_url).send().await {
+                    Ok(fallback_resp) => {
+                        let status = fallback_resp.status();
+                        if status.is_success() {
+                            match fallback_resp.bytes().await {
+                                Ok(bytes) => {
+                                    tracing::info!(
+                                        "✓ fallback server {} succeeded for image, received {} bytes from {}",
+                                        idx + 1,
+                                        bytes.len(),
+                                        fallback_server
+                                    );
+                                    return Ok(bytes);
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "✗ fallback server {} failed to read response bytes: {:?}",
+                                        idx + 1,
+                                        e
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                "✗ fallback server {} returned status {} for {}",
+                                idx + 1,
+                                status,
+                                fallback_server
+                            );
                         }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "✗ fallback server {} request failed for {}: {:?}",
+                            idx + 1,
+                            fallback_server,
+                            e
+                        );
                     }
                 }
             }
+
+            tracing::warn!(
+                "all {} fallback servers exhausted for image {}, returning original error",
+                state.cfg.blossom_fallback_servers.len(),
+                src_url
+            );
         }
+    } else {
+        tracing::debug!("url is not blossom format, skipping fallback servers");
     }
 
     // All attempts failed - return original error

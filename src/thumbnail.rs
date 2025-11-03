@@ -78,18 +78,60 @@ pub async fn extract_video_thumbnail(
     // Try original URL first
     let result = extract_thumbnail_with_ffmpeg(video_url).await;
 
-    // If failed and it's a Blossom URL, try fallback servers
-    if result.is_err() && is_blossom_url(video_url) {
-        if let Some((hash, ext)) = extract_blossom_hash(video_url) {
-            for fallback_server in blossom_fallback_servers {
-                let fallback_url = format!("{}/{}.{}", fallback_server, hash, ext);
-                info!("trying fallback server for video: {}", fallback_url);
+    // Log success or failure of primary attempt
+    match &result {
+        Ok(bytes) => {
+            tracing::debug!("primary server succeeded for video {}, extracted {} bytes", video_url, bytes.len());
+            return Ok(bytes.clone());
+        }
+        Err(e) => {
+            tracing::debug!("primary server failed for video {}: {:?}", video_url, e);
+        }
+    }
 
-                if let Ok(thumbnail_bytes) = extract_thumbnail_with_ffmpeg(&fallback_url).await {
-                    return Ok(thumbnail_bytes);
+    // If failed and it's a Blossom URL, try fallback servers
+    if is_blossom_url(video_url) {
+        tracing::debug!("url is blossom format, attempting {} fallback servers", blossom_fallback_servers.len());
+
+        if let Some((hash, ext)) = extract_blossom_hash(video_url) {
+            for (idx, fallback_server) in blossom_fallback_servers.iter().enumerate() {
+                let fallback_url = format!("{}/{}.{}", fallback_server, hash, ext);
+                tracing::debug!(
+                    "attempting fallback server {}/{} for video: {}",
+                    idx + 1,
+                    blossom_fallback_servers.len(),
+                    fallback_url
+                );
+
+                match extract_thumbnail_with_ffmpeg(&fallback_url).await {
+                    Ok(thumbnail_bytes) => {
+                        tracing::info!(
+                            "✓ fallback server {} succeeded for video, extracted {} bytes from {}",
+                            idx + 1,
+                            thumbnail_bytes.len(),
+                            fallback_server
+                        );
+                        return Ok(thumbnail_bytes);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "✗ fallback server {} extraction failed for {}: {:?}",
+                            idx + 1,
+                            fallback_server,
+                            e
+                        );
+                    }
                 }
             }
+
+            tracing::warn!(
+                "all {} fallback servers exhausted for video {}, returning original error",
+                blossom_fallback_servers.len(),
+                video_url
+            );
         }
+    } else {
+        tracing::debug!("url is not blossom format, skipping fallback servers");
     }
 
     result
@@ -107,6 +149,8 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
     // Run ffmpeg to extract thumbnail
     // Equivalent to:
     // ffmpeg -ss 0.5 -i <video_url> -vframes 1 -vf "scale=-1:'min(720,ih)'" -q:v 80 -c:v libwebp -f image2 output.webp
+    tracing::debug!("spawning ffmpeg for video: {}", video_url);
+
     let output = Command::new("ffmpeg")
         .args(&[
             "-ss", "0.5",               // Seek to 0.5 seconds
@@ -122,18 +166,36 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
         .output()
         .await
         .map_err(|e| {
-            error!("failed to spawn ffmpeg: {}", e);
+            error!("failed to spawn ffmpeg for {}: {}", video_url, e);
             SvcError::Io(e)
         })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("ffmpeg failed: {}", stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Check for common error patterns
+        let is_timeout = stderr.contains("timed out") || stderr.contains("Connection timed out");
+        let is_network_error = stderr.contains("Connection refused") || stderr.contains("Could not resolve host");
+        let is_404 = stderr.contains("404") || stderr.contains("Not Found");
+
+        if is_timeout {
+            tracing::debug!("ffmpeg timeout for {}: connection timed out", video_url);
+        } else if is_network_error {
+            tracing::debug!("ffmpeg network error for {}: {}", video_url, stderr.lines().next().unwrap_or("unknown"));
+        } else if is_404 {
+            tracing::debug!("ffmpeg 404 error for {}: resource not found", video_url);
+        } else {
+            tracing::debug!("ffmpeg failed for {}: {}", video_url, stderr.lines().take(3).collect::<Vec<_>>().join(" | "));
+        }
+
         return Err(SvcError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("ffmpeg failed: {}", stderr),
         )));
     }
+
+    tracing::debug!("ffmpeg successfully extracted thumbnail for: {}", video_url);
 
     // Read the generated thumbnail
     let thumbnail_data = tokio::fs::read(output_path)
