@@ -18,6 +18,10 @@ impl ThumbnailState {
 }
 
 /// Check if a URL is likely a video based on file extension
+///
+/// Returns true only for known video extensions.
+/// All other URLs (including .jfif, .jpg, .jpeg, .png, .webp, .avif, and URLs without extensions)
+/// are treated as images and processed with content-based format detection.
 pub fn is_video_url(url: &str) -> bool {
     let url_lower = url.to_lowercase();
     url_lower.ends_with(".mp4")

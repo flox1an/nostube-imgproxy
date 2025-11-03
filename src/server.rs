@@ -109,7 +109,9 @@ async fn handle_insecure(
         }
     };
 
-    // Decode - use ImageReader with format guessing for AVIF/JPEG/PNG/WebP support
+    // Decode - use ImageReader with content-based format detection
+    // Supports: JPEG, JFIF, PNG, WebP, AVIF, and other formats
+    // Works with or without file extensions (detects format from image data)
     let img = {
         use std::io::Cursor;
         image::ImageReader::new(Cursor::new(&img_bytes))
