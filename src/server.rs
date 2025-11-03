@@ -175,20 +175,28 @@ async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError
         return Err(SvcError::BadRequest("unsupported source scheme"));
     }
 
-    let resp = state.http.get(src_url).send().await?;
+    // Try original URL first
+    let result = async {
+        let resp = state.http.get(src_url).send().await?;
+        if resp.status().is_success() {
+            resp.bytes().await.map_err(Into::into)
+        } else {
+            Err(SvcError::BadRequest("upstream not ok"))
+        }
+    }.await;
 
-    // If successful, return the bytes
-    if resp.status().is_success() {
-        let bytes = resp.bytes().await?;
+    // If successful, return immediately
+    if let Ok(bytes) = result {
         return Ok(bytes);
     }
 
-    // If 404 and it's a Blossom URL, try fallback servers
-    if resp.status() == reqwest::StatusCode::NOT_FOUND && is_blossom_url(src_url) {
+    // If failed and it's a Blossom URL, try fallback servers
+    if is_blossom_url(src_url) {
         if let Some((hash, ext)) = extract_blossom_hash(src_url) {
             // Try each fallback server
             for fallback_server in &state.cfg.blossom_fallback_servers {
                 let fallback_url = format!("{}/{}.{}", fallback_server, hash, ext);
+                tracing::info!("trying fallback server for image: {}", fallback_url);
 
                 if let Ok(fallback_resp) = state.http.get(&fallback_url).send().await {
                     if fallback_resp.status().is_success() {
@@ -201,7 +209,7 @@ async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError
         }
     }
 
-    // All attempts failed
-    Err(SvcError::BadRequest("upstream not ok"))
+    // All attempts failed - return original error
+    result
 }
 
