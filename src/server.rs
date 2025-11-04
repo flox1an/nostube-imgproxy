@@ -185,7 +185,7 @@ async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError
             resp.bytes().await.map_err(Into::into)
         } else {
             tracing::debug!("primary server returned non-success status for image {}: {}", src_url, status);
-            Err(SvcError::BadRequest("upstream not ok"))
+            Err(SvcError::UpstreamError(status.as_u16()))
         }
     }.await;
 
