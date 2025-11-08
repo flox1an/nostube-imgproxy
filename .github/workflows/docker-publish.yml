@@ -132,6 +132,6 @@ jobs:
         uses: caprover/deploy-from-github@v1.1.2
         with:
           server: 'https://captain.apps3.slidestr.net'
-          app: 'nostube-imgproxy'
+          app-name: 'nostube-imgproxy'
           token: '${{ secrets.CAPROVER_APP_TOKEN }}'
           image: 'ghcr.io/flox1an/nostube-imgproxy:main'
