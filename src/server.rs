@@ -40,7 +40,7 @@ pub fn create_router(state: AppState, thumbnail_state: Arc<ThumbnailState>) -> R
         .allow_headers(Any);
 
     Router::new()
-        .route("/insecure/*rest", get(handle_insecure))
+        .route("/insecure/{*rest}", get(handle_insecure))
         .route("/health", get(health_check))
         .with_state(combined)
         .layer(cors)
@@ -51,7 +51,7 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-/// Main handler for /insecure/* requests (handles both images and videos)
+/// Main handler for /insecure/{*} requests (handles both images and videos)
 async fn handle_insecure(
     State(state): State<CombinedState>,
     AxPath(rest): AxPath<String>,
