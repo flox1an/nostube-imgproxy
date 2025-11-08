@@ -58,10 +58,6 @@ jobs:
       # with sigstore/fulcio when running outside of PRs.
       id-token: write
 
-    outputs:
-      image: ${{ steps.image-ref.outputs.image }}
-      digest: ${{ steps.build-and-push.outputs.digest }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -111,11 +107,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Set image reference for deployment
-      - name: Set image reference
-        id: image-ref
-        run: echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-and-push.outputs.digest }}" >> $GITHUB_OUTPUT
-
       # Sign the resulting Docker image digest except on PRs.
       # This will only write to the public Rekor transparency log when the Docker
       # repository is public to avoid leaking data.  If you would like to publish
@@ -143,4 +134,4 @@ jobs:
           server: 'https://captain.apps3.slidestr.net'
           app: 'nostube-imgproxy'
           token: '${{ secrets.CAPROVER_APP_TOKEN }}'
-          image: '${{ needs.docker-build.outputs.image }}'
+          image: 'ghcr.io/flox1an/nostube-imgproxy:main'
