@@ -99,7 +99,7 @@ pub async fn extract_video_thumbnail(
 
         if let Some((hash, ext)) = extract_blossom_hash(video_url) {
             for (idx, fallback_server) in blossom_fallback_servers.iter().enumerate() {
-                let fallback_url = format!("{}/{}.{}", fallback_server, hash, ext);
+                let fallback_url = format!("{}/{}.{}", fallback_server.trim_end_matches('/'), hash, ext);
                 tracing::debug!(
                     "attempting fallback server {}/{} for video: {}",
                     idx + 1,

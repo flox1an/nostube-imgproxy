@@ -205,7 +205,7 @@ async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError
         if let Some((hash, ext)) = extract_blossom_hash(src_url) {
             // Try each fallback server
             for (idx, fallback_server) in state.cfg.blossom_fallback_servers.iter().enumerate() {
-                let fallback_url = format!("{}/{}.{}", fallback_server, hash, ext);
+                let fallback_url = format!("{}/{}.{}", fallback_server.trim_end_matches('/'), hash, ext);
                 tracing::debug!(
                     "attempting fallback server {}/{} for image: {}",
                     idx + 1,
