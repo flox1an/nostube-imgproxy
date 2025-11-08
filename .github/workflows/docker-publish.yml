@@ -134,4 +134,4 @@ jobs:
           server: 'https://captain.apps3.slidestr.net'
           app: 'nostube-imgproxy'
           token: '${{ secrets.CAPROVER_APP_TOKEN }}'
-          image: 'ghcr.io/${{ github.repository }}:main'
+          image: 'ghcr.io/flox1an/nostube-imgproxy:main'
