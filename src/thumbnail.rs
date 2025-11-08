@@ -176,7 +176,7 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let _stdout = String::from_utf8_lossy(&output.stdout);
 
         // Check for common error patterns
         let is_timeout = stderr.contains("timed out") || stderr.contains("Connection timed out");
