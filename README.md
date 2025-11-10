@@ -264,7 +264,7 @@ cache/
 ### General Cache Properties
 - **Atomic writes**: Uses temp files + rename for safety
 - **TTL cleanup**: Runs every 60 seconds, removes files older than `CACHE_TTL_SECS` from both caches
-- **Cache headers**: `Cache-Control: public, max-age=3600, stale-while-revalidate=600`
+- **Cache headers**: `Cache-Control: public, max-age=31536000, immutable` (1 year, indefinite browser caching)
 - **Hit/Miss indicator**: `X-Cache: hit` or `X-Cache: miss`
 
 ## Dependencies
