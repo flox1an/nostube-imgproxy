@@ -135,7 +135,7 @@ async fn handle_insecure(
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=600"),
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
     headers.insert(
         HeaderName::from_static("x-cache"),

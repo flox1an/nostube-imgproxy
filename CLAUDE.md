@@ -56,7 +56,7 @@ src/
 - SHA-256 hashing for keys
 - Atomic writes using temp files + rename
 - TTL-based cleanup (runs every 60s)
-- Cache headers: `Cache-Control: public, max-age=3600, stale-while-revalidate=600`
+- Cache headers: `Cache-Control: public, max-age=31536000, immutable` (1 year, indefinite browser caching)
 
 #### 5. Config (config.rs)
 - Environment-based configuration

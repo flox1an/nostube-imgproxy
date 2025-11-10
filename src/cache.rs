@@ -50,7 +50,7 @@ pub async fn try_serve_cache(path: &Path, mime: &str) -> Result<Option<Response>
         );
         headers.insert(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=600"),
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
         );
         headers.insert(
             HeaderName::from_static("x-cache"),
