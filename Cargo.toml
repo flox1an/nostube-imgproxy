@@ -26,4 +26,6 @@ mime = "0.3"
 walkdir = "2"
 fs2 = "0.4"
 tempfile = "3"
+nostr-sdk = "0.37"
+serde = { version = "1", features = ["derive"] }
 

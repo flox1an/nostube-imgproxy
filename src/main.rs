@@ -1,6 +1,7 @@
 use std::{fs, sync::Arc};
 use tracing::info;
 
+mod blossom;
 mod cache;
 mod config;
 mod error;
@@ -8,6 +9,7 @@ mod server;
 mod thumbnail;
 mod transform;
 
+use blossom::BlossomState;
 use cache::janitor_loop;
 use config::{AppCfg, AppState};
 use server::create_router;
@@ -33,10 +35,17 @@ async fn main() {
         .unwrap_or(8);
     let thumbnail_state = Arc::new(ThumbnailState::new(max_ffmpeg_concurrent));
 
+    // Create blossom state with configurable cache TTL
+    let blossom_cache_ttl_hours = std::env::var("BLOSSOM_SERVER_LIST_CACHE_TTL_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let blossom_state = Arc::new(BlossomState::new(blossom_cache_ttl_hours).await);
+
     // Spawn janitor
     tokio::spawn(async move { janitor_loop(cfg).await });
 
-    let app = create_router(state, thumbnail_state);
+    let app = create_router(state, thumbnail_state, blossom_state);
 
     info!(addr = bind_addr, "listening");
     let listener = tokio::net::TcpListener::bind(&bind_addr)
