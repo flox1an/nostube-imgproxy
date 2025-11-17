@@ -17,6 +17,7 @@ use crate::{
     cache::{cache_path_for, original_cache_path_for, try_read_original_cache, try_serve_cache, write_cache_atomic},
     config::AppState,
     error::SvcError,
+    metrics,
     thumbnail::{extract_video_thumbnail, is_video_url, ThumbnailState},
     transform::{apply_resize, encode_image, parse_rest, Directives, OutFmt, Resize, ResizeMode},
 };
@@ -51,6 +52,7 @@ pub fn create_router(
         .route("/insecure/{*rest}", get(handle_insecure))
         .route("/thumb/{filename}", get(handle_thumb))
         .route("/health", get(health_check))
+        .route("/metrics", get(handle_metrics))
         .with_state(combined)
         .layer(cors)
 }
@@ -84,11 +86,28 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+/// Prometheus metrics endpoint
+async fn handle_metrics() -> Result<Response, SvcError> {
+    let metrics_text = metrics::encode_metrics()
+        .map_err(|e| SvcError::InternalError(format!("failed to encode metrics: {}", e)))?;
+
+    let mut resp = Response::new(Body::from(metrics_text));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+
+    Ok(resp)
+}
+
 /// Main handler for /insecure/{*} requests (handles both images and videos)
 async fn handle_insecure(
     State(state): State<CombinedState>,
     AxPath(rest): AxPath<String>,
 ) -> Result<Response, SvcError> {
+    let start_time = std::time::Instant::now();
+
     // full_url is the exact request path for cache keying
     let full_request_url = format!("/insecure/{}", rest);
 
@@ -101,15 +120,23 @@ async fn handle_insecure(
 
     // Serve from processed cache if present
     if let Some(resp) = try_serve_cache(&cache_path, mime).await? {
+        metrics::record_cache_hit("processed");
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::observe_http_duration("/insecure", "GET", duration);
+        metrics::record_http_request("/insecure", "GET", 200);
         return Ok(resp);
     }
+
+    metrics::record_cache_miss("processed");
 
     // Try to get original image/video thumbnail from cache first
     let original_cache_path = original_cache_path_for(&state.app.cfg, &src_url);
     let img_bytes = if let Some(cached) = try_read_original_cache(&original_cache_path).await? {
+        metrics::record_cache_hit("original");
         // Cache hit - use cached original (could be image or previously extracted thumbnail)
         cached
     } else {
+        metrics::record_cache_miss("original");
         // Cache miss - check if source is a video or image
         if is_video_url(&src_url) {
             // It's a video - extract thumbnail using FFmpeg
@@ -118,24 +145,30 @@ async fn handle_insecure(
                 &state.thumbnail.ffmpeg_semaphore,
                 &state.app.cfg.blossom_fallback_servers,
             ).await?;
-            
+
             // Ensure max size
             if thumbnail_bytes.len() > state.app.cfg.max_image_bytes {
+                metrics::record_processing_error("thumbnail_too_large");
                 return Err(SvcError::BadRequest("thumbnail too large"));
             }
-            
+
+            metrics::record_bytes_downloaded("video", thumbnail_bytes.len());
+
             // Cache the extracted thumbnail as "original"
             write_cache_atomic(&original_cache_path, &thumbnail_bytes).await?;
             thumbnail_bytes
         } else {
             // It's an image - fetch normally
             let bytes = fetch_source(&state.app, &src_url).await?;
-            
+
             // Ensure max size
             if bytes.len() > state.app.cfg.max_image_bytes {
+                metrics::record_processing_error("image_too_large");
                 return Err(SvcError::BadRequest("image too large"));
             }
-            
+
+            metrics::record_bytes_downloaded("image", bytes.len());
+
             // Cache the original image
             write_cache_atomic(&original_cache_path, &bytes).await?;
             bytes.to_vec()
@@ -159,6 +192,22 @@ async fn handle_insecure(
     // Encode
     let encoded = encode_image(&img, &dirs.out_fmt, dirs.quality)?;
 
+    // Record processing metrics
+    let out_fmt_str = match dirs.out_fmt {
+        OutFmt::Jpeg => "jpeg",
+        OutFmt::Png => "png",
+        OutFmt::Webp => "webp",
+        OutFmt::Avif => "avif",
+    };
+
+    if is_video_url(&src_url) {
+        metrics::record_video_processed(out_fmt_str);
+    } else {
+        metrics::record_image_processed(out_fmt_str);
+    }
+
+    metrics::record_bytes_served(mime, encoded.len());
+
     // Write to cache atomically
     write_cache_atomic(&cache_path, &encoded).await?;
 
@@ -175,6 +224,11 @@ async fn handle_insecure(
         HeaderValue::from_static("miss"),
     );
 
+    // Record request metrics
+    let duration = start_time.elapsed().as_secs_f64();
+    metrics::observe_http_duration("/insecure", "GET", duration);
+    metrics::record_http_request("/insecure", "GET", 200);
+
     Ok(resp)
 }
 
@@ -184,6 +238,8 @@ async fn handle_thumb(
     AxPath(filename): AxPath<String>,
     Query(params): Query<ThumbQuery>,
 ) -> Result<Response, SvcError> {
+    let start_time = std::time::Instant::now();
+
     // Validate filename format: <sha256>.<ext>
     let (hash, ext) = filename
         .rsplit_once('.')
@@ -204,8 +260,14 @@ async fn handle_thumb(
 
     // Serve from processed cache if present
     if let Some(resp) = try_serve_cache(&cache_path, mime).await? {
+        metrics::record_cache_hit("processed");
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::observe_http_duration("/thumb", "GET", duration);
+        metrics::record_http_request("/thumb", "GET", 200);
         return Ok(resp);
     }
+
+    metrics::record_cache_miss("processed");
 
     // Get author servers if pubkey provided
     let author_servers = if let Some(ref pubkey) = params.author_pubkey {
@@ -239,16 +301,21 @@ async fn handle_thumb(
 
     // Check original cache first
     let img_bytes = if let Some(cached) = try_read_original_cache(&original_cache_path).await? {
+        metrics::record_cache_hit("original");
         tracing::debug!("Original cache hit for {}.{}", hash, ext);
         cached
     } else {
+        metrics::record_cache_miss("original");
         // Fetch from Blossom servers
         let bytes = fetch_from_blossom_servers(&state.app, &servers, hash, ext).await?;
 
         // Validate size
         if bytes.len() > state.app.cfg.max_image_bytes {
+            metrics::record_processing_error("image_too_large");
             return Err(SvcError::BadRequest("image too large"));
         }
+
+        metrics::record_bytes_downloaded("blossom", bytes.len());
 
         // Cache the original
         write_cache_atomic(&original_cache_path, &bytes).await?;
@@ -270,6 +337,16 @@ async fn handle_thumb(
     // Encode
     let encoded = encode_image(&img, &dirs.out_fmt, dirs.quality)?;
 
+    // Record processing metrics
+    let out_fmt_str = match dirs.out_fmt {
+        OutFmt::Jpeg => "jpeg",
+        OutFmt::Png => "png",
+        OutFmt::Webp => "webp",
+        OutFmt::Avif => "avif",
+    };
+    metrics::record_image_processed(out_fmt_str);
+    metrics::record_bytes_served(mime, encoded.len());
+
     // Write to processed cache
     write_cache_atomic(&cache_path, &encoded).await?;
 
@@ -286,6 +363,11 @@ async fn handle_thumb(
         HeaderName::from_static("x-cache"),
         HeaderValue::from_static("miss"),
     );
+
+    // Record request metrics
+    let duration = start_time.elapsed().as_secs_f64();
+    metrics::observe_http_duration("/thumb", "GET", duration);
+    metrics::record_http_request("/thumb", "GET", 200);
 
     Ok(resp)
 }

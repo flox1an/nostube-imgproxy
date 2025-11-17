@@ -16,6 +16,8 @@ pub enum SvcError {
     Decode(#[from] image::ImageError),
     #[error("io failed")]
     Io(#[from] std::io::Error),
+    #[error("internal error: {0}")]
+    InternalError(String),
 }
 
 impl IntoResponse for SvcError {
@@ -35,6 +37,7 @@ impl IntoResponse for SvcError {
             SvcError::Fetch(_) => (StatusCode::BAD_GATEWAY, "Failed to fetch source image".to_string()),
             SvcError::Decode(_) => (StatusCode::UNPROCESSABLE_ENTITY, "Failed to decode image".to_string()),
             SvcError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string()),
+            SvcError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         (status, message).into_response()
     }

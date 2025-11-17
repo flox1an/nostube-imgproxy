@@ -28,4 +28,6 @@ fs2 = "0.4"
 tempfile = "3"
 nostr-sdk = "0.37"
 serde = { version = "1", features = ["derive"] }
+prometheus = "0.13"
+lazy_static = "1.4"
 
