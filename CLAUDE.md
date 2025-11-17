@@ -23,7 +23,8 @@ src/
 ├── server.rs     # HTTP server and route handlers (unified image/video handling)
 ├── transform.rs  # Image transformation logic (resize, encode, parse)
 ├── thumbnail.rs  # Video thumbnail extraction (FFmpeg integration)
-└── cache.rs      # Cache operations (read, write, cleanup)
+├── cache.rs      # Cache operations (read, write, cleanup)
+└── metrics.rs    # Prometheus metrics collection and export
 ```
 
 ### Key Components
@@ -68,18 +69,30 @@ src/
 - IntoResponse implementation for HTTP error responses
 - Proper HTTP status codes
 
+#### 7. Metrics (metrics.rs)
+- Prometheus metrics collection and export
+- HTTP request metrics (total requests, duration histograms)
+- Cache metrics (hits/misses by cache type)
+- Processing metrics (images/videos processed by format)
+- FFmpeg semaphore metrics (permits available, waiters)
+- Bytes transferred metrics (downloaded/served)
+- Error tracking by error type
+- Metrics endpoint: `/metrics` (Prometheus text format)
+
 ## Technology Stack
 
 ### Core Dependencies
-- **axum** (0.7) - Web framework
+- **axum** (0.8) - Web framework
 - **tokio** (1.x) - Async runtime
 - **tower-http** - CORS middleware
 - **reqwest** (0.12) - HTTP client with rustls
 - **image** (0.25) - Image processing with AVIF support
 - **webp** (0.3) - WebP encoding
-- **ravif** (0.11) - AVIF encoding
+- **ravif** (0.12) - AVIF encoding
 - **sha2** (0.10) - Cache key hashing
 - **tracing** - Structured logging
+- **prometheus** (0.13) - Metrics collection and export
+- **lazy_static** (1.4) - Global metrics initialization
 
 ### Build Requirements
 - **meson** and **ninja** - Required for AVIF support (dav1d decoder)
@@ -131,6 +144,9 @@ BIND_ADDR=0.0.0.0:3000 CACHE_TTL_SECS=3600 cargo run --release
 ```bash
 # Health check
 curl http://127.0.0.1:8080/health
+
+# Prometheus metrics
+curl http://127.0.0.1:8080/metrics
 
 # Test image resize
 curl "http://127.0.0.1:8080/insecure/f:webp/q:85/rs:fill:480:480/plain/https%3A%2F%2Fexample.com%2Fimage.jpg" -o test.webp
@@ -259,6 +275,63 @@ docker-compose logs -f
 
 # Video thumbnail
 /insecure/f:webp/rs:fit:400:400/plain/https%3A%2F%2Fexample.com%2Fvideo.mp4
+```
+
+## Monitoring and Metrics
+
+### Prometheus Metrics Endpoint
+
+The service exposes a `/metrics` endpoint that provides Prometheus-compatible metrics in text format.
+
+**Available Metrics:**
+
+1. **HTTP Request Metrics**
+   - `imgproxy_http_requests_total` - Total HTTP requests by endpoint, method, and status
+   - `imgproxy_http_request_duration_seconds` - HTTP request latencies (histogram)
+
+2. **Cache Metrics**
+   - `imgproxy_cache_hits_total` - Cache hits by type (original/processed)
+   - `imgproxy_cache_misses_total` - Cache misses by type
+
+3. **Processing Metrics**
+   - `imgproxy_images_processed_total` - Images processed by output format
+   - `imgproxy_videos_processed_total` - Video thumbnails extracted
+   - `imgproxy_processing_errors_total` - Processing errors by type
+
+4. **FFmpeg Metrics**
+   - `imgproxy_ffmpeg_semaphore_permits_available` - Available FFmpeg permits (gauge)
+   - `imgproxy_ffmpeg_semaphore_waiters` - Tasks waiting for FFmpeg (gauge)
+   - `imgproxy_ffmpeg_extractions_total` - FFmpeg extractions by status
+
+5. **Bandwidth Metrics**
+   - `imgproxy_bytes_downloaded_total` - Bytes downloaded from sources
+   - `imgproxy_bytes_served_total` - Bytes served to clients
+
+**Example Prometheus Scrape Config:**
+
+```yaml
+scrape_configs:
+  - job_name: 'imgproxy'
+    static_configs:
+      - targets: ['localhost:8080']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+```
+
+**Useful Queries:**
+
+```promql
+# Request rate by endpoint
+rate(imgproxy_http_requests_total[5m])
+
+# Cache hit ratio
+sum(rate(imgproxy_cache_hits_total[5m])) / (sum(rate(imgproxy_cache_hits_total[5m])) + sum(rate(imgproxy_cache_misses_total[5m])))
+
+# 95th percentile latency
+histogram_quantile(0.95, rate(imgproxy_http_request_duration_seconds_bucket[5m]))
+
+# FFmpeg queue depth
+imgproxy_ffmpeg_semaphore_waiters
 ```
 
 ## Debugging Tips

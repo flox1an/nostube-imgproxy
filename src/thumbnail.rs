@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{error, info};
 
-use crate::error::SvcError;
+use crate::{error::SvcError, metrics};
 
 #[derive(Clone)]
 pub struct ThumbnailState {
@@ -193,6 +193,8 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
             tracing::debug!("ffmpeg failed for {}: {}", video_url, stderr.lines().take(3).collect::<Vec<_>>().join(" | "));
         }
 
+        metrics::record_ffmpeg_extraction(false);
+
         return Err(SvcError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("ffmpeg failed: {}", stderr),
@@ -200,6 +202,8 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
     }
 
     tracing::debug!("ffmpeg successfully extracted thumbnail for: {}", video_url);
+
+    metrics::record_ffmpeg_extraction(true);
 
     // Read the generated thumbnail
     let thumbnail_data = tokio::fs::read(output_path)

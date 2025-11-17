@@ -5,6 +5,7 @@ mod blossom;
 mod cache;
 mod config;
 mod error;
+mod metrics;
 mod server;
 mod thumbnail;
 mod transform;
