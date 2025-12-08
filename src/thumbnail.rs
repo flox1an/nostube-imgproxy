@@ -36,6 +36,7 @@ pub fn is_video_url(url: &str) -> bool {
         || url_lower.ends_with(".mpeg")
         || url_lower.ends_with(".3gp")
         || url_lower.ends_with(".ogv")
+        || url_lower.ends_with(".m3u8")
 }
 
 /// Check if a URL is a Blossom CDN URL (has <sha256>.<ext> format)
