@@ -43,17 +43,16 @@ impl BlossomState {
         let cache_ttl = Duration::from_secs(cache_ttl_hours * 3600);
 
         // Initialize Nostr client with seed relays
+        // Note: We don't call client.connect() here to avoid persistent WebSocket connections
+        // The client will connect on-demand when fetch_events_from() is called
         let client = Client::default();
 
-        // Add all seed relays
+        // Add all seed relays (for reference, but not connected yet)
         for relay in SEED_RELAYS {
             if let Err(e) = client.add_relay(*relay).await {
                 warn!("Failed to add relay {}: {:?}", relay, e);
             }
         }
-
-        // Connect to relays
-        client.connect().await;
 
         Self {
             server_list_cache: Arc::new(RwLock::new(HashMap::new())),
