@@ -1,6 +1,6 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter_vec, register_gauge, register_histogram_vec, CounterVec, Gauge, HistogramVec,
+    register_counter_vec, register_histogram_vec, CounterVec, HistogramVec,
     TextEncoder, Encoder,
 };
 
@@ -58,19 +58,7 @@ lazy_static! {
     )
     .unwrap();
 
-    // FFmpeg semaphore metrics
-    pub static ref FFMPEG_SEMAPHORE_PERMITS_AVAILABLE: Gauge = register_gauge!(
-        "imgproxy_ffmpeg_semaphore_permits_available",
-        "Number of available FFmpeg semaphore permits"
-    )
-    .unwrap();
-
-    pub static ref FFMPEG_SEMAPHORE_WAITERS: Gauge = register_gauge!(
-        "imgproxy_ffmpeg_semaphore_waiters",
-        "Number of tasks waiting for FFmpeg semaphore"
-    )
-    .unwrap();
-
+    // FFmpeg extraction metrics
     pub static ref FFMPEG_EXTRACTIONS_TOTAL: CounterVec = register_counter_vec!(
         "imgproxy_ffmpeg_extractions_total",
         "Total number of FFmpeg thumbnail extractions",
@@ -168,10 +156,4 @@ pub fn record_bytes_served(content_type: &str, bytes: usize) {
     BYTES_SERVED_TOTAL
         .with_label_values(&[content_type])
         .inc_by(bytes as f64);
-}
-
-/// Update FFmpeg semaphore metrics
-pub fn update_ffmpeg_semaphore_metrics(permits_available: usize, waiters: usize) {
-    FFMPEG_SEMAPHORE_PERMITS_AVAILABLE.set(permits_available as f64);
-    FFMPEG_SEMAPHORE_WAITERS.set(waiters as f64);
 }
