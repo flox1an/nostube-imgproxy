@@ -5,6 +5,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// Servers that re-encode uploaded content, so the SHA256 in the URL does not
+/// correspond to the blob served. Do NOT use these as blossom fallbacks.
+pub const NON_BLOSSOM_SERVERS: &[&str] = &["video.nostr.build", "cdn.nostrcheck.me"];
+
 /// Seed relays for fetching user server lists (kind 10063)
 const SEED_RELAYS: &[&str] = &[
     "wss://nos.lol",
@@ -42,12 +46,11 @@ impl BlossomState {
     pub async fn new(cache_ttl_hours: u64) -> Self {
         let cache_ttl = Duration::from_secs(cache_ttl_hours * 3600);
 
-        // Initialize Nostr client with seed relays
-        // Note: We don't call client.connect() here to avoid persistent WebSocket connections
-        // The client will connect on-demand when fetch_events_from() is called
+        // Initialize Nostr client with seed relays.
+        // We don't call client.connect() here to avoid persistent WebSocket connections;
+        // the client connects on-demand when fetch_events_from() is called.
         let client = Client::default();
 
-        // Add all seed relays (for reference, but not connected yet)
         for relay in SEED_RELAYS {
             if let Err(e) = client.add_relay(*relay).await {
                 warn!("Failed to add relay {}: {:?}", relay, e);
@@ -63,16 +66,12 @@ impl BlossomState {
 
     /// Parse pubkey from string (supports both npub and hex formats)
     fn parse_pubkey(pubkey_str: &str) -> Result<PublicKey, String> {
-        // Try parsing as npub (Bech32) first
         if let Ok(pubkey) = PublicKey::from_bech32(pubkey_str) {
             return Ok(pubkey);
         }
-
-        // Try parsing as hex
         if let Ok(pubkey) = PublicKey::from_hex(pubkey_str) {
             return Ok(pubkey);
         }
-
         Err(format!("Invalid pubkey format: {}", pubkey_str))
     }
 
@@ -80,20 +79,19 @@ impl BlossomState {
     async fn fetch_author_servers(&self, pubkey: &PublicKey) -> Result<Vec<String>, String> {
         debug!("Fetching server list for pubkey: {}", pubkey);
 
-        // Create filter for kind 10063 events from this author
         let filter = Filter::new()
             .kind(Kind::from(10063))
             .author(*pubkey)
             .limit(10);
 
-        // Fetch events from relays with timeout
         let timeout = Duration::from_secs(10);
 
-        // Use fetch_events_from to fetch events from specific relays
         let events = match tokio::time::timeout(
             timeout,
-            self.client.fetch_events_from(SEED_RELAYS.to_vec(), vec![filter], Some(timeout))
-        ).await {
+            self.client.fetch_events_from(SEED_RELAYS.to_vec(), vec![filter], Some(timeout)),
+        )
+        .await
+        {
             Ok(Ok(events)) => events,
             Ok(Err(e)) => {
                 warn!("Failed to fetch events from Nostr: {:?}", e);
@@ -110,12 +108,9 @@ impl BlossomState {
             return Ok(Vec::new());
         }
 
-        // Get the most recent event
         let event = events.iter().max_by_key(|e| e.created_at).unwrap();
-
         debug!("Found server list event: {} with {} tags", event.id, event.tags.len());
 
-        // Extract server URLs from "server" tags
         let mut servers = Vec::new();
         for tag in event.tags.clone() {
             let tag_vec = tag.to_vec();
@@ -126,7 +121,6 @@ impl BlossomState {
         }
 
         info!("Found {} servers for pubkey {}: {:?}", servers.len(), pubkey, servers);
-
         Ok(servers)
     }
 
@@ -134,34 +128,71 @@ impl BlossomState {
     pub async fn get_author_servers(&self, pubkey_str: &str) -> Result<Vec<String>, String> {
         let pubkey = Self::parse_pubkey(pubkey_str)?;
 
-        // Check cache first
         {
             let cache = self.server_list_cache.read().await;
             if let Some(entry) = cache.get(&pubkey) {
-                // Check if cache is still valid
                 if entry.cached_at.elapsed() < self.cache_ttl {
                     debug!("Cache hit for pubkey {}", pubkey);
                     return Ok(entry.servers.clone());
-                } else {
-                    debug!("Cache expired for pubkey {}", pubkey);
                 }
+                debug!("Cache expired for pubkey {}", pubkey);
             }
         }
 
-        // Cache miss or expired - fetch from Nostr
         debug!("Cache miss for pubkey {}, fetching from Nostr", pubkey);
         let servers = self.fetch_author_servers(&pubkey).await?;
 
-        // Update cache
         {
             let mut cache = self.server_list_cache.write().await;
-            cache.insert(pubkey, CacheEntry {
-                servers: servers.clone(),
-                cached_at: Instant::now(),
-            });
+            cache.insert(
+                pubkey,
+                CacheEntry {
+                    servers: servers.clone(),
+                    cached_at: Instant::now(),
+                },
+            );
         }
 
         Ok(servers)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// URL utilities (shared across server.rs and thumbnail.rs)
+// ---------------------------------------------------------------------------
+
+/// Return true if `url` has the Blossom SHA-256 filename format **and** is not
+/// from a server that re-encodes content (whose hash therefore won't match).
+pub fn is_blossom_url(url: &str) -> bool {
+    // Extract hostname via string splitting — no url crate dep needed
+    let after_scheme = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    // authority is everything before the first '/'
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    // strip userinfo if present (user@host)
+    let host = authority.split('@').next_back().unwrap_or(authority).to_lowercase();
+    // Reject known re-encoding servers whose SHA-256 won't match the blob
+    if NON_BLOSSOM_SERVERS
+        .iter()
+        .any(|s| host == *s || host.ends_with(&format!(".{}", s)))
+    {
+        return false;
+    }
+    extract_blossom_hash(url).is_some()
+}
+
+/// Extract `(hash, ext)` from a Blossom URL path segment (`<sha256>.<ext>`).
+/// Returns `None` for non-blossom URLs or re-encoding servers.
+pub fn extract_blossom_hash(url: &str) -> Option<(&str, &str)> {
+    let filename = url.rsplit('/').next()?;
+    // Strip query string if any
+    let filename = filename.split('?').next().unwrap_or(filename);
+    let (hash_part, ext) = filename.rsplit_once('.')?;
+    if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some((hash_part, ext))
+    } else {
+        None
     }
 }
 
@@ -176,8 +207,8 @@ pub fn normalize_server_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
 }
 
-/// Combine and deduplicate server lists in priority order
-/// Priority: xs (highest) -> as -> fallback (lowest)
+/// Combine and deduplicate server lists in priority order:
+/// xs (explicit hints, highest) → as (author servers) → fallback (lowest)
 pub fn combine_server_lists(
     xs_servers: Option<&[String]>,
     as_servers: Option<&[String]>,
@@ -186,7 +217,6 @@ pub fn combine_server_lists(
     let mut seen = HashSet::new();
     let mut result = Vec::new();
 
-    // Helper to add servers with deduplication
     let mut add_servers = |servers: &[String]| {
         for server in servers {
             let normalized = normalize_server_url(server);
@@ -198,7 +228,6 @@ pub fn combine_server_lists(
         }
     };
 
-    // Add in priority order
     if let Some(xs) = xs_servers {
         add_servers(xs);
     }
@@ -208,6 +237,55 @@ pub fn combine_server_lists(
     add_servers(fallback_servers);
 
     result
+}
+
+/// Fetch a blob by trying each server in order.
+///
+/// Constructs `{server}/{hash}.{ext}` for each entry and returns on the first
+/// successful 2xx response.  `ext` must not be empty.
+pub async fn fetch_from_servers(
+    http: &reqwest::Client,
+    servers: &[String],
+    hash: &str,
+    ext: &str,
+) -> Result<bytes::Bytes, crate::error::SvcError> {
+    use crate::error::SvcError;
+
+    if servers.is_empty() {
+        return Err(SvcError::UpstreamError(404));
+    }
+
+    let mut last_err = SvcError::UpstreamError(404);
+
+    for (idx, server) in servers.iter().enumerate() {
+        let url = format!("{}/{}.{}", server.trim_end_matches('/'), hash, ext);
+        tracing::debug!("server {}/{}: {}", idx + 1, servers.len(), url);
+
+        match http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(b) => {
+                    tracing::info!("✓ server {}/{} ({}) → {} bytes", idx + 1, servers.len(), server, b.len());
+                    return Ok(b);
+                }
+                Err(e) => {
+                    tracing::debug!("✗ server {}/{} body read failed: {:?}", idx + 1, servers.len(), e);
+                    last_err = SvcError::UpstreamError(500);
+                }
+            },
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                tracing::debug!("✗ server {}/{} returned {}", idx + 1, servers.len(), status);
+                last_err = SvcError::UpstreamError(status);
+            }
+            Err(e) => {
+                tracing::debug!("✗ server {}/{} request error: {:?}", idx + 1, servers.len(), e);
+                last_err = SvcError::UpstreamError(500);
+            }
+        }
+    }
+
+    tracing::warn!("all {} servers failed for {}.{}", servers.len(), hash, ext);
+    Err(last_err)
 }
 
 #[cfg(test)]
@@ -231,10 +309,37 @@ mod tests {
 
         let combined = combine_server_lists(Some(&xs), Some(&as_s), &fallback);
 
-        // Should deduplicate SERVER1.COM and preserve order
         assert_eq!(combined.len(), 3);
         assert_eq!(combined[0], "https://server1.com");
         assert_eq!(combined[1], "https://server2.com");
         assert_eq!(combined[2], "https://server3.com");
+    }
+
+    #[test]
+    fn test_is_blossom_url_rejects_non_blossom_servers() {
+        let hash = "a".repeat(64);
+        assert!(!is_blossom_url(&format!("https://video.nostr.build/{}.mp4", hash)));
+        assert!(!is_blossom_url(&format!("https://cdn.nostrcheck.me/{}.mp4", hash)));
+        assert!(is_blossom_url(&format!("https://cdn.satellite.earth/{}.mp4", hash)));
+    }
+
+    #[test]
+    fn test_extract_blossom_hash() {
+        let hash = "b".repeat(64);
+        let url = format!("https://example.com/{}.mp4", hash);
+        let result = extract_blossom_hash(&url);
+        assert!(result.is_some());
+        let (h, ext) = result.unwrap();
+        assert_eq!(h, hash);
+        assert_eq!(ext, "mp4");
+    }
+
+    #[test]
+    fn test_extract_blossom_hash_with_query() {
+        let hash = "c".repeat(64);
+        let url = format!("https://example.com/{}.jpg?foo=bar", hash);
+        let (h, ext) = extract_blossom_hash(&url).unwrap();
+        assert_eq!(h, hash);
+        assert_eq!(ext, "jpg");
     }
 }

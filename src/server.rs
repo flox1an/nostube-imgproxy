@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
-    blossom::{combine_server_lists, BlossomState},
+    blossom::{combine_server_lists, extract_blossom_hash, fetch_from_servers, is_blossom_url, BlossomState},
     cache::{cache_path_for, original_cache_path_for, try_read_original_cache, try_serve_cache, write_cache_atomic},
     config::AppState,
     error::SvcError,
@@ -72,13 +72,19 @@ struct ThumbQuery {
     #[serde(rename = "q")]
     quality: Option<u8>,
 
-    /// Server hints (can be multiple)
+    /// Server hints — hostnames or full URLs (xs= can repeat)
     #[serde(rename = "xs", default)]
     server_hints: Vec<String>,
 
-    /// Author pubkey for Nostr-based lookup
+    /// Author pubkey (npub or hex) for kind 10063 relay lookup
     #[serde(rename = "as")]
     author_pubkey: Option<String>,
+
+    /// Max output width in pixels (from nostube proxyConfig.maxSize)
+    width: Option<u32>,
+
+    /// Max output height in pixels (from nostube proxyConfig.maxSize)
+    height: Option<u32>,
 }
 
 /// Simple health check endpoint
@@ -295,34 +301,64 @@ async fn handle_thumb(
 
     tracing::debug!("Resolved {} servers for {}.{}: {:?}", servers.len(), hash, ext, servers);
 
-    // Try to fetch from servers in order
+    // Build a representative video URL for cache keying and ffmpeg
+    // (server resolution happens separately below)
+    let is_video = is_video_url(&format!("{}.{}", hash, ext));
     let original_cache_key = format!("{}.{}", hash, ext);
     let original_cache_path = original_cache_path_for(&state.app.cfg, &original_cache_key);
 
-    // Check original cache first
+    // Check original cache first (stores thumbnail bytes for video hashes)
     let img_bytes = if let Some(cached) = try_read_original_cache(&original_cache_path).await? {
         metrics::record_cache_hit("original");
-        tracing::debug!("Original cache hit for {}.{}", hash, ext);
+        tracing::debug!("original cache hit for {}.{}", hash, ext);
         cached
     } else {
         metrics::record_cache_miss("original");
-        // Fetch from Blossom servers
-        let bytes = fetch_from_blossom_servers(&state.app, &servers, hash, ext).await?;
 
-        // Validate size
-        if bytes.len() > state.app.cfg.max_image_bytes {
-            metrics::record_processing_error("image_too_large");
-            return Err(SvcError::BadRequest("image too large"));
+        if is_video {
+            // Video hash: pick the first server URL and pass it to ffmpeg.
+            // ffmpeg streams the video — we don't buffer it in memory.
+            if servers.is_empty() {
+                return Err(SvcError::BadRequest("no servers available for video thumbnail"));
+            }
+            // Build the primary URL from the top-priority server; the remaining
+            // servers are passed as the fallback list so extract_video_thumbnail
+            // can try them in order.
+            let primary_url = format!("{}/{}.{}", servers[0].trim_end_matches('/'), hash, ext);
+            let thumbnail_bytes = extract_video_thumbnail(
+                &primary_url,
+                &state.thumbnail.ffmpeg_semaphore,
+                &servers,
+            )
+            .await?;
+
+            if thumbnail_bytes.len() > state.app.cfg.max_image_bytes {
+                metrics::record_processing_error("thumbnail_too_large");
+                return Err(SvcError::BadRequest("thumbnail too large"));
+            }
+
+            metrics::record_bytes_downloaded("video", thumbnail_bytes.len());
+            metrics::record_video_processed("webp"); // ffmpeg always emits WebP
+
+            write_cache_atomic(&original_cache_path, &thumbnail_bytes).await?;
+            thumbnail_bytes
+        } else {
+            // Image hash: fetch bytes from blossom servers
+            let bytes = fetch_from_servers(&state.app.http, &servers, hash, ext).await?;
+
+            if bytes.len() > state.app.cfg.max_image_bytes {
+                metrics::record_processing_error("image_too_large");
+                return Err(SvcError::BadRequest("image too large"));
+            }
+
+            metrics::record_bytes_downloaded("blossom", bytes.len());
+
+            write_cache_atomic(&original_cache_path, &bytes).await?;
+            bytes.to_vec()
         }
-
-        metrics::record_bytes_downloaded("blossom", bytes.len());
-
-        // Cache the original
-        write_cache_atomic(&original_cache_path, &bytes).await?;
-        bytes.to_vec()
     };
 
-    // Decode image
+    // Decode image (thumbnail bytes from ffmpeg are WebP; image bytes use guessed format)
     let img = {
         use std::io::Cursor;
         image::ImageReader::new(Cursor::new(&img_bytes))
@@ -337,7 +373,6 @@ async fn handle_thumb(
     // Encode
     let encoded = encode_image(&img, &dirs.out_fmt, dirs.quality)?;
 
-    // Record processing metrics
     let out_fmt_str = match dirs.out_fmt {
         OutFmt::Jpeg => "jpeg",
         OutFmt::Png => "png",
@@ -347,10 +382,8 @@ async fn handle_thumb(
     metrics::record_image_processed(out_fmt_str);
     metrics::record_bytes_served(mime, encoded.len());
 
-    // Write to processed cache
     write_cache_atomic(&cache_path, &encoded).await?;
 
-    // Build response
     let mut resp = Response::new(Body::from(encoded));
     *resp.status_mut() = StatusCode::OK;
     let headers = resp.headers_mut();
@@ -364,7 +397,6 @@ async fn handle_thumb(
         HeaderValue::from_static("miss"),
     );
 
-    // Record request metrics
     let duration = start_time.elapsed().as_secs_f64();
     metrics::observe_http_duration("/thumb", "GET", duration);
     metrics::record_http_request("/thumb", "GET", 200);
@@ -393,15 +425,17 @@ fn parse_thumb_params(params: &ThumbQuery) -> Result<Directives, SvcError> {
         return Err(SvcError::BadRequest("quality must be 0-100"));
     }
 
-    // Parse resize directive
+    // Parse resize directive.
+    // Priority: explicit `rs` param > `width`/`height` > default 480×480 fit.
     let resize = if let Some(ref rs) = params.resize {
         parse_resize_from_query(rs)?
     } else {
-        // Default: fit 480x480
+        let w = params.width.unwrap_or(480);
+        let h = params.height.unwrap_or(480);
         Resize {
             mode: ResizeMode::Fit,
-            w: 480,
-            h: 480,
+            w,
+            h,
         }
     };
 
@@ -453,192 +487,51 @@ fn build_query_string(params: &ThumbQuery) -> String {
     if let Some(ref as_) = params.author_pubkey {
         parts.push(format!("as={}", as_));
     }
+    if let Some(w) = params.width {
+        parts.push(format!("width={}", w));
+    }
+    if let Some(h) = params.height {
+        parts.push(format!("height={}", h));
+    }
 
     parts.join("&")
 }
 
-/// Fetch image from Blossom servers (try each in order)
-async fn fetch_from_blossom_servers(
-    state: &AppState,
-    servers: &[String],
-    hash: &str,
-    ext: &str,
-) -> Result<Bytes, SvcError> {
-    if servers.is_empty() {
-        return Err(SvcError::BadRequest("no servers available to fetch from"));
-    }
-
-    let mut last_error = None;
-
-    for (idx, server) in servers.iter().enumerate() {
-        let url = format!("{}/{}.{}", server.trim_end_matches('/'), hash, ext);
-        tracing::debug!("Attempting server {}/{}: {}", idx + 1, servers.len(), url);
-
-        match state.http.get(&url).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    match resp.bytes().await {
-                        Ok(bytes) => {
-                            tracing::info!(
-                                "✓ Server {}/{} succeeded: {} ({} bytes)",
-                                idx + 1,
-                                servers.len(),
-                                server,
-                                bytes.len()
-                            );
-                            return Ok(bytes);
-                        }
-                        Err(e) => {
-                            tracing::debug!("✗ Server {}/{} failed to read bytes: {:?}", idx + 1, servers.len(), e);
-                            last_error = Some(SvcError::UpstreamError(500));
-                        }
-                    }
-                } else {
-                    tracing::debug!(
-                        "✗ Server {}/{} returned status {}: {}",
-                        idx + 1,
-                        servers.len(),
-                        status,
-                        server
-                    );
-                    last_error = Some(SvcError::UpstreamError(status.as_u16()));
-                }
-            }
-            Err(e) => {
-                tracing::debug!("✗ Server {}/{} request failed: {:?}", idx + 1, servers.len(), e);
-                last_error = Some(SvcError::UpstreamError(500));
-            }
-        }
-    }
-
-    tracing::warn!("All {} servers failed for {}.{}", servers.len(), hash, ext);
-
-    // Return the last error or a generic not found
-    Err(last_error.unwrap_or(SvcError::UpstreamError(404)))
-}
-
-/// Check if a URL is a Blossom CDN URL (has <sha256>.<ext> format)
-fn is_blossom_url(url: &str) -> bool {
-    if let Some(filename) = url.rsplit('/').next() {
-        if let Some((hash_part, _ext)) = filename.rsplit_once('.') {
-            // SHA256 hash is 64 hexadecimal characters
-            return hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit());
-        }
-    }
-    false
-}
-
-/// Extract the hash and extension from a Blossom URL
-/// Returns (hash, extension) if valid, None otherwise
-fn extract_blossom_hash(url: &str) -> Option<(&str, &str)> {
-    if let Some(filename) = url.rsplit('/').next() {
-        if let Some((hash_part, ext)) = filename.rsplit_once('.') {
-            // SHA256 hash is 64 hexadecimal characters
-            if hash_part.len() == 64 && hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some((hash_part, ext));
-            }
-        }
-    }
-    None
-}
-
-/// Fetch source image from URL with Blossom fallback support
+/// Fetch source image from URL, with Blossom fallback when the primary fails.
 async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError> {
-    // Basic allowlist: only http/https
     if !(src_url.starts_with("http://") || src_url.starts_with("https://")) {
         return Err(SvcError::BadRequest("unsupported source scheme"));
     }
 
-    // Try original URL first
-    let result = async {
-        let resp = state.http.get(src_url).send().await?;
-        let status = resp.status();
-        if status.is_success() {
-            resp.bytes().await.map_err(Into::into)
-        } else {
-            tracing::debug!("primary server returned non-success status for image {}: {}", src_url, status);
-            Err(SvcError::UpstreamError(status.as_u16()))
+    // Try primary URL
+    match state.http.get(src_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let bytes = resp.bytes().await?;
+            tracing::debug!("primary fetch succeeded: {} ({} bytes)", src_url, bytes.len());
+            return Ok(bytes);
         }
-    }.await;
-
-    // If successful, return immediately
-    if let Ok(bytes) = &result {
-        tracing::debug!("primary server succeeded for image {}, received {} bytes", src_url, bytes.len());
-        return Ok(bytes.clone());
+        Ok(resp) => {
+            tracing::debug!("primary fetch returned {}: {}", resp.status(), src_url);
+        }
+        Err(e) => {
+            tracing::debug!("primary fetch error for {}: {:?}", src_url, e);
+        }
     }
 
-    // Log primary failure
-    tracing::debug!("primary server failed for image {}: {:?}", src_url, result);
-
-    // If failed and it's a Blossom URL, try fallback servers
+    // Blossom fallback: only when the URL has the SHA-256 filename format
+    // and is not from a re-encoding server
     if is_blossom_url(src_url) {
-        tracing::debug!("url is blossom format, attempting {} fallback servers", state.cfg.blossom_fallback_servers.len());
-
         if let Some((hash, ext)) = extract_blossom_hash(src_url) {
-            // Try each fallback server
-            for (idx, fallback_server) in state.cfg.blossom_fallback_servers.iter().enumerate() {
-                let fallback_url = format!("{}/{}.{}", fallback_server.trim_end_matches('/'), hash, ext);
-                tracing::debug!(
-                    "attempting fallback server {}/{} for image: {}",
-                    idx + 1,
-                    state.cfg.blossom_fallback_servers.len(),
-                    fallback_url
-                );
-
-                match state.http.get(&fallback_url).send().await {
-                    Ok(fallback_resp) => {
-                        let status = fallback_resp.status();
-                        if status.is_success() {
-                            match fallback_resp.bytes().await {
-                                Ok(bytes) => {
-                                    tracing::info!(
-                                        "✓ fallback server {} succeeded for image, received {} bytes from {}",
-                                        idx + 1,
-                                        bytes.len(),
-                                        fallback_server
-                                    );
-                                    return Ok(bytes);
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        "✗ fallback server {} failed to read response bytes: {:?}",
-                                        idx + 1,
-                                        e
-                                    );
-                                }
-                            }
-                        } else {
-                            tracing::debug!(
-                                "✗ fallback server {} returned status {} for {}",
-                                idx + 1,
-                                status,
-                                fallback_server
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "✗ fallback server {} request failed for {}: {:?}",
-                            idx + 1,
-                            fallback_server,
-                            e
-                        );
-                    }
-                }
-            }
-
-            tracing::warn!(
-                "all {} fallback servers exhausted for image {}, returning original error",
+            tracing::debug!(
+                "blossom fallback: trying {} servers for {}.{}",
                 state.cfg.blossom_fallback_servers.len(),
-                src_url
+                hash,
+                ext
             );
+            return fetch_from_servers(&state.http, &state.cfg.blossom_fallback_servers, hash, ext).await;
         }
-    } else {
-        tracing::debug!("url is not blossom format, skipping fallback servers");
     }
 
-    // All attempts failed - return original error
-    result
+    Err(SvcError::UpstreamError(404))
 }
 
