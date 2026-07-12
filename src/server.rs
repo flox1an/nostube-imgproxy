@@ -13,11 +13,18 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
-    blossom::{combine_server_lists, extract_blossom_hash, fetch_from_servers, is_blossom_url, BlossomState},
-    cache::{cache_path_for, original_cache_path_for, try_read_original_cache, try_serve_cache, write_cache_atomic},
+    blossom::{
+        combine_server_lists, extract_blossom_hash, fetch_from_servers, is_blossom_url,
+        BlossomState,
+    },
+    cache::{
+        cache_path_for, original_cache_path_for, try_read_original_cache, try_serve_cache,
+        write_cache_atomic,
+    },
     config::AppState,
     error::SvcError,
     metrics,
+    network_policy::validate_untrusted_url,
     thumbnail::{extract_video_thumbnail, is_video_url, ThumbnailState},
     transform::{apply_resize, encode_image, parse_rest, Directives, OutFmt, Resize, ResizeMode},
 };
@@ -117,8 +124,10 @@ async fn handle_insecure(
     // full_url is the exact request path for cache keying
     let full_request_url = format!("/insecure/{}", rest);
 
-    // Parse something like: f:webp/q:85/rs:fill:480:480/plain/<encoded>
+    // Parse and validate before any cache lookup. The request URL is untrusted
+    // and must never become an FFmpeg or HTTP target on this server.
     let (dirs, src_url) = parse_rest(&rest)?;
+    validate_untrusted_url(&src_url)?;
 
     // Derive cache file path from hash(full_request_url)
     let cache_path = cache_path_for(&state.app.cfg, &full_request_url, &dirs.out_fmt);
@@ -150,7 +159,8 @@ async fn handle_insecure(
                 &src_url,
                 &state.thumbnail.ffmpeg_semaphore,
                 &state.app.cfg.blossom_fallback_servers,
-            ).await?;
+            )
+            .await?;
 
             // Ensure max size
             if thumbnail_bytes.len() > state.app.cfg.max_image_bytes {
@@ -247,9 +257,9 @@ async fn handle_thumb(
     let start_time = std::time::Instant::now();
 
     // Validate filename format: <sha256>.<ext>
-    let (hash, ext) = filename
-        .rsplit_once('.')
-        .ok_or(SvcError::BadRequest("invalid filename format, expected <sha256>.<ext>"))?;
+    let (hash, ext) = filename.rsplit_once('.').ok_or(SvcError::BadRequest(
+        "invalid filename format, expected <sha256>.<ext>",
+    ))?;
 
     // Validate SHA256 hash (64 hex characters)
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -280,7 +290,11 @@ async fn handle_thumb(
         match state.blossom.get_author_servers(pubkey).await {
             Ok(s) => Some(s),
             Err(e) => {
-                tracing::warn!("Failed to fetch author servers for pubkey {}: {}", pubkey, e);
+                tracing::warn!(
+                    "Failed to fetch author servers for pubkey {}: {}",
+                    pubkey,
+                    e
+                );
                 None
             }
         }
@@ -299,7 +313,13 @@ async fn handle_thumb(
         &state.app.cfg.blossom_fallback_servers,
     );
 
-    tracing::debug!("Resolved {} servers for {}.{}: {:?}", servers.len(), hash, ext, servers);
+    tracing::debug!(
+        "Resolved {} servers for {}.{}: {:?}",
+        servers.len(),
+        hash,
+        ext,
+        servers
+    );
 
     // Build a representative video URL for cache keying and ffmpeg
     // (server resolution happens separately below)
@@ -319,18 +339,17 @@ async fn handle_thumb(
             // Video hash: pick the first server URL and pass it to ffmpeg.
             // ffmpeg streams the video — we don't buffer it in memory.
             if servers.is_empty() {
-                return Err(SvcError::BadRequest("no servers available for video thumbnail"));
+                return Err(SvcError::BadRequest(
+                    "no servers available for video thumbnail",
+                ));
             }
             // Build the primary URL from the top-priority server; the remaining
             // servers are passed as the fallback list so extract_video_thumbnail
             // can try them in order.
             let primary_url = format!("{}/{}.{}", servers[0].trim_end_matches('/'), hash, ext);
-            let thumbnail_bytes = extract_video_thumbnail(
-                &primary_url,
-                &state.thumbnail.ffmpeg_semaphore,
-                &servers,
-            )
-            .await?;
+            let thumbnail_bytes =
+                extract_video_thumbnail(&primary_url, &state.thumbnail.ffmpeg_semaphore, &servers)
+                    .await?;
 
             if thumbnail_bytes.len() > state.app.cfg.max_image_bytes {
                 metrics::record_processing_error("thumbnail_too_large");
@@ -450,7 +469,9 @@ fn parse_thumb_params(params: &ThumbQuery) -> Result<Directives, SvcError> {
 fn parse_resize_from_query(rs: &str) -> Result<Resize, SvcError> {
     let parts: Vec<&str> = rs.split(':').collect();
     if parts.len() != 3 {
-        return Err(SvcError::BadRequest("invalid resize format, expected mode:width:height"));
+        return Err(SvcError::BadRequest(
+            "invalid resize format, expected mode:width:height",
+        ));
     }
 
     let mode = match parts[0].to_ascii_lowercase().as_str() {
@@ -499,15 +520,17 @@ fn build_query_string(params: &ThumbQuery) -> String {
 
 /// Fetch source image from URL, with Blossom fallback when the primary fails.
 async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError> {
-    if !(src_url.starts_with("http://") || src_url.starts_with("https://")) {
-        return Err(SvcError::BadRequest("unsupported source scheme"));
-    }
+    validate_untrusted_url(src_url)?;
 
     // Try primary URL
     match state.http.get(src_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             let bytes = resp.bytes().await?;
-            tracing::debug!("primary fetch succeeded: {} ({} bytes)", src_url, bytes.len());
+            tracing::debug!(
+                "primary fetch succeeded: {} ({} bytes)",
+                src_url,
+                bytes.len()
+            );
             return Ok(bytes);
         }
         Ok(resp) => {
@@ -528,10 +551,10 @@ async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError
                 hash,
                 ext
             );
-            return fetch_from_servers(&state.http, &state.cfg.blossom_fallback_servers, hash, ext).await;
+            return fetch_from_servers(&state.http, &state.cfg.blossom_fallback_servers, hash, ext)
+                .await;
         }
     }
 
     Err(SvcError::UpstreamError(404))
 }
-

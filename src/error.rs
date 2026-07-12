@@ -34,12 +34,20 @@ impl IntoResponse for SvcError {
                 };
                 (status_code, message)
             }
-            SvcError::Fetch(_) => (StatusCode::BAD_GATEWAY, "Failed to fetch source image".to_string()),
-            SvcError::Decode(_) => (StatusCode::UNPROCESSABLE_ENTITY, "Failed to decode image".to_string()),
-            SvcError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string()),
+            SvcError::Fetch(_) => (
+                StatusCode::BAD_GATEWAY,
+                "Failed to fetch source image".to_string(),
+            ),
+            SvcError::Decode(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Failed to decode image".to_string(),
+            ),
+            SvcError::Io(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            ),
             SvcError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         (status, message).into_response()
     }
 }
-

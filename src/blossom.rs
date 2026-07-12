@@ -1,3 +1,4 @@
+use crate::network_policy::is_allowed_untrusted_server;
 use nostr_sdk::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -88,7 +89,8 @@ impl BlossomState {
 
         let events = match tokio::time::timeout(
             timeout,
-            self.client.fetch_events_from(SEED_RELAYS.to_vec(), vec![filter], Some(timeout)),
+            self.client
+                .fetch_events_from(SEED_RELAYS.to_vec(), vec![filter], Some(timeout)),
         )
         .await
         {
@@ -109,7 +111,11 @@ impl BlossomState {
         }
 
         let event = events.iter().max_by_key(|e| e.created_at).unwrap();
-        debug!("Found server list event: {} with {} tags", event.id, event.tags.len());
+        debug!(
+            "Found server list event: {} with {} tags",
+            event.id,
+            event.tags.len()
+        );
 
         let mut servers = Vec::new();
         for tag in event.tags.clone() {
@@ -120,7 +126,12 @@ impl BlossomState {
             }
         }
 
-        info!("Found {} servers for pubkey {}: {:?}", servers.len(), pubkey, servers);
+        info!(
+            "Found {} servers for pubkey {}: {:?}",
+            servers.len(),
+            pubkey,
+            servers
+        );
         Ok(servers)
     }
 
@@ -171,7 +182,11 @@ pub fn is_blossom_url(url: &str) -> bool {
     // authority is everything before the first '/'
     let authority = after_scheme.split('/').next().unwrap_or("");
     // strip userinfo if present (user@host)
-    let host = authority.split('@').next_back().unwrap_or(authority).to_lowercase();
+    let host = authority
+        .split('@')
+        .next_back()
+        .unwrap_or(authority)
+        .to_lowercase();
     // Reject known re-encoding servers whose SHA-256 won't match the blob
     if NON_BLOSSOM_SERVERS
         .iter()
@@ -220,6 +235,10 @@ pub fn combine_server_lists(
     let mut add_servers = |servers: &[String]| {
         for server in servers {
             let normalized = normalize_server_url(server);
+            if !is_allowed_untrusted_server(&normalized) {
+                warn!("Ignoring private or invalid Blossom upstream: {}", server);
+                continue;
+            }
             let lowercase = normalized.to_lowercase();
             if !seen.contains(&lowercase) {
                 seen.insert(lowercase);
@@ -258,17 +277,32 @@ pub async fn fetch_from_servers(
     let mut last_err = SvcError::UpstreamError(404);
 
     for (idx, server) in servers.iter().enumerate() {
+        if !is_allowed_untrusted_server(server) {
+            tracing::warn!("Skipping private or invalid Blossom upstream: {}", server);
+            continue;
+        }
         let url = format!("{}/{}.{}", server.trim_end_matches('/'), hash, ext);
         tracing::debug!("server {}/{}: {}", idx + 1, servers.len(), url);
 
         match http.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                 Ok(b) => {
-                    tracing::info!("✓ server {}/{} ({}) → {} bytes", idx + 1, servers.len(), server, b.len());
+                    tracing::info!(
+                        "✓ server {}/{} ({}) → {} bytes",
+                        idx + 1,
+                        servers.len(),
+                        server,
+                        b.len()
+                    );
                     return Ok(b);
                 }
                 Err(e) => {
-                    tracing::debug!("✗ server {}/{} body read failed: {:?}", idx + 1, servers.len(), e);
+                    tracing::debug!(
+                        "✗ server {}/{} body read failed: {:?}",
+                        idx + 1,
+                        servers.len(),
+                        e
+                    );
                     last_err = SvcError::UpstreamError(500);
                 }
             },
@@ -278,7 +312,12 @@ pub async fn fetch_from_servers(
                 last_err = SvcError::UpstreamError(status);
             }
             Err(e) => {
-                tracing::debug!("✗ server {}/{} request error: {:?}", idx + 1, servers.len(), e);
+                tracing::debug!(
+                    "✗ server {}/{} request error: {:?}",
+                    idx + 1,
+                    servers.len(),
+                    e
+                );
                 last_err = SvcError::UpstreamError(500);
             }
         }
@@ -296,9 +335,18 @@ mod tests {
     fn test_normalize_server_url() {
         assert_eq!(normalize_server_url("example.com"), "https://example.com");
         assert_eq!(normalize_server_url("example.com/"), "https://example.com");
-        assert_eq!(normalize_server_url("https://example.com"), "https://example.com");
-        assert_eq!(normalize_server_url("https://example.com/"), "https://example.com");
-        assert_eq!(normalize_server_url("http://example.com"), "http://example.com");
+        assert_eq!(
+            normalize_server_url("https://example.com"),
+            "https://example.com"
+        );
+        assert_eq!(
+            normalize_server_url("https://example.com/"),
+            "https://example.com"
+        );
+        assert_eq!(
+            normalize_server_url("http://example.com"),
+            "http://example.com"
+        );
     }
 
     #[test]
@@ -316,11 +364,33 @@ mod tests {
     }
 
     #[test]
+    fn test_combine_server_lists_rejects_private_hints() {
+        let xs = vec![
+            "127.0.0.1:3000".to_string(),
+            "https://cdn.example.com".to_string(),
+        ];
+        let author_servers = vec!["http://10.0.0.2".to_string()];
+
+        let combined = combine_server_lists(Some(&xs), Some(&author_servers), &[]);
+
+        assert_eq!(combined, vec!["https://cdn.example.com"]);
+    }
+
+    #[test]
     fn test_is_blossom_url_rejects_non_blossom_servers() {
         let hash = "a".repeat(64);
-        assert!(!is_blossom_url(&format!("https://video.nostr.build/{}.mp4", hash)));
-        assert!(!is_blossom_url(&format!("https://cdn.nostrcheck.me/{}.mp4", hash)));
-        assert!(is_blossom_url(&format!("https://cdn.satellite.earth/{}.mp4", hash)));
+        assert!(!is_blossom_url(&format!(
+            "https://video.nostr.build/{}.mp4",
+            hash
+        )));
+        assert!(!is_blossom_url(&format!(
+            "https://cdn.nostrcheck.me/{}.mp4",
+            hash
+        )));
+        assert!(is_blossom_url(&format!(
+            "https://cdn.satellite.earth/{}.mp4",
+            hash
+        )));
     }
 
     #[test]

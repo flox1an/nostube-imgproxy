@@ -7,7 +7,7 @@ edition = "2021"
 axum = { version = "0.8", features = ["http1", "json"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync", "process", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync", "process", "signal", "net"] }
 http = "1"
 hyper = { version = "1", features = ["http1", "server"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "brotli"] }
@@ -30,4 +30,5 @@ nostr-sdk = "0.37"
 serde = { version = "1", features = ["derive"] }
 prometheus = "0.13"
 lazy_static = "1.4"
+url = "2"
 

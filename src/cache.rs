@@ -44,10 +44,7 @@ pub async fn try_serve_cache(path: &Path, mime: &str) -> Result<Option<Response>
         let mut resp = Response::new(Body::from(bytes));
         *resp.status_mut() = StatusCode::OK;
         let headers = resp.headers_mut();
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_str(mime).unwrap(),
-        );
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
         headers.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -84,7 +81,7 @@ pub async fn write_cache_atomic(path: &Path, bytes: &[u8]) -> Result<(), SvcErro
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, &path)?;
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -101,20 +98,17 @@ pub async fn janitor_loop(cfg: AppCfg) {
 /// Run a single cleanup pass
 async fn run_cleanup(cfg: &AppCfg) -> Result<(), std::io::Error> {
     let now = SystemTime::now();
-    
+
     // Clean both original and processed cache directories
     let original_dir = cfg.cache_dir.join("original");
     let processed_dir = cfg.cache_dir.join("processed");
-    
+
     for cache_dir in [original_dir, processed_dir] {
         if !cache_dir.exists() {
             continue;
         }
-        
-        for entry in WalkDir::new(&cache_dir)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+
+        for entry in WalkDir::new(&cache_dir).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -128,4 +122,3 @@ async fn run_cleanup(cfg: &AppCfg) -> Result<(), std::io::Error> {
     }
     Ok(())
 }
-

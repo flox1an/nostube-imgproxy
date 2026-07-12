@@ -146,7 +146,7 @@ fn parse_resize_directive(arg: &str) -> Result<Resize, SvcError> {
             .parse()
             .map_err(|_| SvcError::BadRequest("bad width"))?
     };
-    
+
     let h: u32 = if parts[2].is_empty() {
         0
     } else {
@@ -161,7 +161,7 @@ fn parse_resize_directive(arg: &str) -> Result<Resize, SvcError> {
 /// Apply resize transformation based on the resize mode
 pub fn apply_resize(img: DynamicImage, resize: &Resize) -> DynamicImage {
     let (src_w, src_h) = img.dimensions();
-    
+
     // Calculate missing dimension based on aspect ratio
     let (target_w, target_h) = calculate_dimensions(src_w, src_h, resize.w, resize.h);
 
@@ -214,10 +214,10 @@ fn apply_resize_fit(img: DynamicImage, target_w: u32, target_h: u32) -> DynamicI
 
     // Scale to fit within the box
     let scale = f32::min(target_w as f32 / w as f32, target_h as f32 / h as f32);
-    
+
     // Don't upscale if image is smaller
     let scale = f32::min(scale, 1.0);
-    
+
     let new_w = (w as f32 * scale).round() as u32;
     let new_h = (h as f32 * scale).round() as u32;
 
@@ -247,10 +247,10 @@ fn apply_resize_fill_down(img: DynamicImage, target_w: u32, target_h: u32) -> Dy
 
     // Scale to fill the box
     let scale = f32::max(target_w as f32 / w as f32, target_h as f32 / h as f32);
-    
+
     // Don't upscale
     let scale = f32::min(scale, 1.0);
-    
+
     let new_w = (w as f32 * scale).ceil() as u32;
     let new_h = (h as f32 * scale).ceil() as u32;
 
@@ -259,7 +259,7 @@ fn apply_resize_fill_down(img: DynamicImage, target_w: u32, target_h: u32) -> Dy
     // If smaller than target, crop to maintain aspect ratio
     let crop_w = new_w.min(target_w);
     let crop_h = new_h.min(target_h);
-    
+
     // Center crop
     let x = (new_w.saturating_sub(crop_w)) / 2;
     let y = (new_h.saturating_sub(crop_h)) / 2;
@@ -286,7 +286,7 @@ pub fn encode_image(img: &DynamicImage, fmt: &OutFmt, quality: u8) -> Result<Vec
         OutFmt::Webp => {
             // Use lossy WebP encoding with quality control
             let webp_data = webp::Encoder::from_image(img)
-                .map_err(|e| SvcError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+                .map_err(|e| SvcError::Io(std::io::Error::other(e)))?
                 .encode(quality as f32);
             out.extend_from_slice(&webp_data);
         }
@@ -311,14 +311,10 @@ pub fn encode_image(img: &DynamicImage, fmt: &OutFmt, quality: u8) -> Result<Vec
                 .with_quality(quality as f32)
                 .with_speed(6);
             let encoded = encoder.encode_rgba(avif_img).map_err(|e| {
-                SvcError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("AVIF encode error: {}", e),
-                ))
+                SvcError::Io(std::io::Error::other(format!("AVIF encode error: {}", e)))
             })?;
             out.extend_from_slice(&encoded.avif_file);
         }
     }
     Ok(out)
 }
-

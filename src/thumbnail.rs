@@ -3,9 +3,7 @@ use tokio::sync::Semaphore;
 use tracing::{error, info};
 
 use crate::{
-    blossom::extract_blossom_hash,
-    error::SvcError,
-    metrics,
+    blossom::extract_blossom_hash, error::SvcError, metrics, network_policy::validate_untrusted_url,
 };
 
 #[derive(Clone)]
@@ -76,10 +74,20 @@ pub async fn extract_video_thumbnail(
         }
     }
 
+    candidates.retain(|url| validate_untrusted_url(url).is_ok());
+    if candidates.is_empty() {
+        return Err(SvcError::BadRequest("no safe video thumbnail source"));
+    }
+
     let mut last_error = SvcError::UpstreamError(404);
 
     for (idx, url) in candidates.iter().enumerate() {
-        tracing::debug!("thumbnail attempt {}/{}: {}", idx + 1, candidates.len(), url);
+        tracing::debug!(
+            "thumbnail attempt {}/{}: {}",
+            idx + 1,
+            candidates.len(),
+            url
+        );
         match extract_thumbnail_with_ffmpeg(url).await {
             Ok(bytes) => {
                 tracing::info!(
@@ -92,23 +100,31 @@ pub async fn extract_video_thumbnail(
                 return Ok(bytes);
             }
             Err(e) => {
-                tracing::debug!("✗ thumbnail {}/{} failed: {:?}", idx + 1, candidates.len(), e);
+                tracing::debug!(
+                    "✗ thumbnail {}/{} failed: {:?}",
+                    idx + 1,
+                    candidates.len(),
+                    e
+                );
                 last_error = e;
             }
         }
     }
 
-    tracing::warn!("all {} candidates exhausted for {}", candidates.len(), video_url);
+    tracing::warn!(
+        "all {} candidates exhausted for {}",
+        candidates.len(),
+        video_url
+    );
     Err(last_error)
 }
 
 /// Extract a thumbnail from a video using ffmpeg CLI
 async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcError> {
     use tokio::process::Command;
-    
+
     // Create a temporary file for the output
-    let temp_file = tempfile::NamedTempFile::new()
-        .map_err(SvcError::Io)?;
+    let temp_file = tempfile::NamedTempFile::new().map_err(SvcError::Io)?;
     let output_path = temp_file.path();
 
     // Run ffmpeg to extract thumbnail
@@ -118,13 +134,20 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
 
     let output = Command::new("ffmpeg")
         .args([
-            "-ss", "0.5",
-            "-i", video_url,
-            "-vframes", "1",
-            "-vf", "scale=-1:'min(720,ih)'",
-            "-q:v", "80",
-            "-c:v", "libwebp",
-            "-f", "image2",
+            "-ss",
+            "0.5",
+            "-i",
+            video_url,
+            "-vframes",
+            "1",
+            "-vf",
+            "scale=-1:'min(720,ih)'",
+            "-q:v",
+            "80",
+            "-c:v",
+            "libwebp",
+            "-f",
+            "image2",
             "-y",
         ])
         .arg(output_path)
@@ -141,22 +164,34 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
 
         // Check for common error patterns
         let is_timeout = stderr.contains("timed out") || stderr.contains("Connection timed out");
-        let is_network_error = stderr.contains("Connection refused") || stderr.contains("Could not resolve host");
+        let is_network_error =
+            stderr.contains("Connection refused") || stderr.contains("Could not resolve host");
         let is_404 = stderr.contains("404") || stderr.contains("Not Found");
 
         if is_timeout {
             tracing::debug!("ffmpeg timeout for {}: connection timed out", video_url);
         } else if is_network_error {
-            tracing::debug!("ffmpeg network error for {}: {}", video_url, stderr.lines().next().unwrap_or("unknown"));
+            tracing::debug!(
+                "ffmpeg network error for {}: {}",
+                video_url,
+                stderr.lines().next().unwrap_or("unknown")
+            );
         } else if is_404 {
             tracing::debug!("ffmpeg 404 error for {}: resource not found", video_url);
         } else {
-            tracing::debug!("ffmpeg failed for {}: {}", video_url, stderr.lines().take(3).collect::<Vec<_>>().join(" | "));
+            tracing::debug!(
+                "ffmpeg failed for {}: {}",
+                video_url,
+                stderr.lines().take(3).collect::<Vec<_>>().join(" | ")
+            );
         }
 
         metrics::record_ffmpeg_extraction(false);
 
-        return Err(SvcError::Io(std::io::Error::other(format!("ffmpeg failed: {}", stderr))));
+        return Err(SvcError::Io(std::io::Error::other(format!(
+            "ffmpeg failed: {}",
+            stderr
+        ))));
     }
 
     tracing::debug!("ffmpeg successfully extracted thumbnail for: {}", video_url);
@@ -164,13 +199,10 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
     metrics::record_ffmpeg_extraction(true);
 
     // Read the generated thumbnail
-    let thumbnail_data = tokio::fs::read(output_path)
-        .await
-        .map_err(|e| {
-            error!("failed to read thumbnail output: {}", e);
-            SvcError::Io(e)
-        })?;
+    let thumbnail_data = tokio::fs::read(output_path).await.map_err(|e| {
+        error!("failed to read thumbnail output: {}", e);
+        SvcError::Io(e)
+    })?;
 
     Ok(thumbnail_data)
 }
-

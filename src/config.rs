@@ -1,5 +1,6 @@
+use crate::network_policy::public_dns_resolver;
+use reqwest::{redirect, Client};
 use std::{path::PathBuf, time::Duration};
-use reqwest::Client;
 
 #[derive(Clone)]
 pub struct AppCfg {
@@ -60,6 +61,8 @@ impl AppState {
     pub fn new(cfg: AppCfg) -> Self {
         let http = Client::builder()
             .timeout(cfg.fetch_timeout)
+            .redirect(redirect::Policy::none())
+            .dns_resolver(public_dns_resolver())
             .user_agent("rust-imgproxy/0.1")
             .build()
             .expect("reqwest client");
@@ -67,4 +70,3 @@ impl AppState {
         Self { cfg, http }
     }
 }
-

@@ -6,6 +6,7 @@ mod cache;
 mod config;
 mod error;
 mod metrics;
+mod network_policy;
 mod server;
 mod thumbnail;
 mod transform;
@@ -21,7 +22,7 @@ async fn main() {
     init_tracing();
 
     let cfg = AppCfg::from_env();
-    
+
     // Create cache directories
     fs::create_dir_all(cfg.cache_dir.join("original")).expect("create original cache dir");
     fs::create_dir_all(cfg.cache_dir.join("processed")).expect("create processed cache dir");
@@ -49,15 +50,13 @@ async fn main() {
     let app = create_router(state, thumbnail_state, blossom_state);
 
     info!(addr = bind_addr, "listening");
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .unwrap();
-    
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
-    
+
     info!("server shutdown complete");
 }
 
@@ -93,7 +92,5 @@ async fn shutdown_signal() {
 
 fn init_tracing() {
     let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 }

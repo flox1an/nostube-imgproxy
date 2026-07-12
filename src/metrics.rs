@@ -1,7 +1,6 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter_vec, register_histogram_vec, CounterVec, HistogramVec,
-    TextEncoder, Encoder,
+    register_counter_vec, register_histogram_vec, CounterVec, Encoder, HistogramVec, TextEncoder,
 };
 
 lazy_static! {
@@ -139,9 +138,7 @@ pub fn record_processing_error(error_type: &str) {
 /// Record FFmpeg extraction
 pub fn record_ffmpeg_extraction(success: bool) {
     let status = if success { "success" } else { "failure" };
-    FFMPEG_EXTRACTIONS_TOTAL
-        .with_label_values(&[status])
-        .inc();
+    FFMPEG_EXTRACTIONS_TOTAL.with_label_values(&[status]).inc();
 }
 
 /// Record bytes downloaded
