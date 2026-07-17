@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 use tokio::sync::Semaphore;
 use tracing::{error, info};
 
@@ -43,15 +43,13 @@ pub fn is_video_url(url: &str) -> bool {
         || path.ends_with(".m3u8")
 }
 
-/// Extract a video thumbnail by trying candidate URLs in order.
-///
-/// `video_url` is always tried first.  If `servers` is non-empty and `video_url`
-/// has the Blossom SHA-256 filename format, each server's `{server}/{hash}.{ext}`
-/// URL is appended as an additional candidate.  Duplicates are skipped.
+/// Extract a video thumbnail by trying server-derived and discovered candidates.
 pub async fn extract_video_thumbnail(
     video_url: &str,
     semaphore: &Arc<Semaphore>,
     servers: &[String],
+    discovered_urls: &[String],
+    deadline: Instant,
 ) -> Result<Vec<u8>, SvcError> {
     info!("extracting thumbnail from video: {}", video_url);
 
@@ -73,8 +71,11 @@ pub async fn extract_video_thumbnail(
             }
         }
     }
+    candidates.extend(discovered_urls.iter().cloned());
 
-    candidates.retain(|url| validate_untrusted_url(url).is_ok());
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|url| validate_untrusted_url(url).is_ok() && seen.insert(url.clone()));
+
     if candidates.is_empty() {
         return Err(SvcError::BadRequest("no safe video thumbnail source"));
     }
@@ -82,14 +83,19 @@ pub async fn extract_video_thumbnail(
     let mut last_error = SvcError::UpstreamError(404);
 
     for (idx, url) in candidates.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            last_error = SvcError::UpstreamError(504);
+            break;
+        }
         tracing::debug!(
             "thumbnail attempt {}/{}: {}",
             idx + 1,
             candidates.len(),
             url
         );
-        match extract_thumbnail_with_ffmpeg(url).await {
-            Ok(bytes) => {
+        match tokio::time::timeout(remaining, extract_thumbnail_with_ffmpeg(url)).await {
+            Ok(Ok(bytes)) => {
                 tracing::info!(
                     "✓ thumbnail {}/{} ({} bytes) from {}",
                     idx + 1,
@@ -99,14 +105,19 @@ pub async fn extract_video_thumbnail(
                 );
                 return Ok(bytes);
             }
-            Err(e) => {
+            Ok(Err(error)) => {
                 tracing::debug!(
                     "✗ thumbnail {}/{} failed: {:?}",
                     idx + 1,
                     candidates.len(),
-                    e
+                    error
                 );
-                last_error = e;
+                last_error = error;
+            }
+            Err(_) => {
+                tracing::debug!("✗ thumbnail {}/{} timed out", idx + 1, candidates.len());
+                last_error = SvcError::UpstreamError(504);
+                break;
             }
         }
     }

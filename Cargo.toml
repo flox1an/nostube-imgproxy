@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.8", features = ["http1", "json"] }
+axum-extra = { version = "0.10", features = ["query"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync", "process", "signal", "net"] }

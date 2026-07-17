@@ -8,6 +8,7 @@ pub struct AppCfg {
     pub cache_dir: PathBuf,
     pub cache_ttl: Duration,
     pub fetch_timeout: Duration,
+    pub blossom_failover_timeout: Duration,
     pub max_image_bytes: usize,
     pub blossom_fallback_servers: Vec<String>,
 }
@@ -41,6 +42,12 @@ impl AppCfg {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(10),
+            ),
+            blossom_failover_timeout: Duration::from_secs(
+                std::env::var("BLOSSOM_FAILOVER_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(15),
             ),
             max_image_bytes: std::env::var("MAX_IMAGE_BYTES")
                 .ok()

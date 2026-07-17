@@ -1,4 +1,4 @@
-use std::{fs, sync::Arc};
+use std::{fs, sync::Arc, time::Duration};
 use tracing::info;
 
 mod blossom;
@@ -37,12 +37,38 @@ async fn main() {
         .unwrap_or(8);
     let thumbnail_state = Arc::new(ThumbnailState::new(max_ffmpeg_concurrent));
 
-    // Create blossom state with configurable cache TTL
+    // Keep transient relay failures short-lived while retaining successful lists.
     let blossom_cache_ttl_hours = std::env::var("BLOSSOM_SERVER_LIST_CACHE_TTL_HOURS")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or(24);
-    let blossom_state = Arc::new(BlossomState::new(blossom_cache_ttl_hours).await);
+    let blossom_failure_cache_ttl = Duration::from_secs(
+        std::env::var("BLOSSOM_SERVER_LIST_FAILURE_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300),
+    );
+    let blossom_discovery_cache_ttl = Duration::from_secs(
+        std::env::var("BLOSSOM_DISCOVERY_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3600),
+    );
+    let blossom_discovery_timeout = Duration::from_secs(
+        std::env::var("BLOSSOM_DISCOVERY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3),
+    );
+    let blossom_state = Arc::new(
+        BlossomState::new(
+            Duration::from_secs(blossom_cache_ttl_hours * 3600),
+            blossom_failure_cache_ttl,
+            blossom_discovery_cache_ttl,
+            blossom_discovery_timeout,
+        )
+        .await,
+    );
 
     // Spawn janitor
     tokio::spawn(async move { janitor_loop(cfg).await });
