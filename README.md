@@ -185,9 +185,15 @@ Configure via environment variables:
 | `CACHE_DIR` | `./cache` | Cache directory path |
 | `CACHE_TTL_SECS` | `86400` (24h) | Cache TTL in seconds |
 | `FETCH_TIMEOUT_SECS` | `10` | HTTP fetch timeout |
+| `BLOSSOM_NEGATIVE_CACHE_NOT_FOUND_TTL_SECS` | `900` (15m) | Cache 404/410 Blossom candidates; `0` disables this class |
+| `BLOSSOM_NEGATIVE_CACHE_PERMANENT_TTL_SECS` | `3600` (1h) | Cache 3xx and non-transient 4xx Blossom candidates; `0` disables this class |
+| `BLOSSOM_NEGATIVE_CACHE_TRANSIENT_TTL_SECS` | `60` | Cache timeouts, transport failures, 429, and 5xx Blossom candidates; `0` disables this class |
 | `MAX_IMAGE_BYTES` | `16777216` (16 MiB) | Max image size |
 | `MAX_FFMPEG_CONCURRENT` | `8` | Max concurrent FFmpeg processes (requests wait if limit reached) |
 | `RUST_LOG` | `info` | Log level |
+
+Blossom candidate failures are retained only in memory, per candidate URL, up to 10,000 entries.
+Repeated requests skip an unexpired failed URL but still try newly supplied or discovered candidates.
 
 Example:
 

@@ -158,6 +158,7 @@ async fn handle_insecure(
                 &state.thumbnail.ffmpeg_semaphore,
                 &[],
                 &[],
+                None,
                 Instant::now() + state.app.cfg.fetch_timeout,
             )
             .await?;
@@ -369,6 +370,7 @@ async fn handle_thumb(
                 &state.thumbnail.ffmpeg_semaphore,
                 &servers,
                 &discovered_urls,
+                Some((&state.app.http, state.blossom.candidate_failure_cache())),
                 deadline,
             )
             .await?;
@@ -386,6 +388,7 @@ async fn handle_thumb(
         } else {
             let bytes = fetch_blob(
                 &state.app.http,
+                state.blossom.candidate_failure_cache(),
                 &servers,
                 &discovered_urls,
                 &hash,

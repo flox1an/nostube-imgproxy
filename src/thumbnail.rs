@@ -3,7 +3,12 @@ use tokio::sync::Semaphore;
 use tracing::{error, info};
 
 use crate::{
-    blossom::extract_blossom_hash, error::SvcError, metrics, network_policy::validate_untrusted_url,
+    blossom::{
+        extract_blossom_hash, CandidateFailureCache, CandidateFailureClass, CandidateFailureSummary,
+    },
+    error::SvcError,
+    metrics,
+    network_policy::validate_untrusted_url,
 };
 
 #[derive(Clone)]
@@ -49,6 +54,7 @@ pub async fn extract_video_thumbnail(
     semaphore: &Arc<Semaphore>,
     servers: &[String],
     discovered_urls: &[String],
+    negative_cache: Option<(&reqwest::Client, &CandidateFailureCache)>,
     deadline: Instant,
 ) -> Result<Vec<u8>, SvcError> {
     info!("extracting thumbnail from video: {}", video_url);
@@ -80,12 +86,32 @@ pub async fn extract_video_thumbnail(
         return Err(SvcError::BadRequest("no safe video thumbnail source"));
     }
 
+    let mut failures = CandidateFailureSummary::default();
     let mut last_error = SvcError::UpstreamError(404);
+    let mut attempted = 0;
 
     for (idx, url) in candidates.iter().enumerate() {
+        if let Some((_, cache)) = negative_cache {
+            if let Some(class) = cache.lookup(url).await {
+                metrics::record_cache_hit("blossom_negative");
+                tracing::debug!(
+                    ?class,
+                    candidate = %url,
+                    "skipping negatively cached video candidate"
+                );
+                failures.record(class);
+                continue;
+            }
+        }
+        attempted += 1;
+
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             last_error = SvcError::UpstreamError(504);
+            if let Some((_, cache)) = negative_cache {
+                cache.remember(url, CandidateFailureClass::Transient).await;
+                failures.record(CandidateFailureClass::Transient);
+            }
             break;
         }
         tracing::debug!(
@@ -112,11 +138,21 @@ pub async fn extract_video_thumbnail(
                     candidates.len(),
                     error
                 );
+                if let Some((http, cache)) = negative_cache {
+                    let class = classify_video_failure(http, url, deadline).await;
+                    cache.remember(url, class).await;
+                    failures.record(class);
+                    tracing::debug!(?class, candidate = %url, "cached failed video candidate");
+                }
                 last_error = error;
             }
             Err(_) => {
                 tracing::debug!("✗ thumbnail {}/{} timed out", idx + 1, candidates.len());
                 last_error = SvcError::UpstreamError(504);
+                if let Some((_, cache)) = negative_cache {
+                    cache.remember(url, CandidateFailureClass::Transient).await;
+                    failures.record(CandidateFailureClass::Transient);
+                }
                 break;
             }
         }
@@ -127,7 +163,36 @@ pub async fn extract_video_thumbnail(
         candidates.len(),
         video_url
     );
-    Err(last_error)
+    if negative_cache.is_some() && attempted == 0 {
+        Err(failures.into_error())
+    } else {
+        Err(last_error)
+    }
+}
+
+/// Classify an FFmpeg failure by probing only the failed candidate.
+async fn classify_video_failure(
+    http: &reqwest::Client,
+    url: &str,
+    deadline: Instant,
+) -> CandidateFailureClass {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return CandidateFailureClass::Transient;
+    }
+
+    match tokio::time::timeout(
+        remaining,
+        http.get(url)
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) if response.status().is_success() => CandidateFailureClass::Transient,
+        Ok(Ok(response)) => CandidateFailureClass::from_status(response.status().as_u16()),
+        Ok(Err(_)) | Err(_) => CandidateFailureClass::Transient,
+    }
 }
 
 /// Extract a thumbnail from a video using ffmpeg CLI
@@ -216,4 +281,58 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
     })?;
 
     Ok(thumbnail_data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{http::StatusCode, routing::get, Router};
+
+    #[tokio::test]
+    async fn classify_video_failure_maps_not_found_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(get(|| async { StatusCode::NOT_FOUND })),
+            )
+            .await
+            .unwrap();
+        });
+
+        let class = classify_video_failure(
+            &reqwest::Client::new(),
+            &format!("http://{address}/missing.mp4"),
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(class, CandidateFailureClass::Missing);
+    }
+
+    #[tokio::test]
+    async fn extract_video_thumbnail_skips_negatively_cached_candidate() {
+        let cache = CandidateFailureCache::new(
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        );
+        let url = format!("https://cdn.example.com/{}.mp4", "a".repeat(64));
+        cache.remember(&url, CandidateFailureClass::Missing).await;
+        let http = reqwest::Client::new();
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let result = extract_video_thumbnail(
+            &url,
+            &semaphore,
+            &[],
+            &[],
+            Some((&http, &cache)),
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(result, Err(SvcError::UpstreamError(404))));
+    }
 }

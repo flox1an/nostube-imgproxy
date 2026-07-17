@@ -11,7 +11,7 @@ mod server;
 mod thumbnail;
 mod transform;
 
-use blossom::BlossomState;
+use blossom::{BlossomState, CandidateFailureCache};
 use cache::janitor_loop;
 use config::{AppCfg, AppState};
 use server::create_router;
@@ -60,12 +60,18 @@ async fn main() {
             .and_then(|value| value.parse().ok())
             .unwrap_or(3),
     );
+    let candidate_failure_cache = CandidateFailureCache::new(
+        cfg.blossom_negative_not_found_ttl,
+        cfg.blossom_negative_permanent_ttl,
+        cfg.blossom_negative_transient_ttl,
+    );
     let blossom_state = Arc::new(
         BlossomState::new(
             Duration::from_secs(blossom_cache_ttl_hours * 3600),
             blossom_failure_cache_ttl,
             blossom_discovery_cache_ttl,
             blossom_discovery_timeout,
+            candidate_failure_cache,
         )
         .await,
     );

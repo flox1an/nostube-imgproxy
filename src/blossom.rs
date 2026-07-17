@@ -22,18 +22,150 @@ const SEED_RELAYS: &[&str] = &[
     "wss://purplerelay.com",
 ];
 
+/// Classification of a failed candidate URL for negative caching.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CandidateFailureClass {
+    Missing,
+    Forbidden,
+    Permanent,
+    Transient,
+}
+
+impl CandidateFailureClass {
+    pub(crate) fn from_status(status: u16) -> Self {
+        match status {
+            404 | 410 => Self::Missing,
+            401 | 403 => Self::Forbidden,
+            408 | 429 => Self::Transient,
+            300..=499 => Self::Permanent,
+            _ => Self::Transient,
+        }
+    }
+
+    fn from_error(error: &crate::error::SvcError) -> Self {
+        match error {
+            crate::error::SvcError::UpstreamError(status) => Self::from_status(*status),
+            _ => Self::Transient,
+        }
+    }
+}
+
+/// Aggregates all candidate failure classes into one stable client response.
+#[derive(Default)]
+pub struct CandidateFailureSummary {
+    classes: HashSet<CandidateFailureClass>,
+}
+
+impl CandidateFailureSummary {
+    pub fn record(&mut self, class: CandidateFailureClass) {
+        self.classes.insert(class);
+    }
+
+    pub fn into_error(self) -> crate::error::SvcError {
+        use crate::error::SvcError;
+
+        match self.classes.len() {
+            0 => SvcError::UpstreamError(404),
+            1 if self.classes.contains(&CandidateFailureClass::Missing) => {
+                SvcError::UpstreamError(404)
+            }
+            1 if self.classes.contains(&CandidateFailureClass::Forbidden) => {
+                SvcError::UpstreamError(403)
+            }
+            _ => SvcError::UpstreamError(502),
+        }
+    }
+}
+
+/// An in-memory cache entry for a failed blob candidate URL.
+#[derive(Clone, Copy, Debug)]
+struct CandidateFailureCacheEntry {
+    class: CandidateFailureClass,
+    expires_at: Instant,
+}
+
+/// Bounded, in-memory negative cache for immutable blob candidate URLs.
+#[derive(Clone)]
+pub struct CandidateFailureCache {
+    entries: Arc<RwLock<HashMap<String, CandidateFailureCacheEntry>>>,
+    not_found_ttl: Duration,
+    permanent_ttl: Duration,
+    transient_ttl: Duration,
+}
+
+const MAX_CANDIDATE_FAILURE_CACHE_ENTRIES: usize = 10_000;
+
+impl CandidateFailureCache {
+    pub fn new(not_found_ttl: Duration, permanent_ttl: Duration, transient_ttl: Duration) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            not_found_ttl,
+            permanent_ttl,
+            transient_ttl,
+        }
+    }
+
+    fn ttl_for(&self, class: CandidateFailureClass) -> Duration {
+        match class {
+            CandidateFailureClass::Missing => self.not_found_ttl,
+            CandidateFailureClass::Forbidden | CandidateFailureClass::Permanent => {
+                self.permanent_ttl
+            }
+            CandidateFailureClass::Transient => self.transient_ttl,
+        }
+    }
+
+    /// Return an unexpired cached class, removing expired entries opportunistically.
+    pub async fn lookup(&self, url: &str) -> Option<CandidateFailureClass> {
+        let now = Instant::now();
+        let mut entries = self.entries.write().await;
+        entries.retain(|_, entry| entry.expires_at > now);
+        entries.get(url).map(|entry| entry.class)
+    }
+
+    /// Remember a candidate failure unless its class is explicitly disabled with TTL zero.
+    pub async fn remember(&self, url: &str, class: CandidateFailureClass) {
+        let ttl = self.ttl_for(class);
+        if ttl.is_zero() {
+            return;
+        }
+
+        let now = Instant::now();
+        let Some(expires_at) = now.checked_add(ttl) else {
+            return;
+        };
+        let mut entries = self.entries.write().await;
+        entries.retain(|_, entry| entry.expires_at > now);
+
+        if !entries.contains_key(url) && entries.len() >= MAX_CANDIDATE_FAILURE_CACHE_ENTRIES {
+            if let Some(oldest_url) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(url, _)| url.clone())
+            {
+                entries.remove(&oldest_url);
+            }
+        }
+
+        entries.insert(
+            url.to_string(),
+            CandidateFailureCacheEntry { class, expires_at },
+        );
+    }
+}
+
+/// Cache entry for a resolved author server list.
+#[derive(Clone, Debug)]
+struct AuthorServerCacheEntry {
+    result: AuthorServerLookup,
+    cached_at: Instant,
+}
+
 /// Cached outcome of an author server-list lookup.
 #[derive(Clone, Debug)]
 enum AuthorServerLookup {
     Servers(Vec<String>),
     Failed,
-}
-
-/// Cache entry for an author server list.
-#[derive(Clone, Debug)]
-struct AuthorServerCacheEntry {
-    result: AuthorServerLookup,
-    cached_at: Instant,
 }
 
 /// Cache entry for NIP-94 locations discovered by blob hash.
@@ -42,13 +174,14 @@ struct BlobLocationCacheEntry {
     urls: Vec<String>,
     cached_at: Instant,
 }
-
 /// State for Blossom server resolution with caching.
 pub struct BlossomState {
     /// Cache of author pubkey -> server list outcome.
     server_list_cache: Arc<RwLock<HashMap<PublicKey, AuthorServerCacheEntry>>>,
     /// Cache of blob hash -> NIP-94 locations.
     blob_location_cache: Arc<RwLock<HashMap<String, BlobLocationCacheEntry>>>,
+    /// Failed candidate URLs, bounded in-memory and scoped to their failure class TTL.
+    candidate_failure_cache: CandidateFailureCache,
     /// TTL for a successful kind-10063 lookup.
     cache_ttl: Duration,
     /// TTL for a failed kind-10063 lookup.
@@ -62,12 +195,13 @@ pub struct BlossomState {
 }
 
 impl BlossomState {
-    /// Create Blossom resolution state with independent positive and failure TTLs.
+    /// Create Blossom resolution state with independent cache TTLs.
     pub async fn new(
         cache_ttl: Duration,
         failure_cache_ttl: Duration,
         discovery_cache_ttl: Duration,
         discovery_timeout: Duration,
+        candidate_failure_cache: CandidateFailureCache,
     ) -> Self {
         // Initialize Nostr client with seed relays.
         // We don't call client.connect() here to avoid persistent WebSocket connections;
@@ -85,6 +219,7 @@ impl BlossomState {
             blob_location_cache: Arc::new(RwLock::new(HashMap::new())),
             cache_ttl,
             failure_cache_ttl,
+            candidate_failure_cache,
             discovery_cache_ttl,
             discovery_timeout,
             client,
@@ -92,6 +227,10 @@ impl BlossomState {
     }
 
     /// Parse pubkey from string (supports both npub and hex formats).
+    pub fn candidate_failure_cache(&self) -> &CandidateFailureCache {
+        &self.candidate_failure_cache
+    }
+
     fn parse_pubkey(pubkey_str: &str) -> Result<PublicKey, String> {
         if let Ok(pubkey) = PublicKey::from_bech32(pubkey_str) {
             return Ok(pubkey);
@@ -372,63 +511,100 @@ async fn fetch_candidate(
 /// All candidates share one deadline and successful bytes must match `hash`.
 pub async fn fetch_blob(
     http: &reqwest::Client,
+    candidate_failure_cache: &CandidateFailureCache,
     servers: &[String],
     discovered_urls: &[String],
     hash: &str,
     ext: Option<&str>,
     deadline: Instant,
 ) -> Result<bytes::Bytes, crate::error::SvcError> {
-    use crate::error::SvcError;
-
-    let mut last_error = SvcError::UpstreamError(404);
-    let mut attempted = 0;
+    let mut candidates = Vec::with_capacity(servers.len() + discovered_urls.len());
     let mut seen = HashSet::new();
 
     for server in servers {
         let url = blob_url(server, hash, ext);
-        if !seen.insert(url.clone()) {
+        if seen.insert(url.clone()) {
+            candidates.push(url);
+        }
+    }
+    for url in discovered_urls {
+        if seen.insert(url.clone()) {
+            candidates.push(url.clone());
+        }
+    }
+
+    let mut failures = CandidateFailureSummary::default();
+    let mut last_error = crate::error::SvcError::UpstreamError(404);
+    let mut attempted = 0;
+    let mut skipped = 0;
+
+    for url in candidates {
+        if let Some(class) = candidate_failure_cache.lookup(&url).await {
+            crate::metrics::record_cache_hit("blossom_negative");
+            debug!(?class, candidate = %url, "skipping negatively cached blob candidate");
+            failures.record(class);
+            skipped += 1;
             continue;
         }
+
         attempted += 1;
         match fetch_candidate(http, &url, hash, deadline).await {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
-                debug!("Blob candidate {} failed: {:?}", url, error);
+                let class = CandidateFailureClass::from_error(&error);
+                debug!(?class, candidate = %url, ?error, "blob candidate failed");
+                candidate_failure_cache.remember(&url, class).await;
+                failures.record(class);
                 last_error = error;
             }
         }
     }
 
-    for url in discovered_urls {
-        if !seen.insert(url.clone()) {
-            continue;
-        }
-        attempted += 1;
-        match fetch_candidate(http, url, hash, deadline).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(error) => {
-                debug!("Discovered blob candidate {} failed: {:?}", url, error);
-                last_error = error;
-            }
-        }
-    }
-
-    warn!("all {} blob candidates failed for {}", attempted, hash);
-    Err(last_error)
+    warn!(
+        attempted,
+        skipped, "all blob candidates failed for {}", hash
+    );
+    Err(if attempted == 0 {
+        failures.into_error()
+    } else {
+        last_error
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::SvcError;
-    use axum::{routing::get, Router};
-    use std::{net::SocketAddr, time::Duration};
+    use axum::{http::StatusCode, routing::get, Router};
+    use std::{
+        net::SocketAddr,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     async fn spawn_blob_server(body: Vec<u8>) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app = Router::new().fallback(get(move || {
             let body = body.clone();
             async move { body }
+        }));
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        address
+    }
+    async fn spawn_status_server(status: StatusCode, requests: Arc<AtomicUsize>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = Router::new().fallback(get(move || {
+            let requests = requests.clone();
+            async move {
+                requests.fetch_add(1, Ordering::Relaxed);
+                status
+            }
         }));
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -519,6 +695,116 @@ mod tests {
         assert!(has_expected_hash(bytes, &hash));
         assert!(!has_expected_hash(bytes, &"0".repeat(64)));
     }
+    #[test]
+    fn candidate_failure_summary_returns_deterministic_error() {
+        let mut missing = CandidateFailureSummary::default();
+        missing.record(CandidateFailureClass::Missing);
+        assert!(matches!(missing.into_error(), SvcError::UpstreamError(404)));
+
+        let mut forbidden = CandidateFailureSummary::default();
+        forbidden.record(CandidateFailureClass::Forbidden);
+        assert!(matches!(
+            forbidden.into_error(),
+            SvcError::UpstreamError(403)
+        ));
+
+        let mut mixed = CandidateFailureSummary::default();
+        mixed.record(CandidateFailureClass::Missing);
+        mixed.record(CandidateFailureClass::Transient);
+        assert!(matches!(mixed.into_error(), SvcError::UpstreamError(502)));
+        assert_eq!(
+            CandidateFailureClass::from_status(429),
+            CandidateFailureClass::Transient
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_failure_cache_zero_ttl_does_not_store_failure() {
+        let cache = CandidateFailureCache::new(Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        cache
+            .remember(
+                "https://missing.example/blob.jpg",
+                CandidateFailureClass::Missing,
+            )
+            .await;
+
+        assert_eq!(cache.lookup("https://missing.example/blob.jpg").await, None);
+    }
+
+    #[tokio::test]
+    async fn candidate_failure_cache_evicts_earliest_expiring_entry_at_capacity() {
+        let cache = CandidateFailureCache::new(
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        for index in 0..MAX_CANDIDATE_FAILURE_CACHE_ENTRIES {
+            cache
+                .remember(
+                    &format!("https://missing.example/{index}"),
+                    CandidateFailureClass::Transient,
+                )
+                .await;
+        }
+        cache
+            .remember(
+                "https://missing.example/new",
+                CandidateFailureClass::Missing,
+            )
+            .await;
+
+        let entries = cache.entries.read().await;
+        assert_eq!(entries.len(), MAX_CANDIDATE_FAILURE_CACHE_ENTRIES);
+        assert!(entries.contains_key("https://missing.example/new"));
+    }
+
+    #[tokio::test]
+    async fn fetch_blob_skips_negatively_cached_missing_candidate() {
+        let expected_bytes = b"verified blob".to_vec();
+        let hash = hex::encode(Sha256::digest(&expected_bytes));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let missing_server = spawn_status_server(StatusCode::NOT_FOUND, requests.clone()).await;
+        let verified_server = spawn_blob_server(expected_bytes.clone()).await;
+        let http = reqwest::Client::builder()
+            .resolve("missing.example", missing_server)
+            .resolve("verified.example", verified_server)
+            .build()
+            .unwrap();
+        let missing = format!("http://missing.example:{}", missing_server.port());
+        let verified = format!("http://verified.example:{}", verified_server.port());
+        let cache = CandidateFailureCache::new(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+
+        let first = fetch_blob(
+            &http,
+            &cache,
+            std::slice::from_ref(&missing),
+            &[],
+            &hash,
+            Some("bin"),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(first, Err(SvcError::UpstreamError(404))));
+
+        let bytes = fetch_blob(
+            &http,
+            &cache,
+            &[missing, verified],
+            &[],
+            &hash,
+            Some("bin"),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes.as_ref(), expected_bytes);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn fetch_blob_skips_corrupt_candidate() {
@@ -535,9 +821,15 @@ mod tests {
             format!("http://corrupt.example:{}", corrupt_server.port()),
             format!("http://verified.example:{}", verified_server.port()),
         ];
+        let failure_cache = CandidateFailureCache::new(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
 
         let bytes = fetch_blob(
             &http,
+            &failure_cache,
             &servers,
             &[],
             &hash,
@@ -552,8 +844,14 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_blob_honors_aggregate_deadline() {
+        let failure_cache = CandidateFailureCache::new(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
         let result = fetch_blob(
             &reqwest::Client::new(),
+            &failure_cache,
             &["https://cdn.example.com".to_string()],
             &[],
             &"a".repeat(64),

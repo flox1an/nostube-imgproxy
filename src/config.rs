@@ -11,6 +11,9 @@ pub struct AppCfg {
     pub blossom_failover_timeout: Duration,
     pub max_image_bytes: usize,
     pub blossom_fallback_servers: Vec<String>,
+    pub blossom_negative_not_found_ttl: Duration,
+    pub blossom_negative_permanent_ttl: Duration,
+    pub blossom_negative_transient_ttl: Duration,
 }
 
 impl AppCfg {
@@ -54,6 +57,24 @@ impl AppCfg {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(16 * 1024 * 1024),
             blossom_fallback_servers,
+            blossom_negative_not_found_ttl: Duration::from_secs(
+                std::env::var("BLOSSOM_NEGATIVE_CACHE_NOT_FOUND_TTL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(900),
+            ),
+            blossom_negative_permanent_ttl: Duration::from_secs(
+                std::env::var("BLOSSOM_NEGATIVE_CACHE_PERMANENT_TTL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(3600),
+            ),
+            blossom_negative_transient_ttl: Duration::from_secs(
+                std::env::var("BLOSSOM_NEGATIVE_CACHE_TRANSIENT_TTL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(60),
+            ),
         }
     }
 }
