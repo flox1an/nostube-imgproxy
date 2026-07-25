@@ -6,10 +6,13 @@
 pub mod blossom;
 pub mod cache;
 pub mod config;
+pub mod cpu;
 pub mod error;
+pub mod fetch;
 pub mod metrics;
 pub mod network_policy;
 pub mod server;
+pub mod singleflight;
 pub mod thumbnail;
 pub mod transform;
 

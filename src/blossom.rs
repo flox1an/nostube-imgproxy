@@ -42,7 +42,7 @@ impl CandidateFailureClass {
         }
     }
 
-    fn from_error(error: &crate::error::SvcError) -> Self {
+    pub(crate) fn from_error(error: &crate::error::SvcError) -> Self {
         match error {
             crate::error::SvcError::UpstreamError(status) => Self::from_status(*status),
             _ => Self::Transient,
@@ -516,6 +516,7 @@ async fn fetch_candidate(
     url: &str,
     hash: &str,
     deadline: Instant,
+    max_bytes: usize,
 ) -> Result<bytes::Bytes, crate::error::SvcError> {
     use crate::error::SvcError;
 
@@ -532,7 +533,7 @@ async fn fetch_candidate(
         if !response.status().is_success() {
             return Err(SvcError::UpstreamError(response.status().as_u16()));
         }
-        response.bytes().await.map_err(SvcError::from)
+        crate::fetch::read_body_capped(response, max_bytes).await
     })
     .await
     .map_err(|_| SvcError::UpstreamError(504))?
@@ -547,7 +548,9 @@ async fn fetch_candidate(
 
 /// Fetch a hash-addressed blob through server-derived and NIP-94 direct URLs.
 ///
-/// All candidates share one deadline and successful bytes must match `hash`.
+/// All candidates share one deadline, every body is capped at `max_bytes`, and
+/// successful bytes must match `hash`.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_blob(
     http: &reqwest::Client,
     candidate_failure_cache: &CandidateFailureCache,
@@ -556,6 +559,7 @@ pub async fn fetch_blob(
     hash: &str,
     ext: Option<&str>,
     deadline: Instant,
+    max_bytes: usize,
 ) -> Result<bytes::Bytes, crate::error::SvcError> {
     let mut candidates = Vec::with_capacity(servers.len() + discovered_urls.len());
     let mut seen = HashSet::new();
@@ -587,7 +591,7 @@ pub async fn fetch_blob(
         }
 
         attempted += 1;
-        match fetch_candidate(http, &url, hash, deadline).await {
+        match fetch_candidate(http, &url, hash, deadline, max_bytes).await {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 let class = CandidateFailureClass::from_error(&error);
@@ -826,6 +830,7 @@ mod tests {
             &hash,
             Some("bin"),
             Instant::now() + Duration::from_secs(1),
+            1024 * 1024,
         )
         .await;
         assert!(matches!(first, Err(SvcError::UpstreamError(404))));
@@ -838,6 +843,7 @@ mod tests {
             &hash,
             Some("bin"),
             Instant::now() + Duration::from_secs(1),
+            1024 * 1024,
         )
         .await
         .unwrap();
@@ -876,6 +882,7 @@ mod tests {
             &hash,
             Some("bin"),
             Instant::now() + Duration::from_secs(1),
+            1024 * 1024,
         )
         .await
         .unwrap();
@@ -899,6 +906,7 @@ mod tests {
             &"a".repeat(64),
             Some("jpg"),
             Instant::now(),
+            1024 * 1024,
         )
         .await;
 

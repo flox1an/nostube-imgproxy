@@ -1,22 +1,26 @@
 use std::{
-    fs,
-    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime},
 };
 
 use axum::{
     body::Body,
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
 use http::HeaderName;
 use sha2::{Digest, Sha256};
 use tokio::{fs as tokio_fs, time::sleep};
+use tokio_util::io::ReaderStream;
 use tracing::error;
 use walkdir::WalkDir;
 
 use crate::{config::AppCfg, error::SvcError, transform::OutFmt};
+
+const IMMUTABLE_CACHE_CONTROL: HeaderValue =
+    HeaderValue::from_static("public, max-age=31536000, immutable");
+const X_CACHE: HeaderName = HeaderName::from_static("x-cache");
 
 /// Generate cache file path for processed images
 pub fn cache_path_for(cfg: &AppCfg, request_url: &str, fmt: &OutFmt) -> PathBuf {
@@ -38,24 +42,82 @@ pub fn original_cache_path_for(cfg: &AppCfg, source_url: &str) -> PathBuf {
     cfg.cache_dir.join("original").join(hash)
 }
 
-/// Try to serve a response from cache
-pub async fn try_serve_cache(path: &Path, mime: &str) -> Result<Option<Response>, SvcError> {
-    if let Ok(bytes) = tokio_fs::read(path).await {
-        let mut resp = Response::new(Body::from(bytes));
-        *resp.status_mut() = StatusCode::OK;
-        let headers = resp.headers_mut();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
-        headers.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=31536000, immutable"),
-        );
-        headers.insert(
-            HeaderName::from_static("x-cache"),
-            HeaderValue::from_static("hit"),
-        );
-        return Ok(Some(resp));
+/// Strong ETag for a cache entry.
+///
+/// The file stem is already the SHA-256 of the fully-qualified request, so it
+/// is a free, exact validator — no extra hashing, and it lets repeat visitors
+/// take a 304 instead of the whole payload.
+pub fn etag_for(path: &Path) -> Option<HeaderValue> {
+    let stem = path.file_stem()?.to_str()?;
+    HeaderValue::from_str(&format!("\"{stem}\"")).ok()
+}
+
+/// True when the client already holds this exact entity.
+fn if_none_match_hits(request_headers: &HeaderMap, etag: &HeaderValue) -> bool {
+    request_headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|candidate| {
+            candidate == "*" || candidate.trim_start_matches("W/") == etag.to_str().unwrap_or("")
+        })
+}
+
+/// Apply the headers every cached-derivative response carries.
+fn decorate(headers: &mut HeaderMap, mime: &str, etag: Option<&HeaderValue>, cache_state: &str) {
+    if let Ok(content_type) = HeaderValue::from_str(mime) {
+        headers.insert(header::CONTENT_TYPE, content_type);
     }
-    Ok(None)
+    headers.insert(header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL);
+    if let Ok(state) = HeaderValue::from_str(cache_state) {
+        headers.insert(X_CACHE, state);
+    }
+    if let Some(etag) = etag {
+        headers.insert(header::ETAG, etag.clone());
+    }
+}
+
+/// Headers for a freshly produced (not cached) derivative.
+pub fn fresh_response_headers(headers: &mut HeaderMap, mime: &str, path: &Path, cache_state: &str) {
+    decorate(headers, mime, etag_for(path).as_ref(), cache_state);
+}
+
+/// Try to serve a response from cache.
+///
+/// Streams the file rather than buffering it, and answers `If-None-Match` with
+/// a bodyless 304 — by far the cheapest possible hit for an edge node.
+pub async fn try_serve_cache(
+    path: &Path,
+    mime: &str,
+    request_headers: &HeaderMap,
+) -> Result<Option<Response>, SvcError> {
+    let Ok(file) = tokio_fs::File::open(path).await else {
+        return Ok(None);
+    };
+    let len = match file.metadata().await {
+        Ok(meta) if meta.is_file() => meta.len(),
+        _ => return Ok(None),
+    };
+
+    let etag = etag_for(path);
+
+    if let Some(etag) = etag.as_ref() {
+        if if_none_match_hits(request_headers, etag) {
+            let mut resp = Response::new(Body::empty());
+            *resp.status_mut() = StatusCode::NOT_MODIFIED;
+            decorate(resp.headers_mut(), mime, Some(etag), "hit");
+            return Ok(Some(resp));
+        }
+    }
+
+    let mut resp = Response::new(Body::from_stream(ReaderStream::new(file)));
+    *resp.status_mut() = StatusCode::OK;
+    let headers = resp.headers_mut();
+    decorate(headers, mime, etag.as_ref(), "hit");
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    Ok(Some(resp))
 }
 
 /// Try to read original image from cache
@@ -66,22 +128,40 @@ pub async fn try_read_original_cache(path: &Path) -> Result<Option<Vec<u8>>, Svc
     }
 }
 
-/// Write data to cache atomically
+/// Write data to cache atomically.
+///
+/// The temporary name carries a process-unique counter: a fixed
+/// `<name>.tmp` lets two concurrent writers for the same key interleave into
+/// one file and then both rename it, publishing a torn entry that is served as
+/// `immutable` for a year.
+///
+/// There is deliberately no `fsync`: every cached byte is regenerable, and
+/// syncing each derivative costs tens of milliseconds on the eMMC/SD storage an
+/// edge node usually has.
 pub async fn write_cache_atomic(path: &Path, bytes: &[u8]) -> Result<(), SvcError> {
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        tokio_fs::create_dir_all(parent).await?;
-    }
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let tmp = path.with_extension("tmp");
+    let parent = path.parent().unwrap_or(Path::new("."));
+    tokio_fs::create_dir_all(parent).await?;
 
-    // Sync write via std::fs to ensure durability
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("entry");
+    let tmp = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    if let Err(error) = tokio_fs::write(&tmp, bytes).await {
+        let _ = tokio_fs::remove_file(&tmp).await;
+        return Err(error.into());
     }
-    fs::rename(&tmp, path)?;
+    if let Err(error) = tokio_fs::rename(&tmp, path).await {
+        let _ = tokio_fs::remove_file(&tmp).await;
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -95,32 +175,39 @@ pub async fn janitor_loop(cfg: AppCfg) {
     }
 }
 
-/// Run a single cleanup pass
+/// Run a single cleanup pass.
+///
+/// The walk plus a `metadata` call per entry is unbounded blocking I/O, so it
+/// runs on a blocking thread rather than stalling an async worker every minute.
 async fn run_cleanup(cfg: &AppCfg) -> Result<(), std::io::Error> {
-    let now = SystemTime::now();
+    let cache_dir = cfg.cache_dir.clone();
+    let cache_ttl = cfg.cache_ttl;
 
-    // Clean both original and processed cache directories
-    let original_dir = cfg.cache_dir.join("original");
-    let processed_dir = cfg.cache_dir.join("processed");
+    tokio::task::spawn_blocking(move || {
+        let now = SystemTime::now();
 
-    for cache_dir in [original_dir, processed_dir] {
-        if !cache_dir.exists() {
-            continue;
-        }
-
-        for entry in WalkDir::new(&cache_dir).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() {
+        for sub_dir in ["original", "processed"] {
+            let dir = cache_dir.join(sub_dir);
+            if !dir.exists() {
                 continue;
             }
-            let p = entry.path();
-            let meta = fs::metadata(p)?;
-            let created = meta.created().or_else(|_| meta.modified())?;
-            if now.duration_since(created).unwrap_or(Duration::ZERO) > cfg.cache_ttl {
-                let _ = fs::remove_file(p);
+
+            for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let meta = std::fs::metadata(path)?;
+                let created = meta.created().or_else(|_| meta.modified())?;
+                if now.duration_since(created).unwrap_or(Duration::ZERO) > cache_ttl {
+                    let _ = std::fs::remove_file(path);
+                }
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|error| Err(std::io::Error::other(error)))
 }
 
 #[cfg(test)]
@@ -140,6 +227,12 @@ mod tests {
             blossom_negative_not_found_ttl: Duration::from_secs(1),
             blossom_negative_permanent_ttl: Duration::from_secs(1),
             blossom_negative_transient_ttl: Duration::from_secs(1),
+            max_image_dimension: 4096,
+            max_decode_alloc_bytes: 64 * 1024 * 1024,
+            cpu_concurrency: 1,
+            max_inflight_requests: 8,
+            request_timeout: Duration::from_secs(5),
+            ffmpeg_timeout: Duration::from_secs(5),
         }
     }
 
@@ -230,9 +323,44 @@ mod tests {
 
         write_cache_atomic(&path, b"payload").await.unwrap();
 
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp files left behind: {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn write_cache_atomic_keeps_concurrent_writers_from_tearing_an_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hot.webp");
+        // Two payloads of different lengths: a shared tmp path would let the
+        // writes interleave and publish something that is neither.
+        let short = vec![b'a'; 4096];
+        let long = vec![b'b'; 65_536];
+
+        let writers: Vec<_> = (0..16)
+            .map(|index| {
+                let path = path.clone();
+                let payload = if index % 2 == 0 {
+                    short.clone()
+                } else {
+                    long.clone()
+                };
+                tokio::spawn(async move { write_cache_atomic(&path, &payload).await })
+            })
+            .collect();
+        for writer in writers {
+            writer.await.unwrap().unwrap();
+        }
+
+        let published = try_read_original_cache(&path).await.unwrap().unwrap();
         assert!(
-            !path.with_extension("tmp").exists(),
-            "tmp file must be renamed away"
+            published == short || published == long,
+            "published entry is torn: {} bytes",
+            published.len()
         );
     }
 
@@ -265,7 +393,7 @@ mod tests {
     async fn try_serve_cache_reports_a_miss_for_absent_files() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.webp");
-        assert!(try_serve_cache(&missing, "image/webp")
+        assert!(try_serve_cache(&missing, "image/webp", &HeaderMap::new())
             .await
             .unwrap()
             .is_none());
@@ -277,7 +405,7 @@ mod tests {
         let path = dir.path().join("blob.webp");
         write_cache_atomic(&path, b"cached image").await.unwrap();
 
-        let response = try_serve_cache(&path, "image/webp")
+        let response = try_serve_cache(&path, "image/webp", &HeaderMap::new())
             .await
             .unwrap()
             .expect("cache hit");
@@ -290,6 +418,64 @@ mod tests {
             headers[header::CACHE_CONTROL],
             "public, max-age=31536000, immutable"
         );
+        assert_eq!(headers[header::ETAG], "\"blob\"");
+        assert_eq!(headers[header::CONTENT_LENGTH], "12");
+    }
+
+    #[tokio::test]
+    async fn try_serve_cache_answers_a_matching_validator_with_304() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.webp");
+        write_cache_atomic(&path, b"cached image").await.unwrap();
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"blob\""));
+
+        let response = try_serve_cache(&path, "image/webp", &request_headers)
+            .await
+            .unwrap()
+            .expect("cache hit");
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()[header::ETAG], "\"blob\"");
+    }
+
+    #[tokio::test]
+    async fn try_serve_cache_accepts_a_weak_or_listed_validator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.webp");
+        write_cache_atomic(&path, b"cached image").await.unwrap();
+
+        for value in ["W/\"blob\"", "\"other\", \"blob\"", "*"] {
+            let mut request_headers = HeaderMap::new();
+            request_headers.insert(header::IF_NONE_MATCH, HeaderValue::from_str(value).unwrap());
+            let response = try_serve_cache(&path, "image/webp", &request_headers)
+                .await
+                .unwrap()
+                .expect("cache hit");
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_MODIFIED,
+                "validator {value} should have matched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn try_serve_cache_sends_the_body_for_a_stale_validator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.webp");
+        write_cache_atomic(&path, b"cached image").await.unwrap();
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"stale\""));
+
+        let response = try_serve_cache(&path, "image/webp", &request_headers)
+            .await
+            .unwrap()
+            .expect("cache hit");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     // -----------------------------------------------------------------------

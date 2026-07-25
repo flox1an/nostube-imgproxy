@@ -49,13 +49,20 @@ pub fn is_video_url(url: &str) -> bool {
 }
 
 /// Extract a video thumbnail by trying server-derived and discovered candidates.
+///
+/// `http` is the SSRF-guarded client every candidate is preflighted with, and
+/// `ffmpeg_timeout` caps a single FFmpeg run so one stalled upstream cannot
+/// hold a semaphore permit indefinitely.
+#[allow(clippy::too_many_arguments)]
 pub async fn extract_video_thumbnail(
     video_url: &str,
     semaphore: &Arc<Semaphore>,
+    http: &reqwest::Client,
     servers: &[String],
     discovered_urls: &[String],
-    negative_cache: Option<(&reqwest::Client, &CandidateFailureCache)>,
+    negative_cache: Option<&CandidateFailureCache>,
     deadline: Instant,
+    ffmpeg_timeout: std::time::Duration,
 ) -> Result<Vec<u8>, SvcError> {
     info!("extracting thumbnail from video: {}", video_url);
 
@@ -91,7 +98,7 @@ pub async fn extract_video_thumbnail(
     let mut attempted = 0;
 
     for (idx, url) in candidates.iter().enumerate() {
-        if let Some((_, cache)) = negative_cache {
+        if let Some(cache) = negative_cache {
             if let Some(class) = cache.lookup(url).await {
                 metrics::record_cache_hit("blossom_negative");
                 tracing::debug!(
@@ -108,7 +115,7 @@ pub async fn extract_video_thumbnail(
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             last_error = SvcError::UpstreamError(504);
-            if let Some((_, cache)) = negative_cache {
+            if let Some(cache) = negative_cache {
                 cache.remember(url, CandidateFailureClass::Transient).await;
                 failures.record(CandidateFailureClass::Transient);
             }
@@ -120,8 +127,23 @@ pub async fn extract_video_thumbnail(
             candidates.len(),
             url
         );
-        match tokio::time::timeout(remaining, extract_thumbnail_with_ffmpeg(url)).await {
-            Ok(Ok(bytes)) => {
+
+        // Cheap guarded probe first: dead or redirecting candidates are
+        // rejected in milliseconds instead of costing an FFmpeg spawn.
+        if let Err(error) = preflight_candidate(http, url, deadline).await {
+            let class = CandidateFailureClass::from_error(&error);
+            if let Some(cache) = negative_cache {
+                cache.remember(url, class).await;
+            }
+            failures.record(class);
+            tracing::debug!(?class, candidate = %url, "preflight rejected video candidate");
+            last_error = error;
+            continue;
+        }
+
+        let attempt_budget = remaining.min(ffmpeg_timeout);
+        match extract_thumbnail_with_ffmpeg(url, attempt_budget).await {
+            Ok(bytes) => {
                 tracing::info!(
                     "✓ thumbnail {}/{} ({} bytes) from {}",
                     idx + 1,
@@ -131,29 +153,19 @@ pub async fn extract_video_thumbnail(
                 );
                 return Ok(bytes);
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 tracing::debug!(
                     "✗ thumbnail {}/{} failed: {:?}",
                     idx + 1,
                     candidates.len(),
                     error
                 );
-                if let Some((http, cache)) = negative_cache {
-                    let class = classify_video_failure(http, url, deadline).await;
+                let class = CandidateFailureClass::from_error(&error);
+                if let Some(cache) = negative_cache {
                     cache.remember(url, class).await;
-                    failures.record(class);
-                    tracing::debug!(?class, candidate = %url, "cached failed video candidate");
                 }
+                failures.record(class);
                 last_error = error;
-            }
-            Err(_) => {
-                tracing::debug!("✗ thumbnail {}/{} timed out", idx + 1, candidates.len());
-                last_error = SvcError::UpstreamError(504);
-                if let Some((_, cache)) = negative_cache {
-                    cache.remember(url, CandidateFailureClass::Transient).await;
-                    failures.record(CandidateFailureClass::Transient);
-                }
-                break;
             }
         }
     }
@@ -170,46 +182,82 @@ pub async fn extract_video_thumbnail(
     }
 }
 
-/// Classify an FFmpeg failure by probing only the failed candidate.
-async fn classify_video_failure(
+/// Preflight a candidate with our own HTTP client before handing it to FFmpeg.
+///
+/// FFmpeg resolves and follows redirects itself, so it bypasses the public-IP
+/// DNS resolver and `redirect::Policy::none()` that protect every other fetch
+/// in this service. Probing first with the guarded client means a candidate
+/// that redirects (or is simply dead) never reaches FFmpeg at all.
+async fn preflight_candidate(
     http: &reqwest::Client,
     url: &str,
     deadline: Instant,
-) -> CandidateFailureClass {
+) -> Result<(), SvcError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return CandidateFailureClass::Transient;
+        return Err(SvcError::UpstreamError(504));
     }
 
-    match tokio::time::timeout(
+    let response = tokio::time::timeout(
         remaining,
         http.get(url)
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send(),
     )
     .await
-    {
-        Ok(Ok(response)) if response.status().is_success() => CandidateFailureClass::Transient,
-        Ok(Ok(response)) => CandidateFailureClass::from_status(response.status().as_u16()),
-        Ok(Err(_)) | Err(_) => CandidateFailureClass::Transient,
+    .map_err(|_| SvcError::UpstreamError(504))?
+    .map_err(SvcError::Fetch)?;
+
+    let status = response.status();
+    if status.is_redirection() {
+        // `redirect::Policy::none()` surfaces the 3xx instead of following it.
+        // Refuse rather than let FFmpeg chase it to an unvalidated host.
+        tracing::debug!(%url, %status, "refusing redirecting video candidate");
+        return Err(SvcError::UpstreamError(502));
     }
+    if !status.is_success() {
+        return Err(SvcError::UpstreamError(status.as_u16()));
+    }
+    Ok(())
 }
 
-/// Extract a thumbnail from a video using ffmpeg CLI
-async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcError> {
+/// Extract a thumbnail from a video using the FFmpeg CLI.
+///
+/// `timeout` is a hard wall-clock bound. Without one, `Command::output()` waits
+/// forever on a stalled upstream and the semaphore permit is never returned, so
+/// a handful of hung fetches permanently disable video thumbnails.
+async fn extract_thumbnail_with_ffmpeg(
+    video_url: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, SvcError> {
     use tokio::process::Command;
 
-    // Create a temporary file for the output
     let temp_file = tempfile::NamedTempFile::new().map_err(SvcError::Io)?;
     let output_path = temp_file.path();
 
-    // Run ffmpeg to extract thumbnail
-    // Equivalent to:
-    // ffmpeg -ss 0.5 -i <video_url> -vframes 1 -vf "scale=-1:'min(720,ih)'" -q:v 80 -c:v libwebp -f image2 output.webp
     tracing::debug!("spawning ffmpeg for video: {}", video_url);
 
-    let output = Command::new("ffmpeg")
+    // `-rw_timeout` is in microseconds and bounds each socket read/write, so a
+    // trickling upstream cannot outlive the wall-clock budget by stalling.
+    let io_timeout_micros = (timeout.as_micros().min(u128::from(u32::MAX)) as u64).to_string();
+
+    let child = Command::new("ffmpeg")
         .args([
+            "-nostdin",
+            "-loglevel",
+            "error",
+            // Confine FFmpeg to network protocols: without this it will happily
+            // open `file:`, `concat:` or `subfile:` targets from a playlist.
+            "-protocol_whitelist",
+            "http,https,tcp,tls,crypto",
+            "-user_agent",
+            "rust-imgproxy/0.1",
+            "-rw_timeout",
+            &io_timeout_micros,
+            "-analyzeduration",
+            "5000000",
+            "-probesize",
+            "5000000",
             "-ss",
             "0.5",
             "-i",
@@ -227,16 +275,29 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
             "-y",
         ])
         .arg(output_path)
-        .output()
-        .await
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Dropping the future on timeout must actually reap the process rather
+        // than orphan it holding an upstream connection open.
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|e| {
             error!("failed to spawn ffmpeg for {}: {}", video_url, e);
             SvcError::Io(e)
         })?;
 
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => result.map_err(SvcError::Io)?,
+        Err(_) => {
+            tracing::debug!("ffmpeg exceeded {:?} for {}", timeout, video_url);
+            metrics::record_ffmpeg_extraction(false);
+            return Err(SvcError::UpstreamError(504));
+        }
+    };
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _stdout = String::from_utf8_lossy(&output.stdout);
 
         // Check for common error patterns
         let is_timeout = stderr.contains("timed out") || stderr.contains("Connection timed out");
@@ -274,7 +335,6 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
 
     metrics::record_ffmpeg_extraction(true);
 
-    // Read the generated thumbnail
     let thumbnail_data = tokio::fs::read(output_path).await.map_err(|e| {
         error!("failed to read thumbnail output: {}", e);
         SvcError::Io(e)
@@ -286,30 +346,13 @@ async fn extract_thumbnail_with_ffmpeg(video_url: &str) -> Result<Vec<u8>, SvcEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{http::StatusCode, routing::get, Router};
 
-    #[tokio::test]
-    async fn classify_video_failure_maps_not_found_response() {
-        crate::init_crypto_provider();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new().fallback(get(|| async { StatusCode::NOT_FOUND })),
-            )
-            .await
-            .unwrap();
-        });
-
-        let class = classify_video_failure(
-            &reqwest::Client::new(),
-            &format!("http://{address}/missing.mp4"),
-            Instant::now() + std::time::Duration::from_secs(1),
-        )
-        .await;
-
-        assert_eq!(class, CandidateFailureClass::Missing);
+    #[test]
+    fn candidate_failure_classifies_not_found_as_missing() {
+        assert_eq!(
+            CandidateFailureClass::from_status(404),
+            CandidateFailureClass::Missing
+        );
     }
 
     #[tokio::test]
@@ -328,10 +371,12 @@ mod tests {
         let result = extract_video_thumbnail(
             &url,
             &semaphore,
+            &http,
             &[],
             &[],
-            Some((&http, &cache)),
+            Some(&cache),
             Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
         )
         .await;
 

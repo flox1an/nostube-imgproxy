@@ -1,5 +1,6 @@
-use image::{imageops::FilterType, DynamicImage, GenericImageView};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, Limits};
 use percent_encoding::percent_decode_str;
+use rgb::FromSlice;
 
 use crate::error::SvcError;
 
@@ -31,6 +32,16 @@ impl OutFmt {
     pub fn extension(&self) -> &'static str {
         match self {
             OutFmt::Jpeg => "jpg",
+            OutFmt::Png => "png",
+            OutFmt::Webp => "webp",
+            OutFmt::Avif => "avif",
+        }
+    }
+
+    /// Short, stable name used as a metrics label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            OutFmt::Jpeg => "jpeg",
             OutFmt::Png => "png",
             OutFmt::Webp => "webp",
             OutFmt::Avif => "avif",
@@ -291,22 +302,13 @@ pub fn encode_image(img: &DynamicImage, fmt: &OutFmt, quality: u8) -> Result<Vec
             out.extend_from_slice(&webp_data);
         }
         OutFmt::Avif => {
-            // Use ravif for AVIF encoding with quality control
             let rgba = img.to_rgba8();
             let (w, h) = (rgba.width(), rgba.height());
 
-            // Convert to rgb::RGBA format
-            let pixels: Vec<rgb::RGBA<u8>> = rgba
-                .pixels()
-                .map(|p| rgb::RGBA {
-                    r: p[0],
-                    g: p[1],
-                    b: p[2],
-                    a: p[3],
-                })
-                .collect();
-
-            let avif_img = ravif::Img::new(&pixels[..], w as usize, h as usize);
+            // `as_rgba` reinterprets the existing buffer in place. Collecting
+            // into a `Vec<rgb::RGBA<u8>>` instead would allocate and copy a
+            // second full framebuffer for no benefit.
+            let avif_img = ravif::Img::new(rgba.as_raw().as_rgba(), w as usize, h as usize);
             let encoder = ravif::Encoder::new()
                 .with_quality(quality as f32)
                 .with_speed(6);
@@ -317,6 +319,29 @@ pub fn encode_image(img: &DynamicImage, fmt: &OutFmt, quality: u8) -> Result<Vec
         }
     }
     Ok(out)
+}
+
+/// Decode `bytes` with the format guessed from content and `limits` enforced.
+///
+/// `MAX_IMAGE_BYTES` bounds only the compressed payload; without these limits a
+/// small file declaring enormous dimensions still gets a matching framebuffer
+/// allocated, which is the cheapest way to OOM a memory-capped edge node.
+pub fn decode_image(bytes: &[u8], limits: Limits) -> Result<DynamicImage, SvcError> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| SvcError::Decode(image::ImageError::IoError(e)))?;
+    reader.limits(limits);
+    Ok(reader.decode()?)
+}
+
+/// The full synchronous decode → resize → encode pipeline.
+///
+/// Deliberately blocking and self-contained: callers hand this to
+/// [`crate::cpu::CpuPool`] so it never runs on an async worker thread.
+pub fn process_image(bytes: &[u8], dirs: &Directives, limits: Limits) -> Result<Vec<u8>, SvcError> {
+    let img = decode_image(bytes, limits)?;
+    let img = apply_resize(img, &dirs.resize);
+    encode_image(&img, &dirs.out_fmt, dirs.quality)
 }
 
 #[cfg(test)]
