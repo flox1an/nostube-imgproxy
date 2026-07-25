@@ -1,5 +1,9 @@
 # Stage 1: Build
-FROM rustlang/rust:nightly-slim AS builder
+# Stable toolchain on trixie: the crate needs no nightly features, and
+# `rustlang/rust:nightly-slim` floats to whatever nightly is current, which
+# broke the image build on an ICE compiling tokio (nightly-2026-07-25).
+# Base matches the trixie runtime stage so glibc lines up.
+FROM rust:1-slim-trixie AS builder
 
 # Install build dependencies for AVIF support (meson, ninja) and general tools
 RUN apt-get update && apt-get install -y \
