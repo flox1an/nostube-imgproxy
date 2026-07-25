@@ -1,24 +1,18 @@
 use std::{fs, sync::Arc, time::Duration};
 use tracing::info;
 
-mod blossom;
-mod cache;
-mod config;
-mod error;
-mod metrics;
-mod network_policy;
-mod server;
-mod thumbnail;
-mod transform;
-
-use blossom::{BlossomState, CandidateFailureCache};
-use cache::janitor_loop;
-use config::{AppCfg, AppState};
-use server::create_router;
-use thumbnail::ThumbnailState;
+use rust_imgproxy::{
+    blossom::{BlossomState, CandidateFailureCache},
+    cache::janitor_loop,
+    config::{AppCfg, AppState},
+    init_crypto_provider,
+    server::create_router,
+    thumbnail::ThumbnailState,
+};
 
 #[tokio::main]
 async fn main() {
+    init_crypto_provider();
     init_tracing();
 
     let cfg = AppCfg::from_env();

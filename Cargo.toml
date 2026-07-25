@@ -5,19 +5,29 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.8", features = ["http1", "json"] }
-axum-extra = { version = "0.10", features = ["query"] }
+axum-extra = { version = "0.12", features = ["query"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync", "process", "signal", "net"] }
 http = "1"
 hyper = { version = "1", features = ["http1", "server"] }
-reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "brotli"] }
+# `rustls-no-provider` (not `rustls`) is deliberate: `rustls` pulls the
+# aws-lc-rs provider, while nostr-sdk's websocket stack pulls ring. Both
+# unify onto one rustls, leaving the process-level CryptoProvider ambiguous
+# and panicking every relay TLS handshake. Ring-only keeps it unambiguous
+# (and matches reqwest 0.12's behaviour, with no cmake needed to build).
+# `default-features = false` drops reqwest's `default-tls`, which would
+# otherwise re-enable the `rustls` (aws-lc-rs) feature behind our back.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy", "gzip", "brotli"] }
+# Direct dep so we can install the ring provider explicitly at startup;
+# `rustls-no-provider` makes that installation mandatory.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 bytes = "1"
 image = { version = "0.25", features = ["png", "jpeg", "webp", "avif-native"] }
 webp = "0.3"
-ravif = "0.12"
+ravif = "0.13"
 rgb = "0.8"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 percent-encoding = "2"
 thiserror = "2"
@@ -27,9 +37,9 @@ mime = "0.3"
 walkdir = "2"
 fs2 = "0.4"
 tempfile = "3"
-nostr-sdk = "0.37"
+nostr-sdk = "0.44"
 serde = { version = "1", features = ["derive"] }
-prometheus = "0.13"
-lazy_static = "1.4"
+prometheus = "0.14"
+lazy_static = "1.5"
 url = "2"
 

@@ -204,8 +204,6 @@ impl BlossomState {
         candidate_failure_cache: CandidateFailureCache,
     ) -> Self {
         // Initialize Nostr client with seed relays.
-        // We don't call client.connect() here to avoid persistent WebSocket connections;
-        // the client connects on-demand when fetch_events_from() is called.
         let client = Client::default();
 
         for relay in SEED_RELAYS {
@@ -213,6 +211,12 @@ impl BlossomState {
                 warn!("Failed to add relay {}: {:?}", relay, e);
             }
         }
+
+        // `add_relay` only registers a relay; since nostr-sdk 0.44 a relay stays
+        // in the "initialized" state until `connect()` is called, and queries
+        // against it fail with "relay is initialized but not ready". `connect()`
+        // is non-blocking: it spawns background tasks that dial and auto-reconnect.
+        client.connect().await;
 
         Self {
             server_list_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -226,29 +230,23 @@ impl BlossomState {
         }
     }
 
-    /// Parse pubkey from string (supports both npub and hex formats).
+    /// Access the shared negative cache for blob candidate URLs.
     pub fn candidate_failure_cache(&self) -> &CandidateFailureCache {
         &self.candidate_failure_cache
     }
 
-    fn parse_pubkey(pubkey_str: &str) -> Result<PublicKey, String> {
-        if let Ok(pubkey) = PublicKey::from_bech32(pubkey_str) {
-            return Ok(pubkey);
-        }
-        if let Ok(pubkey) = PublicKey::from_hex(pubkey_str) {
-            return Ok(pubkey);
-        }
-        Err(format!("Invalid pubkey format: {}", pubkey_str))
-    }
-
     async fn fetch_events(&self, filter: Filter) -> Result<Events, String> {
+        // `fetch_events_from` already bounds itself by `discovery_timeout` and
+        // returns whatever arrived before EOSE. The outer timeout is only a
+        // backstop for the SDK hanging, so it must be strictly longer —
+        // arming both at the same instant makes them race and discards results
+        // that the inner call was about to return.
+        let backstop = self.discovery_timeout + Duration::from_secs(2);
+
         tokio::time::timeout(
-            self.discovery_timeout,
-            self.client.fetch_events_from(
-                SEED_RELAYS.to_vec(),
-                vec![filter],
-                Some(self.discovery_timeout),
-            ),
+            backstop,
+            self.client
+                .fetch_events_from(SEED_RELAYS.to_vec(), filter, self.discovery_timeout),
         )
         .await
         .map_err(|_| "Nostr lookup timed out".to_string())?
@@ -268,18 +266,13 @@ impl BlossomState {
             )
             .await?;
 
-        let Some(event) = events.iter().max_by_key(|event| event.created_at) else {
-            debug!("No server list events found for pubkey {}", pubkey);
-            return Ok(Vec::new());
-        };
-
-        let mut servers = Vec::new();
-        for tag in event.tags.clone() {
-            let tag = tag.to_vec();
-            if tag.len() >= 2 && tag[0] == "server" {
-                servers.push(normalize_server_url(&tag[1]));
+        let servers = match best_event(events.iter()) {
+            Some(event) => servers_from_event(event),
+            None => {
+                debug!("No server list events found for pubkey {}", pubkey);
+                Vec::new()
             }
-        }
+        };
 
         info!(
             "Found {} servers for pubkey {}: {:?}",
@@ -292,7 +285,7 @@ impl BlossomState {
 
     /// Get an author's kind-10063 server list with separate success and failure TTLs.
     pub async fn get_author_servers(&self, pubkey_str: &str) -> Result<Vec<String>, String> {
-        let pubkey = Self::parse_pubkey(pubkey_str)?;
+        let pubkey = parse_pubkey(pubkey_str)?;
 
         {
             let cache = self.server_list_cache.read().await;
@@ -355,29 +348,13 @@ impl BlossomState {
                     .kind(Kind::from(1063))
                     .custom_tag(
                         SingleLetterTag::lowercase(Alphabet::X),
-                        [normalized_hash.clone()],
+                        normalized_hash.clone(),
                     )
                     .limit(20),
             )
             .await?;
 
-        let mut urls = Vec::new();
-        let mut seen = HashSet::new();
-        for event in events {
-            for tag in event.tags.clone() {
-                let tag = tag.to_vec();
-                if tag.len() < 2 || !matches!(tag[0].as_str(), "url" | "fallback") {
-                    continue;
-                }
-                let url = &tag[1];
-                if !is_allowed_untrusted_server(url) {
-                    continue;
-                }
-                if seen.insert(url.clone()) {
-                    urls.push(url.clone());
-                }
-            }
-        }
+        let urls = blob_urls_from_events(events.iter());
 
         self.blob_location_cache.write().await.insert(
             normalized_hash,
@@ -388,6 +365,68 @@ impl BlossomState {
         );
         Ok(urls)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Nostr event parsing (pure, testable; shared with integration tests)
+// ---------------------------------------------------------------------------
+
+/// Parse a Nostr public key from either bech32 (`npub…`) or lowercase hex.
+pub fn parse_pubkey(pubkey_str: &str) -> Result<PublicKey, String> {
+    if let Ok(pubkey) = PublicKey::from_bech32(pubkey_str) {
+        return Ok(pubkey);
+    }
+    if let Ok(pubkey) = PublicKey::from_hex(pubkey_str) {
+        return Ok(pubkey);
+    }
+    Err(format!("Invalid pubkey format: {}", pubkey_str))
+}
+
+/// Select the most recent event by `created_at`, breaking ties deterministically.
+pub fn best_event<'a, I>(events: I) -> Option<&'a Event>
+where
+    I: IntoIterator<Item = &'a Event>,
+{
+    events.into_iter().max_by_key(|event| event.created_at)
+}
+
+/// Extract and normalize BUD-03 `server` tags from a single kind-10063 event.
+/// Tags with fewer than two entries or a non-`server` name are skipped.
+pub fn servers_from_event(event: &Event) -> Vec<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let parts = tag.clone().to_vec();
+            (parts.len() >= 2 && parts[0] == "server").then(|| normalize_server_url(&parts[1]))
+        })
+        .collect()
+}
+
+/// Extract deduplicated, SSRF-safe blob URLs from kind-1063 `url` and `fallback`
+/// tags. Order follows the source events; private/loopback hosts are filtered.
+pub fn blob_urls_from_events<'a, I>(events: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a Event>,
+{
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    for event in events {
+        for tag in event.tags.iter() {
+            let parts = tag.clone().to_vec();
+            if parts.len() < 2 || !matches!(parts[0].as_str(), "url" | "fallback") {
+                continue;
+            }
+            let url = &parts[1];
+            if !is_allowed_untrusted_server(url) {
+                continue;
+            }
+            if seen.insert(url.clone()) {
+                urls.push(url.clone());
+            }
+        }
+    }
+    urls
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +804,7 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let missing_server = spawn_status_server(StatusCode::NOT_FOUND, requests.clone()).await;
         let verified_server = spawn_blob_server(expected_bytes.clone()).await;
+        crate::init_crypto_provider();
         let http = reqwest::Client::builder()
             .resolve("missing.example", missing_server)
             .resolve("verified.example", verified_server)
@@ -812,6 +852,7 @@ mod tests {
         let hash = hex::encode(Sha256::digest(&expected_bytes));
         let corrupt_server = spawn_blob_server(b"corrupt blob".to_vec()).await;
         let verified_server = spawn_blob_server(expected_bytes.clone()).await;
+        crate::init_crypto_provider();
         let http = reqwest::Client::builder()
             .resolve("corrupt.example", corrupt_server)
             .resolve("verified.example", verified_server)
@@ -844,6 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_blob_honors_aggregate_deadline() {
+        crate::init_crypto_provider();
         let failure_cache = CandidateFailureCache::new(
             Duration::from_secs(60),
             Duration::from_secs(60),

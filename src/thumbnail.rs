@@ -290,6 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn classify_video_failure_maps_not_found_response() {
+        crate::init_crypto_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -313,6 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn extract_video_thumbnail_skips_negatively_cached_candidate() {
+        crate::init_crypto_provider();
         let cache = CandidateFailureCache::new(
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(60),

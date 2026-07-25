@@ -318,3 +318,409 @@ pub fn encode_image(img: &DynamicImage, fmt: &OutFmt, quality: u8) -> Result<Vec
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, RgbaImage};
+
+    /// Solid-colour test image; content is irrelevant, geometry is what matters.
+    fn img(w: u32, h: u32) -> DynamicImage {
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(w, h, image::Rgba([10, 20, 30, 255])))
+    }
+
+    fn directives(rest: &str) -> Directives {
+        parse_rest(rest).expect("directives parse").0
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_rest — URL directive parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_rest_requires_a_plain_segment() {
+        let err = parse_rest("rs:fit:10:10/https://example.com/a.png").unwrap_err();
+        assert!(matches!(
+            err,
+            SvcError::BadRequest("missing /plain/ segment")
+        ));
+    }
+
+    #[test]
+    fn parse_rest_extracts_source_url_after_plain() {
+        let (_, src) = parse_rest("rs:fit:10:10/plain/https://example.com/a.png").unwrap();
+        assert_eq!(src, "https://example.com/a.png");
+    }
+
+    #[test]
+    fn parse_rest_percent_decodes_source_url() {
+        let (_, src) =
+            parse_rest("rs:fit:10:10/plain/https%3A%2F%2Fexample.com%2Fa%20b.png").unwrap();
+        assert_eq!(src, "https://example.com/a b.png");
+    }
+
+    #[test]
+    fn parse_rest_defaults_to_jpeg_quality_82_when_unspecified() {
+        let d = directives("rs:fit:10:10/plain/https://example.com/a.png");
+        assert!(matches!(d.out_fmt, OutFmt::Jpeg));
+        assert_eq!(d.quality, 82);
+    }
+
+    #[test]
+    fn parse_rest_maps_every_supported_format_token() {
+        for (token, expected_mime) in [
+            ("jpeg", "image/jpeg"),
+            ("jpg", "image/jpeg"),
+            ("png", "image/png"),
+            ("webp", "image/webp"),
+            ("avif", "image/avif"),
+        ] {
+            let d = directives(&format!("f:{token}/rs:fit:10:10/plain/https://e.com/a.png"));
+            assert_eq!(d.out_fmt.mime_type(), expected_mime, "token {token}");
+        }
+    }
+
+    #[test]
+    fn parse_rest_format_token_is_case_insensitive() {
+        let d = directives("f:PNG/rs:fit:10:10/plain/https://e.com/a.png");
+        assert!(matches!(d.out_fmt, OutFmt::Png));
+    }
+
+    #[test]
+    fn parse_rest_rejects_unsupported_format() {
+        let err = parse_rest("f:gif/rs:fit:10:10/plain/https://e.com/a.gif").unwrap_err();
+        assert!(matches!(err, SvcError::BadRequest("unsupported format")));
+    }
+
+    #[test]
+    fn parse_rest_accepts_quality_at_the_upper_bound() {
+        let d = directives("q:100/rs:fit:10:10/plain/https://e.com/a.png");
+        assert_eq!(d.quality, 100);
+    }
+
+    #[test]
+    fn parse_rest_rejects_quality_above_one_hundred() {
+        let err = parse_rest("q:101/rs:fit:10:10/plain/https://e.com/a.png").unwrap_err();
+        assert!(matches!(err, SvcError::BadRequest("bad quality")));
+    }
+
+    #[test]
+    fn parse_rest_rejects_non_numeric_quality() {
+        let err = parse_rest("q:high/rs:fit:10:10/plain/https://e.com/a.png").unwrap_err();
+        assert!(matches!(err, SvcError::BadRequest("bad quality")));
+    }
+
+    #[test]
+    fn parse_rest_requires_at_least_one_resize_dimension() {
+        // No rs: directive at all leaves both dimensions at zero.
+        let err = parse_rest("f:png/plain/https://e.com/a.png").unwrap_err();
+        assert!(matches!(
+            err,
+            SvcError::BadRequest("at least one dimension required")
+        ));
+
+        // An explicit empty-empty resize is equally invalid.
+        let err = parse_rest("rs:fit::/plain/https://e.com/a.png").unwrap_err();
+        assert!(matches!(
+            err,
+            SvcError::BadRequest("at least one dimension required")
+        ));
+    }
+
+    #[test]
+    fn parse_rest_accepts_rt_as_an_alias_for_rs() {
+        let d = directives("rt:fill:64:48/plain/https://e.com/a.png");
+        assert!(matches!(d.resize.mode, ResizeMode::Fill));
+        assert_eq!((d.resize.w, d.resize.h), (64, 48));
+    }
+
+    #[test]
+    fn parse_rest_maps_every_supported_resize_mode() {
+        assert!(matches!(
+            directives("rs:fit:8:8/plain/u").resize.mode,
+            ResizeMode::Fit
+        ));
+        assert!(matches!(
+            directives("rs:fill:8:8/plain/u").resize.mode,
+            ResizeMode::Fill
+        ));
+        assert!(matches!(
+            directives("rs:fill-down:8:8/plain/u").resize.mode,
+            ResizeMode::FillDown
+        ));
+        assert!(matches!(
+            directives("rs:force:8:8/plain/u").resize.mode,
+            ResizeMode::Force
+        ));
+        assert!(matches!(
+            directives("rs:auto:8:8/plain/u").resize.mode,
+            ResizeMode::Auto
+        ));
+    }
+
+    #[test]
+    fn parse_rest_resize_mode_is_case_insensitive() {
+        assert!(matches!(
+            directives("rs:FILL:8:8/plain/u").resize.mode,
+            ResizeMode::Fill
+        ));
+    }
+
+    #[test]
+    fn parse_rest_treats_a_blank_dimension_as_aspect_driven() {
+        let only_h = directives("rs:fit::600/plain/https://e.com/a.png").resize;
+        assert_eq!((only_h.w, only_h.h), (0, 600));
+
+        let only_w = directives("rs:fit:800:/plain/https://e.com/a.png").resize;
+        assert_eq!((only_w.w, only_w.h), (800, 0));
+    }
+
+    #[test]
+    fn parse_rest_rejects_malformed_resize_directives() {
+        for (rest, expected) in [
+            ("rs:fit:10/plain/u", "invalid resize format"),
+            ("rs:fit:10:10:10/plain/u", "invalid resize format"),
+            ("rs:squish:10:10/plain/u", "unsupported resize mode"),
+            ("rs:fit:wide:10/plain/u", "bad width"),
+            ("rs:fit:10:tall/plain/u", "bad height"),
+        ] {
+            match parse_rest(rest).unwrap_err() {
+                SvcError::BadRequest(msg) => assert_eq!(msg, expected, "for {rest}"),
+                other => panic!("expected BadRequest for {rest}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_rest_lets_the_last_repeated_directive_win() {
+        let d = directives("f:png/f:webp/rs:fit:10:10/plain/https://e.com/a.png");
+        assert!(matches!(d.out_fmt, OutFmt::Webp));
+    }
+
+    #[test]
+    fn parse_rest_ignores_unknown_directive_segments() {
+        let d = directives("bogus:1/rs:fit:10:10/plain/https://e.com/a.png");
+        assert_eq!((d.resize.w, d.resize.h), (10, 10));
+    }
+
+    // -----------------------------------------------------------------------
+    // OutFmt
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn out_fmt_extension_matches_mime_family() {
+        for (fmt, ext, mime) in [
+            (OutFmt::Jpeg, "jpg", "image/jpeg"),
+            (OutFmt::Png, "png", "image/png"),
+            (OutFmt::Webp, "webp", "image/webp"),
+            (OutFmt::Avif, "avif", "image/avif"),
+        ] {
+            assert_eq!(fmt.extension(), ext);
+            assert_eq!(fmt.mime_type(), mime);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_resize
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fit_resize_preserves_aspect_within_the_box() {
+        let out = apply_resize(
+            img(400, 200),
+            &Resize {
+                mode: ResizeMode::Fit,
+                w: 100,
+                h: 100,
+            },
+        );
+        // Scale is limited by width (100/400), so height follows the 2:1 ratio.
+        assert_eq!(out.dimensions(), (100, 50));
+    }
+
+    #[test]
+    fn fit_resize_never_upscales_a_smaller_source() {
+        let out = apply_resize(
+            img(50, 40),
+            &Resize {
+                mode: ResizeMode::Fit,
+                w: 500,
+                h: 400,
+            },
+        );
+        assert_eq!(out.dimensions(), (50, 40));
+    }
+
+    #[test]
+    fn fill_resize_returns_exactly_the_requested_box() {
+        let out = apply_resize(
+            img(400, 200),
+            &Resize {
+                mode: ResizeMode::Fill,
+                w: 100,
+                h: 100,
+            },
+        );
+        assert_eq!(out.dimensions(), (100, 100));
+    }
+
+    #[test]
+    fn fill_resize_upscales_to_cover_a_larger_box() {
+        let out = apply_resize(
+            img(50, 50),
+            &Resize {
+                mode: ResizeMode::Fill,
+                w: 200,
+                h: 200,
+            },
+        );
+        assert_eq!(out.dimensions(), (200, 200));
+    }
+
+    #[test]
+    fn fill_down_resize_does_not_upscale_and_clamps_to_source() {
+        let out = apply_resize(
+            img(80, 60),
+            &Resize {
+                mode: ResizeMode::FillDown,
+                w: 400,
+                h: 300,
+            },
+        );
+        // Upscaling is forbidden, so the crop clamps to the source size.
+        assert_eq!(out.dimensions(), (80, 60));
+    }
+
+    #[test]
+    fn force_resize_ignores_aspect_ratio() {
+        let out = apply_resize(
+            img(400, 200),
+            &Resize {
+                mode: ResizeMode::Force,
+                w: 90,
+                h: 90,
+            },
+        );
+        assert_eq!(out.dimensions(), (90, 90));
+    }
+
+    #[test]
+    fn auto_resize_fills_when_orientation_matches() {
+        // Landscape source, landscape target -> behaves like fill (exact box).
+        let out = apply_resize(
+            img(400, 200),
+            &Resize {
+                mode: ResizeMode::Auto,
+                w: 200,
+                h: 100,
+            },
+        );
+        assert_eq!(out.dimensions(), (200, 100));
+    }
+
+    #[test]
+    fn auto_resize_fits_when_orientation_differs() {
+        // Landscape source, portrait target -> behaves like fit (aspect kept).
+        let out = apply_resize(
+            img(400, 200),
+            &Resize {
+                mode: ResizeMode::Auto,
+                w: 100,
+                h: 200,
+            },
+        );
+        assert_eq!(out.dimensions(), (100, 50));
+    }
+
+    #[test]
+    fn missing_height_is_derived_from_source_aspect() {
+        let out = apply_resize(
+            img(400, 200),
+            &Resize {
+                mode: ResizeMode::Force,
+                w: 100,
+                h: 0,
+            },
+        );
+        assert_eq!(out.dimensions(), (100, 50));
+    }
+
+    #[test]
+    fn missing_width_is_derived_from_source_aspect() {
+        let out = apply_resize(
+            img(400, 200),
+            &Resize {
+                mode: ResizeMode::Force,
+                w: 0,
+                h: 50,
+            },
+        );
+        assert_eq!(out.dimensions(), (100, 50));
+    }
+
+    // -----------------------------------------------------------------------
+    // encode_image
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn encode_image_emits_jpeg_magic_bytes() {
+        let out = encode_image(&img(16, 16), &OutFmt::Jpeg, 80).unwrap();
+        assert_eq!(&out[..2], &[0xFF, 0xD8], "JPEG SOI marker");
+    }
+
+    #[test]
+    fn encode_image_emits_png_magic_bytes() {
+        let out = encode_image(&img(16, 16), &OutFmt::Png, 80).unwrap();
+        assert_eq!(&out[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn encode_image_emits_webp_container() {
+        let out = encode_image(&img(16, 16), &OutFmt::Webp, 80).unwrap();
+        assert_eq!(&out[..4], b"RIFF");
+        assert_eq!(&out[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn encode_image_emits_avif_brand() {
+        let out = encode_image(&img(16, 16), &OutFmt::Avif, 60).unwrap();
+        // ISO-BMFF: 4-byte box size, then "ftyp", then the "avif" brand.
+        assert_eq!(&out[4..8], b"ftyp");
+        assert_eq!(&out[8..12], b"avif");
+    }
+
+    #[test]
+    fn encode_image_round_trips_to_the_requested_dimensions() {
+        for fmt in [OutFmt::Jpeg, OutFmt::Png, OutFmt::Webp] {
+            let bytes = encode_image(&img(24, 12), &fmt, 90).unwrap();
+            let decoded = image::load_from_memory(&bytes)
+                .unwrap_or_else(|e| panic!("decode {} failed: {e}", fmt.extension()));
+            assert_eq!(
+                decoded.dimensions(),
+                (24, 12),
+                "dimensions lost for {}",
+                fmt.extension()
+            );
+        }
+    }
+
+    #[test]
+    fn lower_jpeg_quality_produces_smaller_output() {
+        // Use a noisy image so quality actually influences the encoded size.
+        let mut noisy = RgbaImage::new(64, 64);
+        for (x, y, pixel) in noisy.enumerate_pixels_mut() {
+            let v = ((x * 7 + y * 13) % 256) as u8;
+            *pixel = image::Rgba([v, v.wrapping_mul(3), v.wrapping_add(97), 255]);
+        }
+        let noisy = DynamicImage::ImageRgba8(noisy);
+
+        let low = encode_image(&noisy, &OutFmt::Jpeg, 20).unwrap();
+        let high = encode_image(&noisy, &OutFmt::Jpeg, 95).unwrap();
+        assert!(
+            low.len() < high.len(),
+            "q20 ({} bytes) should be smaller than q95 ({} bytes)",
+            low.len(),
+            high.len()
+        );
+    }
+}
