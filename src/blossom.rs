@@ -12,7 +12,6 @@ const SEED_RELAYS: &[&str] = &[
     "wss://nos.lol",
     "wss://nostr.mom",
     "wss://purplepag.es",
-    "wss://relay.damus.io",
     "wss://relay.nostr.band",
     "wss://relay.snort.social",
     "wss://relay.primal.net",

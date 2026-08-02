@@ -397,7 +397,6 @@ fn parse_blossom_filename_matches_hash_in_signed_event() {
 async fn live_relays_return_events_for_a_broad_filter() {
     let client = Client::default();
     for relay in [
-        "wss://relay.damus.io",
         "wss://nos.lol",
         "wss://relay.primal.net",
     ] {
@@ -408,7 +407,6 @@ async fn live_relays_return_events_for_a_broad_filter() {
     let events = client
         .fetch_events_from(
             [
-                "wss://relay.damus.io",
                 "wss://nos.lol",
                 "wss://relay.primal.net",
             ],
@@ -435,7 +433,6 @@ async fn live_relays_return_events_for_a_broad_filter() {
 async fn live_relays_resolve_a_kind_10063_server_list() {
     let client = Client::default();
     for relay in [
-        "wss://relay.damus.io",
         "wss://nos.lol",
         "wss://purplepag.es",
     ] {
@@ -446,7 +443,6 @@ async fn live_relays_resolve_a_kind_10063_server_list() {
     let events = client
         .fetch_events_from(
             [
-                "wss://relay.damus.io",
                 "wss://nos.lol",
                 "wss://purplepag.es",
             ],
@@ -490,7 +486,6 @@ async fn live_blossom_state_resolves_a_real_author_server_list() {
     // test does not depend on one hard-coded pubkey staying alive.
     let probe = Client::default();
     for relay in [
-        "wss://relay.damus.io",
         "wss://nos.lol",
         "wss://purplepag.es",
     ] {
@@ -501,7 +496,6 @@ async fn live_blossom_state_resolves_a_real_author_server_list() {
     let seed_events = probe
         .fetch_events_from(
             [
-                "wss://relay.damus.io",
                 "wss://nos.lol",
                 "wss://purplepag.es",
             ],
