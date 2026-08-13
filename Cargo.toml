@@ -40,7 +40,7 @@ mime = "0.3"
 walkdir = "2"
 fs2 = "0.4"
 tempfile = "3"
-nostr-sdk = "0.44"
+nostr-sdk = "0.45.1"
 serde = { version = "1", features = ["derive"] }
 prometheus = "0.14"
 lazy_static = "1.5"

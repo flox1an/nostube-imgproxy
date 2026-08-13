@@ -1,7 +1,7 @@
 use crate::network_policy::is_allowed_untrusted_server;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -211,10 +211,10 @@ impl BlossomState {
             }
         }
 
-        // `add_relay` only registers a relay; since nostr-sdk 0.44 a relay stays
-        // in the "initialized" state until `connect()` is called, and queries
-        // against it fail with "relay is initialized but not ready". `connect()`
-        // is non-blocking: it spawns background tasks that dial and auto-reconnect.
+        // `add_relay` only registers a relay; a relay stays in the "initialized"
+        // state until `connect()` is called, and queries against it fail with
+        // "relay is initialized but not ready". `connect()` is non-blocking: it
+        // spawns background tasks that dial and auto-reconnect.
         client.connect().await;
 
         Self {
@@ -234,18 +234,23 @@ impl BlossomState {
         &self.candidate_failure_cache
     }
 
-    async fn fetch_events(&self, filter: Filter) -> Result<Events, String> {
-        // `fetch_events_from` already bounds itself by `discovery_timeout` and
-        // returns whatever arrived before EOSE. The outer timeout is only a
-        // backstop for the SDK hanging, so it must be strictly longer —
-        // arming both at the same instant makes them race and discards results
-        // that the inner call was about to return.
+    async fn fetch_events(&self, filter: Filter) -> Result<BTreeSet<Event>, String> {
+        // The fetch builder bounds the relay request by `discovery_timeout`.
+        // The outer timeout remains a backstop for the SDK hanging, so it must
+        // be strictly longer — arming both at the same instant makes them race
+        // and discards results that the inner call was about to return.
         let backstop = self.discovery_timeout + Duration::from_secs(2);
+
+        let targets = SEED_RELAYS
+            .iter()
+            .map(|relay| (*relay, vec![filter.clone()]))
+            .collect::<Vec<_>>();
 
         tokio::time::timeout(
             backstop,
             self.client
-                .fetch_events_from(SEED_RELAYS.to_vec(), filter, self.discovery_timeout),
+                .fetch_events(targets)
+                .timeout(self.discovery_timeout),
         )
         .await
         .map_err(|_| "Nostr lookup timed out".to_string())?
@@ -341,14 +346,13 @@ impl BlossomState {
             }
         }
 
+        let x_tag = SingleLetterTag::from_char('x')
+            .expect("lowercase x is a valid Nostr single-letter tag");
         let events = self
             .fetch_events(
                 Filter::new()
                     .kind(Kind::from(1063))
-                    .custom_tag(
-                        SingleLetterTag::lowercase(Alphabet::X),
-                        normalized_hash.clone(),
-                    )
+                    .custom_tag(x_tag, normalized_hash.clone())
                     .limit(20),
             )
             .await?;

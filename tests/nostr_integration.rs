@@ -15,6 +15,18 @@ use rust_imgproxy::blossom::{
 
 const KIND_SERVER_LIST: u16 = 10063;
 const KIND_FILE_METADATA: u16 = 1063;
+async fn fetch_events_from(
+    client: &Client,
+    relays: &[&str],
+    filter: Filter,
+    timeout: std::time::Duration,
+) -> Result<std::collections::BTreeSet<Event>, nostr_sdk::error::Error> {
+    let targets = relays
+        .iter()
+        .map(|relay| (*relay, vec![filter.clone()]))
+        .collect::<Vec<_>>();
+    client.fetch_events(targets).timeout(timeout).await
+}
 
 /// Build a signed kind-10063 (BUD-03) server-list event.
 fn server_list_event(keys: &Keys, servers: &[&str]) -> Event {
@@ -23,7 +35,7 @@ fn server_list_event(keys: &Keys, servers: &[&str]) -> Event {
         .map(|server| Tag::parse(["server", server]).expect("server tag"));
     EventBuilder::new(Kind::from(KIND_SERVER_LIST), "")
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .expect("sign server list event")
 }
 
@@ -36,7 +48,7 @@ fn file_metadata_event(keys: &Keys, hash: &str, tags: &[(&str, &str)]) -> Event 
     );
     EventBuilder::new(Kind::from(KIND_FILE_METADATA), "")
         .tags(built)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .expect("sign file metadata event")
 }
 
@@ -47,7 +59,7 @@ fn at(keys: &Keys, servers: &[&str], created_at: u64) -> Event {
     EventBuilder::new(Kind::from(KIND_SERVER_LIST), "")
         .tags(tags)
         .custom_created_at(Timestamp::from(created_at))
-        .sign_with_keys(keys)
+        .finalize(keys)
         .expect("sign server list event")
 }
 
@@ -141,7 +153,7 @@ fn servers_from_event_ignores_unrelated_and_valueless_tags() {
             Tag::parse(["server"]).unwrap(),
             Tag::parse(["client", "nostube"]).unwrap(),
         ])
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .expect("sign");
 
     assert_eq!(
@@ -396,25 +408,19 @@ fn parse_blossom_filename_matches_hash_in_signed_event() {
 #[ignore = "requires public relay network access"]
 async fn live_relays_return_events_for_a_broad_filter() {
     let client = Client::default();
-    for relay in [
-        "wss://nos.lol",
-        "wss://relay.primal.net",
-    ] {
+    for relay in ["wss://nos.lol", "wss://relay.primal.net"] {
         client.add_relay(relay).await.expect("add relay");
     }
     client.connect().await;
 
-    let events = client
-        .fetch_events_from(
-            [
-                "wss://nos.lol",
-                "wss://relay.primal.net",
-            ],
-            Filter::new().kind(Kind::TextNote).limit(5),
-            std::time::Duration::from_secs(15),
-        )
-        .await
-        .expect("relay query succeeds");
+    let events = fetch_events_from(
+        &client,
+        &["wss://nos.lol", "wss://relay.primal.net"],
+        Filter::new().kind(Kind::TextNote).limit(5),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .expect("relay query succeeds");
 
     assert!(
         !events.is_empty(),
@@ -432,25 +438,19 @@ async fn live_relays_return_events_for_a_broad_filter() {
 #[ignore = "requires public relay network access"]
 async fn live_relays_resolve_a_kind_10063_server_list() {
     let client = Client::default();
-    for relay in [
-        "wss://nos.lol",
-        "wss://purplepag.es",
-    ] {
+    for relay in ["wss://nos.lol", "wss://purplepag.es"] {
         client.add_relay(relay).await.expect("add relay");
     }
     client.connect().await;
 
-    let events = client
-        .fetch_events_from(
-            [
-                "wss://nos.lol",
-                "wss://purplepag.es",
-            ],
-            Filter::new().kind(Kind::from(KIND_SERVER_LIST)).limit(10),
-            std::time::Duration::from_secs(15),
-        )
-        .await
-        .expect("relay query succeeds");
+    let events = fetch_events_from(
+        &client,
+        &["wss://nos.lol", "wss://purplepag.es"],
+        Filter::new().kind(Kind::from(KIND_SERVER_LIST)).limit(10),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .expect("relay query succeeds");
 
     if events.is_empty() {
         eprintln!("no kind-10063 events available right now; skipping assertions");
@@ -485,25 +485,19 @@ async fn live_blossom_state_resolves_a_real_author_server_list() {
     // Discover an author that actually publishes a kind-10063 list, so the
     // test does not depend on one hard-coded pubkey staying alive.
     let probe = Client::default();
-    for relay in [
-        "wss://nos.lol",
-        "wss://purplepag.es",
-    ] {
+    for relay in ["wss://nos.lol", "wss://purplepag.es"] {
         probe.add_relay(relay).await.expect("add relay");
     }
     probe.connect().await;
 
-    let seed_events = probe
-        .fetch_events_from(
-            [
-                "wss://nos.lol",
-                "wss://purplepag.es",
-            ],
-            Filter::new().kind(Kind::from(KIND_SERVER_LIST)).limit(25),
-            std::time::Duration::from_secs(15),
-        )
-        .await
-        .expect("probe query succeeds");
+    let seed_events = fetch_events_from(
+        &probe,
+        &["wss://nos.lol", "wss://purplepag.es"],
+        Filter::new().kind(Kind::from(KIND_SERVER_LIST)).limit(25),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .expect("probe query succeeds");
 
     // Pick an author whose list actually parses into at least one server.
     let Some(author) = seed_events
