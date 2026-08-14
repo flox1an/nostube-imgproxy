@@ -335,10 +335,14 @@ async fn run_cleanup(cfg: &AppCfg) -> Result<(), std::io::Error> {
                 let Ok(meta) = entry.metadata() else {
                     continue;
                 };
-                let Ok(anchor) = meta.created().or_else(|_| meta.modified()) else {
+                // TTL is time since the cache entry's last completed write.
+                // Birth time is not portable and, on APFS, remains unchanged
+                // when tests or repair tooling update mtime; preferring it made
+                // stale `.tmp` reaping filesystem-dependent.
+                let Ok(modified) = meta.modified() else {
                     continue;
                 };
-                let age = now.duration_since(anchor).unwrap_or(Duration::ZERO);
+                let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
                 let is_tmp = entry.file_name().to_string_lossy().ends_with(".tmp");
 
                 // Leftover temp files are torn writes from a crash or kill.
@@ -358,7 +362,6 @@ async fn run_cleanup(cfg: &AppCfg) -> Result<(), std::io::Error> {
                 }
                 let size = meta.len();
                 dir_bytes[dir_index] += size;
-                let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 entries.push((entry.path().to_path_buf(), size, modified, dir_index));
             }
         }
@@ -959,7 +962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_reaps_tmp_leftovers_older_than_the_ttl_but_keeps_fresh_ones() {
+    async fn cleanup_reaps_tmp_leftovers_by_modified_time() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = cfg_with_cache_dir(dir.path(), Duration::from_secs(3600));
         // A fresh temp file — possibly a writer mid-rename — must survive even
