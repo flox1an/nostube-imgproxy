@@ -1,13 +1,13 @@
 [package]
 name = "rust-imgproxy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
 axum = { version = "0.8", features = ["http1", "json"] }
 axum-extra = { version = "0.12", features = ["query"] }
-tower = { version = "0.5", features = ["limit"] }
-tower-http = { version = "0.7", features = ["cors", "timeout", "trace", "limit"] }
+tower = { version = "0.5", features = ["limit", "load-shed"] }
+tower-http = { version = "0.7", features = ["cors", "timeout", "trace", "limit", "catch-panic"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync", "process", "signal", "net"] }
 http = "1"
 hyper = { version = "1", features = ["http1", "server"] }
@@ -18,7 +18,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 # (and matches reqwest 0.12's behaviour, with no cmake needed to build).
 # `default-features = false` drops reqwest's `default-tls`, which would
 # otherwise re-enable the `rustls` (aws-lc-rs) feature behind our back.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy", "gzip", "brotli"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy", "gzip", "brotli", "stream"] }
 # Direct dep so we can install the ring provider explicitly at startup;
 # `rustls-no-provider` makes that installation mandatory.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -26,7 +26,16 @@ bytes = "1"
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 parking_lot = "0.12"
-image = { version = "0.25", features = ["png", "jpeg", "webp", "avif-native"] }
+# `default-features = false` is load-bearing: the `default-formats` feature
+# would activate a dozen extra decoders (exr, dds, hdr, tga, pnm, qoi, ico,
+# bmp, gif, tiff) of which only PNG/JPEG/GIF/TIFF budget memory via
+# `set_limits` — every other default decoder sniffs magic bytes and allocates
+# an unbounded intermediate buffer. `avif-native` (dav1d) is dropped because
+# its decoder runs the full dav1d decode before `image::Limits` can apply.
+# AVIF stays an *output* format via `ravif` (see `transform.rs::encode_image`).
+# `decode_image` enforces the PNG/JPEG/WebP input allowlist at runtime as
+# defense-in-depth against feature unification re-enabling decoders.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 webp = "0.3"
 ravif = "0.13"
 rgb = "0.8"
@@ -44,6 +53,9 @@ nostr-sdk = "0.45.1"
 serde = { version = "1", features = ["derive"] }
 prometheus = "0.14"
 lazy_static = "1.5"
+# Direct dep for `O_NOFOLLOW` in `write_cache_atomic` symlink hardening
+# (src/cache.rs). Already present in the lock as a transitive dep.
+libc = "0.2"
 url = "2"
 
 [profile.release]

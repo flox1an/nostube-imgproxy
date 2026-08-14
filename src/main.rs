@@ -6,7 +6,7 @@ use rust_imgproxy::{
     cache::janitor_loop,
     config::{AppCfg, AppState},
     init_crypto_provider,
-    server::create_router,
+    server::{create_metrics_router, create_router},
     thumbnail::ThumbnailState,
 };
 
@@ -22,14 +22,10 @@ async fn main() {
     fs::create_dir_all(cfg.cache_dir.join("processed")).expect("create processed cache dir");
 
     let bind_addr = cfg.bind_addr.clone();
+    let metrics_bind_addr = cfg.metrics_bind_addr.clone();
     let state = AppState::new(cfg.clone());
 
-    // Create thumbnail state with max concurrent ffmpeg processes
-    let max_ffmpeg_concurrent = std::env::var("MAX_FFMPEG_CONCURRENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
-    let thumbnail_state = Arc::new(ThumbnailState::new(max_ffmpeg_concurrent));
+    let thumbnail_state = Arc::new(ThumbnailState::new(cfg.max_ffmpeg_concurrent));
 
     // Keep transient relay failures short-lived while retaining successful lists.
     let blossom_cache_ttl_hours = std::env::var("BLOSSOM_SERVER_LIST_CACHE_TTL_HOURS")
@@ -70,16 +66,35 @@ async fn main() {
         .await,
     );
 
-    // Spawn janitor
-    tokio::spawn(async move { janitor_loop(cfg).await });
+    // The cache janitor owns a clone; the same config still controls optional
+    // management services below.
+    tokio::spawn(janitor_loop(cfg.clone()));
 
     let app = create_router(state, thumbnail_state, blossom_state);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+
+    if let Some(metrics_bind_addr) = metrics_bind_addr {
+        let metrics_listener = tokio::net::TcpListener::bind(&metrics_bind_addr)
+            .await
+            .expect("bind metrics listener");
+        let mut metrics_shutdown = shutdown_rx.clone();
+        info!(addr = %metrics_bind_addr, "metrics listener enabled");
+        tokio::spawn(async move {
+            let _ = axum::serve(metrics_listener, create_metrics_router())
+                .with_graceful_shutdown(async move {
+                    let _ = metrics_shutdown.changed().await;
+                })
+                .await;
+        });
+    }
 
     info!(addr = bind_addr, "listening");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(());
+        })
         .await
         .unwrap();
 

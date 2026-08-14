@@ -1,6 +1,7 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter_vec, register_histogram_vec, CounterVec, Encoder, HistogramVec, TextEncoder,
+    register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec, Encoder,
+    GaugeVec, HistogramVec, TextEncoder,
 };
 
 lazy_static! {
@@ -79,6 +80,13 @@ lazy_static! {
         &["content_type"]
     )
     .unwrap();
+    /// Current bytes retained by each cache partition after the janitor pass.
+    pub static ref CACHE_BYTES: GaugeVec = register_gauge_vec!(
+        "imgproxy_cache_bytes",
+        "Bytes retained in the cache after TTL and capacity eviction",
+        &["cache_type"]
+    )
+    .unwrap();
 }
 
 /// Encode all metrics to Prometheus text format
@@ -153,6 +161,13 @@ pub fn record_bytes_served(content_type: &str, bytes: usize) {
     BYTES_SERVED_TOTAL
         .with_label_values(&[content_type])
         .inc_by(bytes as f64);
+}
+
+/// Set the byte total for one cache partition after a janitor pass.
+pub fn set_cache_bytes(cache_type: &str, bytes: u64) {
+    CACHE_BYTES
+        .with_label_values(&[cache_type])
+        .set(bytes as f64);
 }
 
 #[cfg(test)]

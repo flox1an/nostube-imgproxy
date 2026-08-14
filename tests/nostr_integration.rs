@@ -9,8 +9,9 @@
 
 use nostr_sdk::prelude::*;
 use rust_imgproxy::blossom::{
-    best_event, blob_urls_from_events, combine_server_lists, extract_blossom_hash,
-    normalize_server_url, parse_blossom_filename, parse_pubkey, servers_from_event,
+    authoritative_server_list_events, best_event, blob_urls_from_events, combine_server_lists,
+    extract_blossom_hash, normalize_server_url, parse_blossom_filename, parse_pubkey,
+    servers_from_event,
 };
 
 const KIND_SERVER_LIST: u16 = 10063;
@@ -206,6 +207,61 @@ fn best_event_on_single_event_returns_that_event() {
 }
 
 // ---------------------------------------------------------------------------
+// authoritative_server_list_events — defensive kind/author/timestamp filter
+// ---------------------------------------------------------------------------
+
+#[test]
+fn authoritative_server_list_events_ignores_foreign_author_and_kind() {
+    let author = Keys::generate();
+    let attacker = Keys::generate();
+    let now = Timestamp::now().as_secs();
+
+    let own = server_list_event(&author, &["https://own.example"]);
+    // A hostile relay can sign and deliver any event: same kind but a foreign
+    // author must not influence the list…
+    let foreign_author = server_list_event(&attacker, &["https://attacker.example"]);
+    // …and the same author publishing a *different* kind must not either.
+    let foreign_kind = file_metadata_event(
+        &author,
+        &"a".repeat(64),
+        &[("url", "https://not-a-server-list.example/blob.mp4")],
+    );
+    // Newest wins among the *authoritative* events only.
+    let newer_own = at(&author, &["https://own-newer.example"], now + 10);
+
+    let events = [own, foreign_author, foreign_kind, newer_own.clone()];
+    let authoritative = authoritative_server_list_events(events.iter(), &author.public_key());
+
+    assert_eq!(
+        authoritative.len(),
+        2,
+        "only the author's own kind-10063 events"
+    );
+    let chosen = best_event(authoritative).expect("an authoritative event is selected");
+    assert_eq!(chosen.id, newer_own.id);
+    assert_eq!(
+        servers_from_event(chosen),
+        vec!["https://own-newer.example".to_string()]
+    );
+}
+
+#[test]
+fn authoritative_server_list_events_rejects_future_events() {
+    let keys = Keys::generate();
+    let now = Timestamp::now().as_secs();
+
+    // More than the five-minute skew into the future: the timestamp has not
+    // happened yet, so the event cannot be a settled server list.
+    let future = at(&keys, &["https://future.example"], now + 10 * 60);
+    let events = [future];
+
+    assert!(
+        authoritative_server_list_events(events.iter(), &keys.public_key()).is_empty(),
+        "future-dated events must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // kind 1063 — NIP-94 blob locations
 // ---------------------------------------------------------------------------
 
@@ -224,7 +280,7 @@ fn blob_urls_from_events_collects_url_and_fallback_tags() {
 
     let events = [event];
     assert_eq!(
-        blob_urls_from_events(events.iter()),
+        blob_urls_from_events(events.iter(), &hash),
         vec![
             "https://primary.example/blob.mp4".to_string(),
             "https://mirror.example/blob.mp4".to_string(),
@@ -247,7 +303,7 @@ fn blob_urls_from_events_deduplicates_across_events() {
 
     let events = [first, second];
     assert_eq!(
-        blob_urls_from_events(events.iter()),
+        blob_urls_from_events(events.iter(), &hash),
         vec![
             shared.to_string(),
             "https://other.example/b.mp4".to_string(),
@@ -277,7 +333,7 @@ fn blob_urls_from_events_filters_ssrf_targets() {
 
     let events = [event];
     assert_eq!(
-        blob_urls_from_events(events.iter()),
+        blob_urls_from_events(events.iter(), &hash),
         vec!["https://public.example/blob.mp4".to_string()],
         "only the public HTTPS URL may survive filtering"
     );
@@ -299,7 +355,7 @@ fn blob_urls_from_events_ignores_non_location_tags() {
 
     let events = [event];
     assert_eq!(
-        blob_urls_from_events(events.iter()),
+        blob_urls_from_events(events.iter(), &hash),
         vec!["https://kept.example/blob.mp4".to_string()]
     );
 }
@@ -307,7 +363,39 @@ fn blob_urls_from_events_ignores_non_location_tags() {
 #[test]
 fn blob_urls_from_events_returns_empty_for_no_events() {
     let events: Vec<Event> = Vec::new();
-    assert!(blob_urls_from_events(events.iter()).is_empty());
+    assert!(blob_urls_from_events(events.iter(), &"a".repeat(64)).is_empty());
+}
+
+#[test]
+fn blob_urls_from_events_requires_matching_x_tag() {
+    let keys = Keys::generate();
+    let wanted_hash = "a".repeat(64);
+    let other_hash = "b".repeat(64);
+
+    // An event attesting to a *different* hash must not resolve the wanted one:
+    // a hostile relay can publish kind-1063 events for arbitrary hashes.
+    let mismatched = file_metadata_event(
+        &keys,
+        &other_hash,
+        &[("url", "https://wrong-hash.example/blob.mp4")],
+    );
+    // A kind-1063 event with no `x` tag at all must not either.
+    let no_x_tag = EventBuilder::new(Kind::from(KIND_FILE_METADATA), "")
+        .tags([Tag::parse(["url", "https://no-x-tag.example/blob.mp4"]).unwrap()])
+        .finalize(&keys)
+        .expect("sign file metadata event without x tag");
+    let matching = file_metadata_event(
+        &keys,
+        &wanted_hash,
+        &[("url", "https://correct.example/blob.mp4")],
+    );
+
+    let events = [mismatched, no_x_tag, matching];
+    assert_eq!(
+        blob_urls_from_events(events.iter(), &wanted_hash),
+        vec!["https://correct.example/blob.mp4".to_string()],
+        "only events attesting to the requested hash may contribute URLs"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +415,7 @@ fn author_servers_from_signed_event_feed_combine_server_lists() {
         Some(&["https://hint.example".to_string()]),
         Some(&author_servers),
         &["https://fallback.example".to_string()],
+        4,
     );
 
     // Priority: explicit hints, then author servers, then fallbacks.
@@ -349,7 +438,7 @@ fn blossom_url_from_nip94_event_round_trips_to_hash_and_extension() {
     let event = file_metadata_event(&keys, &hash, &[("url", &url)]);
 
     let events = [event];
-    let discovered = blob_urls_from_events(events.iter());
+    let discovered = blob_urls_from_events(events.iter(), &hash);
     assert_eq!(discovered, vec![url.clone()]);
 
     // The discovered URL must be parseable back into the hash we searched for.
@@ -394,6 +483,110 @@ fn parse_blossom_filename_matches_hash_in_signed_event() {
     assert_eq!(
         parse_blossom_filename(&filename),
         Some((hash.as_str(), Some("mp4")))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hard caps: xs= hint count and total blob candidate fan-out
+// ---------------------------------------------------------------------------
+
+#[test]
+fn combine_server_lists_truncates_excess_xs_hints() {
+    // `xs=` comes from the query string: an attacker can send any number of
+    // hints, and each honored hint becomes a candidate host we may contact.
+    // Surplus hints must be dropped, not rejected, so the API stays compatible.
+    let hints = (0..10)
+        .map(|index| format!("hint{index}.example"))
+        .collect::<Vec<_>>();
+
+    let combined = combine_server_lists(Some(&hints), None, &[], 4);
+
+    assert_eq!(
+        combined,
+        vec![
+            "https://hint0.example".to_string(),
+            "https://hint1.example".to_string(),
+            "https://hint2.example".to_string(),
+            "https://hint3.example".to_string(),
+        ],
+        "only the first max_server_hints hints may be honored"
+    );
+}
+
+/// Spawn a local HTTP server that answers every request with 404 and counts
+/// how many times it was hit.
+async fn spawn_not_found_server() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = requests.clone();
+    tokio::spawn(async move {
+        let app = axum::Router::new().fallback(axum::routing::get(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                axum::http::StatusCode::NOT_FOUND
+            }
+        }));
+        axum::serve(listener, app).await.unwrap();
+    });
+    (address, requests)
+}
+
+#[tokio::test]
+async fn fetch_blob_truncates_candidate_list() {
+    use rust_imgproxy::blossom::{fetch_blob, CandidateFailureCache};
+    use std::time::{Duration, Instant};
+
+    // Five reachable (but 404-ing) hosts; the cap must limit the fan-out even
+    // though hints, author servers and discovery supplied more candidates.
+    let mut addresses = Vec::new();
+    let mut counters = Vec::new();
+    for _ in 0..5 {
+        let (address, requests) = spawn_not_found_server().await;
+        addresses.push(address);
+        counters.push(requests);
+    }
+
+    rust_imgproxy::init_crypto_provider();
+    let mut client = reqwest::Client::builder();
+    let mut servers = Vec::new();
+    for (index, address) in addresses.iter().enumerate() {
+        let host = format!("cdn{index}.example");
+        client = client.resolve(&host, *address);
+        servers.push(format!("http://{host}:{}", address.port()));
+    }
+
+    let cache = CandidateFailureCache::new(
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    let result = fetch_blob(
+        &client.build().unwrap(),
+        &cache,
+        &servers,
+        &[],
+        &"a".repeat(64),
+        Some("bin"),
+        Instant::now() + Duration::from_secs(2),
+        1024 * 1024,
+        2, // max_blob_candidates
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(result.is_err(), "all truncated candidates fail");
+    let hits = counters
+        .iter()
+        .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+        .sum::<usize>();
+    assert_eq!(
+        hits, 2,
+        "only max_blob_candidates hosts may be contacted, got {hits} upstream requests"
     );
 }
 

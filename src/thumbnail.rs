@@ -1,5 +1,25 @@
-use std::{sync::Arc, time::Instant};
-use tokio::sync::Semaphore;
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime},
+};
+
+use axum::{
+    body::Body,
+    extract::{Path as AxPath, State},
+    http::{header, HeaderMap, StatusCode},
+    response::Response,
+    routing::get,
+    Router,
+};
+use futures_util::StreamExt;
+use tokio::{
+    io::AsyncReadExt,
+    sync::{oneshot, Semaphore},
+};
 use tracing::{error, info};
 
 use crate::{
@@ -10,6 +30,10 @@ use crate::{
     metrics,
     network_policy::validate_untrusted_url,
 };
+
+const MAX_FFMPEG_STDERR_BYTES: usize = 8 * 1024;
+const FFMPEG_ADDRESS_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+const FFMPEG_FILE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ThumbnailState {
@@ -24,35 +48,223 @@ impl ThumbnailState {
     }
 }
 
-/// Check if a URL is likely a video based on file extension
+/// Return the explicit FFmpeg demuxer for a supported video URL.
 ///
-/// Returns true only for known video extensions.
-/// All other URLs (including .jfif, .jpg, .jpeg, .png, .webp, .avif, and URLs without extensions)
-/// are treated as images and processed with content-based format detection.
-pub fn is_video_url(url: &str) -> bool {
-    // Strip query string before checking extension
-    let url_lower = url.to_lowercase();
-    let path = url_lower.split('?').next().unwrap_or(&url_lower);
-    path.ends_with(".mp4")
+/// Playlist formats intentionally have no entry. A playlist can introduce
+/// nested segment URLs which would evade the one-source media gateway below.
+fn input_demuxer(url: &str) -> Option<&'static str> {
+    let lower = url.to_ascii_lowercase();
+    let path = lower.split('?').next().unwrap_or(&lower);
+    if path.ends_with(".mp4")
         || path.ends_with(".mov")
-        || path.ends_with(".avi")
-        || path.ends_with(".webm")
-        || path.ends_with(".mkv")
-        || path.ends_with(".flv")
-        || path.ends_with(".wmv")
         || path.ends_with(".m4v")
-        || path.ends_with(".mpg")
-        || path.ends_with(".mpeg")
         || path.ends_with(".3gp")
-        || path.ends_with(".ogv")
-        || path.ends_with(".m3u8")
+    {
+        Some("mov")
+    } else if path.ends_with(".webm") || path.ends_with(".mkv") {
+        Some("matroska")
+    } else if path.ends_with(".avi") {
+        Some("avi")
+    } else if path.ends_with(".flv") {
+        Some("flv")
+    } else if path.ends_with(".wmv") {
+        Some("asf")
+    } else if path.ends_with(".mpg") || path.ends_with(".mpeg") {
+        Some("mpeg")
+    } else if path.ends_with(".ogv") {
+        Some("ogg")
+    } else {
+        None
+    }
+}
+
+/// Check if a URL maps to one of the direct-file video formats we can safely
+/// pass through the guarded local media proxy.
+pub fn is_video_url(url: &str) -> bool {
+    input_demuxer(url).is_some()
+}
+
+#[derive(Clone)]
+struct MediaProxyState {
+    source_url: String,
+    token: String,
+    http: reqwest::Client,
+    deadline: Instant,
+    remaining_bytes: Arc<AtomicU64>,
+}
+
+/// A short-lived, loopback-only HTTP gateway for one remote video URL.
+///
+/// FFmpeg supports seeking by sending HTTP Range requests. Giving it this
+/// gateway preserves that behaviour for multi-gigabyte files while every range
+/// fetch still uses our public-DNS resolver and redirect policy. It is not a
+/// general proxy: the random path token is bound to one source URL and a shared
+/// byte budget, and the listener lives only for one FFmpeg invocation.
+struct LocalMediaProxy {
+    input_url: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LocalMediaProxy {
+    async fn start(
+        source_url: String,
+        http: reqwest::Client,
+        deadline: Instant,
+        max_probe_bytes: u64,
+    ) -> Result<Self, SvcError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(SvcError::Io)?;
+        let address = listener.local_addr().map_err(SvcError::Io)?;
+        let token = proxy_token();
+        let state = MediaProxyState {
+            source_url,
+            token: token.clone(),
+            http,
+            deadline,
+            remaining_bytes: Arc::new(AtomicU64::new(max_probe_bytes)),
+        };
+        let app = Router::new()
+            .route("/{token}", get(serve_media_range))
+            .with_state(state);
+        let (shutdown, receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = receiver.await;
+                })
+                .await;
+        });
+
+        Ok(Self {
+            input_url: format!("http://127.0.0.1:{}/{token}", address.port()),
+            shutdown: Some(shutdown),
+            task,
+        })
+    }
+}
+
+impl Drop for LocalMediaProxy {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task.abort();
+    }
+}
+
+async fn serve_media_range(
+    State(state): State<MediaProxyState>,
+    AxPath(token): AxPath<String>,
+    request_headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    if token != state.token {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // A whole-resource 200 response would make an adversarial origin stream
+    // forever. FFmpeg uses Range for seekable containers; rejecting the other
+    // case is safer than silently degrading to a full download.
+    let range = request_headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.starts_with("bytes="))
+        .ok_or(StatusCode::RANGE_NOT_SATISFIABLE)?;
+    let remaining = state.deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    let upstream = tokio::time::timeout(
+        remaining,
+        state
+            .http
+            .get(&state.source_url)
+            .header(reqwest::header::RANGE, range)
+            .send(),
+    )
+    .await
+    .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
+    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    if upstream.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(if upstream.status().is_success() {
+            StatusCode::RANGE_NOT_SATISFIABLE
+        } else {
+            StatusCode::BAD_GATEWAY
+        });
+    }
+
+    let announced = upstream.content_length().unwrap_or(0);
+    if announced > state.remaining_bytes.load(Ordering::Acquire) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // Copy only Range semantics and the media type. Redirect, cookie, CORS and
+    // caching headers belong to the remote origin and must never reach FFmpeg.
+    let response_headers: Vec<_> = [
+        header::CONTENT_LENGTH,
+        header::CONTENT_RANGE,
+        header::ACCEPT_RANGES,
+        header::CONTENT_TYPE,
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        upstream
+            .headers()
+            .get(&name)
+            .cloned()
+            .map(|value| (name, value))
+    })
+    .collect();
+    let mut response = Response::new(Body::from_stream(upstream.bytes_stream().map({
+        let remaining_bytes = Arc::clone(&state.remaining_bytes);
+        move |chunk| match chunk {
+            Ok(chunk) => {
+                let len = chunk.len() as u64;
+                remaining_bytes
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                        left.checked_sub(len)
+                    })
+                    .map_err(|_| std::io::Error::other("video probe byte budget exhausted"))?;
+                Ok::<_, std::io::Error>(chunk)
+            }
+            Err(error) => Err(std::io::Error::other(error)),
+        }
+    })));
+    *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+
+    for (name, value) in response_headers {
+        response.headers_mut().insert(name, value);
+    }
+    Ok(response)
+}
+
+fn proxy_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+
+    static RANDOM: std::sync::LazyLock<std::collections::hash_map::RandomState> =
+        std::sync::LazyLock::new(std::collections::hash_map::RandomState::new);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut hasher = RANDOM.build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos()),
+    );
+    format!("{:016x}", hasher.finish())
 }
 
 /// Extract a video thumbnail by trying server-derived and discovered candidates.
 ///
-/// `http` is the SSRF-guarded client every candidate is preflighted with, and
-/// `ffmpeg_timeout` caps a single FFmpeg run so one stalled upstream cannot
-/// hold a semaphore permit indefinitely.
+/// Every FFmpeg input is a loopback URL from [`LocalMediaProxy`]. It therefore
+/// retains HTTP range seeking without allowing FFmpeg to resolve or contact a
+/// remote host itself. `max_probe_bytes` caps total source bytes across all
+/// Range responses for a candidate; it is deliberately not a full video-size
+/// cap, so large seekable videos remain supported.
 #[allow(clippy::too_many_arguments)]
 pub async fn extract_video_thumbnail(
     video_url: &str,
@@ -61,34 +273,39 @@ pub async fn extract_video_thumbnail(
     servers: &[String],
     discovered_urls: &[String],
     negative_cache: Option<&CandidateFailureCache>,
+    expected_hash: Option<&str>,
+    max_candidates: usize,
+    max_probe_bytes: u64,
+    max_image_bytes: usize,
     deadline: Instant,
-    ffmpeg_timeout: std::time::Duration,
+    ffmpeg_timeout: Duration,
 ) -> Result<Vec<u8>, SvcError> {
-    info!("extracting thumbnail from video: {}", video_url);
+    info!(source = %log_value(video_url), "extracting video thumbnail");
 
     let _permit = semaphore
         .acquire()
         .await
-        .map_err(|_| SvcError::Io(std::io::Error::other("semaphore closed")))?;
+        .map_err(|_| SvcError::InternalError("ffmpeg semaphore closed".into()))?;
 
-    // Always try the original URL first, then any server-derived candidates.
     let mut candidates: Vec<String> = vec![video_url.to_string()];
-
     if !servers.is_empty() {
         if let Some((hash, ext)) = extract_blossom_hash(video_url) {
-            for server in servers {
-                let url = format!("{}/{}.{}", server.trim_end_matches('/'), hash, ext);
-                if url != video_url {
-                    candidates.push(url);
-                }
-            }
+            candidates.extend(
+                servers
+                    .iter()
+                    .map(|server| format!("{}/{}.{}", server.trim_end_matches('/'), hash, ext)),
+            );
         }
     }
     candidates.extend(discovered_urls.iter().cloned());
 
-    let mut seen = std::collections::HashSet::new();
-    candidates.retain(|url| validate_untrusted_url(url).is_ok() && seen.insert(url.clone()));
-
+    let mut seen = HashSet::new();
+    candidates.retain(|url| {
+        input_demuxer(url).is_some()
+            && validate_untrusted_url(url).is_ok()
+            && seen.insert(url.clone())
+    });
+    candidates.truncate(max_candidates.max(1));
     if candidates.is_empty() {
         return Err(SvcError::BadRequest("no safe video thumbnail source"));
     }
@@ -98,14 +315,9 @@ pub async fn extract_video_thumbnail(
     let mut attempted = 0;
 
     for (idx, url) in candidates.iter().enumerate() {
-        if let Some(cache) = negative_cache {
-            if let Some(class) = cache.lookup(url).await {
+        if let (Some(cache), Some(hash)) = (negative_cache, expected_hash) {
+            if let Some(class) = cache.lookup(hash, url).await {
                 metrics::record_cache_hit("blossom_negative");
-                tracing::debug!(
-                    ?class,
-                    candidate = %url,
-                    "skipping negatively cached video candidate"
-                );
                 failures.record(class);
                 continue;
             }
@@ -115,86 +327,80 @@ pub async fn extract_video_thumbnail(
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             last_error = SvcError::UpstreamError(504);
-            if let Some(cache) = negative_cache {
-                cache.remember(url, CandidateFailureClass::Transient).await;
-                failures.record(CandidateFailureClass::Transient);
-            }
+            remember_failure(
+                negative_cache,
+                expected_hash,
+                url,
+                CandidateFailureClass::Transient,
+            )
+            .await;
+            failures.record(CandidateFailureClass::Transient);
             break;
         }
-        tracing::debug!(
-            "thumbnail attempt {}/{}: {}",
-            idx + 1,
-            candidates.len(),
-            url
-        );
 
-        // Cheap guarded probe first: dead candidates are rejected in
-        // milliseconds instead of costing an FFmpeg spawn. It also resolves the
-        // redirect chain under our SSRF guard, so FFmpeg receives a terminal URL
-        // instead of chasing hops with its own resolver.
         let resolved = match preflight_candidate(http, url, deadline).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 let class = CandidateFailureClass::from_error(&error);
-                if let Some(cache) = negative_cache {
-                    cache.remember(url, class).await;
-                }
+                remember_failure(negative_cache, expected_hash, url, class).await;
                 failures.record(class);
-                tracing::debug!(?class, candidate = %url, "preflight rejected video candidate");
                 last_error = error;
                 continue;
             }
         };
 
         let attempt_budget = remaining.min(ffmpeg_timeout);
-        match extract_thumbnail_with_ffmpeg(&resolved, attempt_budget).await {
+        let demuxer = input_demuxer(url).expect("candidate filter retains supported videos");
+        match extract_thumbnail_with_ffmpeg(
+            resolved,
+            demuxer,
+            http.clone(),
+            deadline,
+            max_probe_bytes,
+            max_image_bytes,
+            attempt_budget,
+        )
+        .await
+        {
             Ok(bytes) => {
-                tracing::info!(
-                    "✓ thumbnail {}/{} ({} bytes) from {}",
-                    idx + 1,
-                    candidates.len(),
-                    bytes.len(),
-                    url
+                metrics::record_bytes_downloaded("video", bytes.len());
+                info!(
+                    candidate = idx + 1,
+                    bytes = bytes.len(),
+                    "video thumbnail extracted"
                 );
                 return Ok(bytes);
             }
             Err(error) => {
-                tracing::debug!(
-                    "✗ thumbnail {}/{} failed: {:?}",
-                    idx + 1,
-                    candidates.len(),
-                    error
-                );
                 let class = CandidateFailureClass::from_error(&error);
-                if let Some(cache) = negative_cache {
-                    cache.remember(url, class).await;
-                }
+                remember_failure(negative_cache, expected_hash, url, class).await;
                 failures.record(class);
                 last_error = error;
             }
         }
     }
 
-    tracing::warn!(
-        "all {} candidates exhausted for {}",
-        candidates.len(),
-        video_url
-    );
-    if negative_cache.is_some() && attempted == 0 {
+    if negative_cache.is_some() && expected_hash.is_some() && attempted == 0 {
         Err(failures.into_error())
     } else {
         Err(last_error)
     }
 }
 
-/// Preflight a candidate with our own HTTP client before handing it to FFmpeg.
-///
-/// FFmpeg resolves and follows redirects itself, so it bypasses the public-IP
-/// DNS resolver and the hop validation that protect every other fetch in this
-/// service. Probing first with the guarded client means a dead candidate never
-/// reaches FFmpeg, and — because Blossom servers commonly 302 a blob to the
-/// bucket or CDN holding the bytes — that the chain is walked under our own
-/// guard. Returns the final URL, which is what FFmpeg is given.
+async fn remember_failure(
+    cache: Option<&CandidateFailureCache>,
+    expected_hash: Option<&str>,
+    url: &str,
+    class: CandidateFailureClass,
+) {
+    if let (Some(cache), Some(hash)) = (cache, expected_hash) {
+        cache.remember(hash, url, class).await;
+    }
+}
+
+/// Resolve a candidate through the guarded Reqwest client before starting the
+/// local proxy. Every actual FFmpeg range request is guarded again by that same
+/// client, so this preflight is only an inexpensive early failure path.
 async fn preflight_candidate(
     http: &reqwest::Client,
     url: &str,
@@ -204,7 +410,6 @@ async fn preflight_candidate(
     if remaining.is_zero() {
         return Err(SvcError::UpstreamError(504));
     }
-
     let response = tokio::time::timeout(
         remaining,
         http.get(url)
@@ -215,66 +420,64 @@ async fn preflight_candidate(
     .map_err(|_| SvcError::UpstreamError(504))?
     .map_err(SvcError::Fetch)?;
 
-    let status = response.status();
-    if status.is_redirection() {
-        // The client follows validated hops, so a 3xx surviving to here is one
-        // we could not resolve at all (typically a missing `Location`). Report a
-        // gateway failure rather than passing a bare 3xx back to the caller.
-        tracing::debug!(%url, %status, "unresolvable redirect for video candidate");
-        return Err(SvcError::UpstreamError(502));
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(if response.status().is_success() {
+            SvcError::UpstreamError(416)
+        } else {
+            SvcError::UpstreamError(response.status().as_u16())
+        });
     }
-    if !status.is_success() {
-        return Err(SvcError::UpstreamError(status.as_u16()));
-    }
-
     Ok(response.url().as_str().to_owned())
 }
 
-/// Extract a thumbnail from a video using the FFmpeg CLI.
-///
-/// `timeout` is a hard wall-clock bound. Without one, `Command::output()` waits
-/// forever on a stalled upstream and the semaphore permit is never returned, so
-/// a handful of hung fetches permanently disable video thumbnails.
+/// Spawn one constrained FFmpeg process and have it read only from the local
+/// media gateway. Output is the thumbnail directly; there is no intermediate
+/// clip and no full source-video download.
+#[allow(clippy::too_many_arguments)]
 async fn extract_thumbnail_with_ffmpeg(
-    video_url: &str,
-    timeout: std::time::Duration,
+    source_url: String,
+    demuxer: &str,
+    http: reqwest::Client,
+    deadline: Instant,
+    max_probe_bytes: u64,
+    max_image_bytes: usize,
+    timeout: Duration,
 ) -> Result<Vec<u8>, SvcError> {
     use tokio::process::Command;
 
+    let proxy = LocalMediaProxy::start(source_url, http, deadline, max_probe_bytes).await?;
     let temp_file = tempfile::NamedTempFile::new().map_err(SvcError::Io)?;
-    let output_path = temp_file.path();
+    let output_path = temp_file.path().to_path_buf();
 
-    tracing::debug!("spawning ffmpeg for video: {}", video_url);
-
-    // `-rw_timeout` is in microseconds and bounds each socket read/write, so a
-    // trickling upstream cannot outlive the wall-clock budget by stalling.
-    let io_timeout_micros = (timeout.as_micros().min(u128::from(u32::MAX)) as u64).to_string();
-
-    let child = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    command
         .args([
             "-nostdin",
             "-loglevel",
             "error",
-            // Confine FFmpeg to network protocols: without this it will happily
-            // open `file:`, `concat:` or `subfile:` targets from a playlist.
+            // FFmpeg may contact only our loopback media proxy. Explicit input
+            // demuxing below blocks playlist parsing from introducing nested
+            // remote URLs under this otherwise narrow whitelist.
             "-protocol_whitelist",
-            "http,https,tcp,tls,crypto",
-            "-user_agent",
-            "rust-imgproxy/0.1",
-            "-rw_timeout",
-            &io_timeout_micros,
+            "file,http",
             "-analyzeduration",
             "5000000",
             "-probesize",
             "5000000",
             "-ss",
             "0.5",
+            "-f",
+            demuxer,
             "-i",
-            video_url,
-            "-vframes",
+            &proxy.input_url,
+            "-t",
+            "5",
+            "-map",
+            "0:v:0",
+            "-frames:v",
             "1",
             "-vf",
-            "scale=-1:'min(720,ih)'",
+            "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
             "-q:v",
             "80",
             "-c:v",
@@ -283,73 +486,99 @@ async fn extract_thumbnail_with_ffmpeg(
             "image2",
             "-y",
         ])
-        .arg(output_path)
+        .arg(&output_path)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        // Dropping the future on timeout must actually reap the process rather
-        // than orphan it holding an upstream connection open.
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            error!("failed to spawn ffmpeg for {}: {}", video_url, e);
-            SvcError::Io(e)
-        })?;
+        .kill_on_drop(true);
+    apply_ffmpeg_limits(&mut command, timeout)?;
 
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    let mut child = command.spawn().map_err(|error| {
+        error!(error = %error, "failed to spawn ffmpeg");
+        SvcError::InternalError("failed to spawn ffmpeg".into())
+    })?;
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let stderr_task = tokio::spawn(read_capped(stderr, MAX_FFMPEG_STDERR_BYTES));
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(result) => result.map_err(SvcError::Io)?,
         Err(_) => {
-            tracing::debug!("ffmpeg exceeded {:?} for {}", timeout, video_url);
             metrics::record_ffmpeg_extraction(false);
             return Err(SvcError::UpstreamError(504));
         }
     };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Check for common error patterns
-        let is_timeout = stderr.contains("timed out") || stderr.contains("Connection timed out");
-        let is_network_error =
-            stderr.contains("Connection refused") || stderr.contains("Could not resolve host");
-        let is_404 = stderr.contains("404") || stderr.contains("Not Found");
-
-        if is_timeout {
-            tracing::debug!("ffmpeg timeout for {}: connection timed out", video_url);
-        } else if is_network_error {
-            tracing::debug!(
-                "ffmpeg network error for {}: {}",
-                video_url,
-                stderr.lines().next().unwrap_or("unknown")
-            );
-        } else if is_404 {
-            tracing::debug!("ffmpeg 404 error for {}: resource not found", video_url);
-        } else {
-            tracing::debug!(
-                "ffmpeg failed for {}: {}",
-                video_url,
-                stderr.lines().take(3).collect::<Vec<_>>().join(" | ")
-            );
-        }
-
+    let stderr = stderr_task.await.unwrap_or_else(|_| Vec::new());
+    if !status.success() {
         metrics::record_ffmpeg_extraction(false);
-
-        return Err(SvcError::Io(std::io::Error::other(format!(
-            "ffmpeg failed: {}",
-            stderr
-        ))));
+        tracing::debug!(stderr = %String::from_utf8_lossy(&stderr), "ffmpeg thumbnail extraction failed");
+        return Err(SvcError::UpstreamError(502));
     }
 
-    tracing::debug!("ffmpeg successfully extracted thumbnail for: {}", video_url);
-
+    let metadata = tokio::fs::metadata(&output_path)
+        .await
+        .map_err(SvcError::Io)?;
+    if metadata.len() == 0 || metadata.len() > max_image_bytes as u64 {
+        metrics::record_ffmpeg_extraction(false);
+        return Err(SvcError::UpstreamError(502));
+    }
+    let thumbnail = tokio::fs::read(&output_path).await.map_err(SvcError::Io)?;
     metrics::record_ffmpeg_extraction(true);
+    Ok(thumbnail)
+}
 
-    let thumbnail_data = tokio::fs::read(output_path).await.map_err(|e| {
-        error!("failed to read thumbnail output: {}", e);
-        SvcError::Io(e)
-    })?;
+async fn read_capped<R>(mut reader: R, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut output = Vec::with_capacity(cap);
+    let mut buffer = [0u8; 1024];
+    loop {
+        let read = match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let keep = cap.saturating_sub(output.len()).min(read);
+        output.extend_from_slice(&buffer[..keep]);
+    }
+    output
+}
 
-    Ok(thumbnail_data)
+#[cfg(unix)]
+fn apply_ffmpeg_limits(
+    command: &mut tokio::process::Command,
+    timeout: Duration,
+) -> Result<(), SvcError> {
+    use std::os::unix::process::CommandExt;
+
+    let cpu_seconds = timeout.as_secs().saturating_add(1).max(1);
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            for (resource, limit) in [
+                (libc::RLIMIT_AS, FFMPEG_ADDRESS_LIMIT_BYTES),
+                (libc::RLIMIT_CPU, cpu_seconds),
+                (libc::RLIMIT_FSIZE, FFMPEG_FILE_LIMIT_BYTES),
+            ] {
+                let value = libc::rlimit {
+                    rlim_cur: limit as libc::rlim_t,
+                    rlim_max: limit as libc::rlim_t,
+                };
+                if libc::setrlimit(resource, &value) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_ffmpeg_limits(_: &mut tokio::process::Command, _: Duration) -> Result<(), SvcError> {
+    Ok(())
+}
+
+fn log_value(value: &str) -> &str {
+    value.get(..value.len().min(128)).unwrap_or(value)
 }
 
 #[cfg(test)]
@@ -357,79 +586,101 @@ mod tests {
     use super::*;
 
     #[test]
-    fn candidate_failure_classifies_not_found_as_missing() {
-        assert_eq!(
-            CandidateFailureClass::from_status(404),
-            CandidateFailureClass::Missing
-        );
+    fn is_video_url_accepts_direct_containers_and_rejects_playlists() {
+        assert!(is_video_url("https://cdn.example/video.mp4"));
+        assert!(is_video_url("https://cdn.example/video.webm?download=1"));
+        assert!(!is_video_url("https://cdn.example/video.m3u8"));
+        assert!(!is_video_url("https://cdn.example/video.mpd"));
     }
 
     #[tokio::test]
-    async fn extract_video_thumbnail_skips_negatively_cached_candidate() {
+    async fn media_proxy_rejects_non_range_requests() {
+        crate::init_crypto_provider();
+        let state = MediaProxyState {
+            source_url: "https://cdn.example/video.mp4".into(),
+            token: "correct".into(),
+            http: reqwest::Client::new(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            remaining_bytes: Arc::new(AtomicU64::new(1024)),
+        };
+        let error = serve_media_range(State(state), AxPath("correct".into()), HeaderMap::new())
+            .await
+            .expect_err("whole-file proxy requests must be rejected");
+        assert_eq!(error, StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_skips_hash_scoped_negative_candidate() {
         crate::init_crypto_provider();
         let cache = CandidateFailureCache::new(
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
         );
-        let url = format!("https://cdn.example.com/{}.mp4", "a".repeat(64));
-        cache.remember(&url, CandidateFailureClass::Missing).await;
-        let http = reqwest::Client::new();
-        let semaphore = Arc::new(Semaphore::new(1));
-
+        let hash = "a".repeat(64);
+        let url = format!("https://cdn.example/{hash}.mp4");
+        cache
+            .remember(&hash, &url, CandidateFailureClass::Missing)
+            .await;
         let result = extract_video_thumbnail(
             &url,
-            &semaphore,
-            &http,
+            &Arc::new(Semaphore::new(1)),
+            &reqwest::Client::new(),
             &[],
             &[],
             Some(&cache),
-            Instant::now() + std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(1),
+            Some(&hash),
+            8,
+            1024,
+            1024,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
         )
         .await;
-
         assert!(matches!(result, Err(SvcError::UpstreamError(404))));
     }
-
     #[tokio::test]
-    async fn preflight_candidate_returns_the_redirect_target() {
-        // Regression: blossom.primal.net answers a blob GET with a 302 to
-        // r2a.primal.net. Refusing that hop failed every candidate and the
-        // request surfaced as a 502 without FFmpeg ever running.
+    async fn media_proxy_relays_ranges_without_downloading_the_full_video() {
         crate::init_crypto_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let location = format!("http://cdn.example:{}/final.mp4", address.port());
         tokio::spawn(async move {
-            let router = axum::Router::new()
-                .route(
-                    "/video.mp4",
-                    axum::routing::get(move || {
-                        let location = location.clone();
-                        async move { axum::response::Redirect::to(&location) }
-                    }),
-                )
-                .route("/final.mp4", axum::routing::get(|| async { "mp4 bytes" }));
-            axum::serve(listener, router).await.unwrap();
+            let app = Router::new().route(
+                "/video.mp4",
+                get(|| async {
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        [
+                            (header::CONTENT_RANGE, "bytes 0-3/1073741824"),
+                            (header::ACCEPT_RANGES, "bytes"),
+                        ],
+                        "clip",
+                    )
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
         });
+
         let http = reqwest::Client::builder()
-            .redirect(crate::network_policy::guarded_redirect_policy())
             .resolve("cdn.example", address)
             .build()
             .unwrap();
-
-        let resolved = preflight_candidate(
-            &http,
-            &format!("http://cdn.example:{}/video.mp4", address.port()),
-            Instant::now() + std::time::Duration::from_secs(5),
+        let proxy = LocalMediaProxy::start(
+            format!("http://cdn.example:{}/video.mp4", address.port()),
+            http,
+            Instant::now() + Duration::from_secs(1),
+            4,
         )
         .await
-        .expect("a redirecting video candidate must preflight successfully");
+        .unwrap();
+        let response = reqwest::Client::new()
+            .get(&proxy.input_url)
+            .header(reqwest::header::RANGE, "bytes=0-3")
+            .send()
+            .await
+            .unwrap();
 
-        assert!(
-            resolved.ends_with("/final.mp4"),
-            "FFmpeg must be handed the resolved target, got {resolved}"
-        );
+        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"clip");
     }
 }

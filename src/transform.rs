@@ -1,4 +1,4 @@
-use image::{imageops::FilterType, DynamicImage, GenericImageView, Limits};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, Limits};
 use percent_encoding::percent_decode_str;
 use rgb::FromSlice;
 
@@ -56,6 +56,20 @@ pub struct Resize {
     pub h: u32,
 }
 
+impl Resize {
+    /// Reject an out-of-range target before anything is fetched.
+    ///
+    /// The ceiling is enforced again at the allocation site in
+    /// [`resize_checked`], but a request asking for a 60000² output should cost
+    /// us nothing at all — not a `MAX_IMAGE_BYTES` download first.
+    pub fn validate(&self, max_dimension: u32) -> Result<(), SvcError> {
+        if self.w > max_dimension || self.h > max_dimension {
+            return Err(SvcError::BadRequest("resize target too large"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ResizeMode {
     Fit,
@@ -63,6 +77,22 @@ pub enum ResizeMode {
     FillDown,
     Force,
     Auto,
+}
+
+impl ResizeMode {
+    /// Short, stable text form used in derivative cache keys.
+    ///
+    /// Changing a label invalidates every existing cache entry for that mode,
+    /// so these strings are part of the key format and must stay stable.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ResizeMode::Fit => "fit",
+            ResizeMode::Fill => "fill",
+            ResizeMode::FillDown => "fill-down",
+            ResizeMode::Force => "force",
+            ResizeMode::Auto => "auto",
+        }
+    }
 }
 
 /// Parse URL path segments into directives and source URL
@@ -101,7 +131,7 @@ pub fn parse_rest(rest: &str) -> Result<(Directives, String), SvcError> {
             quality = arg
                 .parse()
                 .ok()
-                .filter(|q: &u8| *q <= 100)
+                .filter(|q: &u8| (1..=100).contains(q))
                 .ok_or(SvcError::BadRequest("bad quality"))?;
         } else if let Some(arg) = seg.strip_prefix("rs:") {
             // Parse rs:<mode>:<w>:<h> or rt:<mode>:<w>:<h>
@@ -134,7 +164,10 @@ pub fn parse_rest(rest: &str) -> Result<(Directives, String), SvcError> {
 }
 
 /// Parse a resize directive like "fill:480:480", "fit:800:600", "fit::600", or "fit:800:"
-fn parse_resize_directive(arg: &str) -> Result<Resize, SvcError> {
+///
+/// Shared with the `/thumb` query parser so there is exactly one resize grammar;
+/// a second copy would let a cap added here be bypassed through the other route.
+pub fn parse_resize_directive(arg: &str) -> Result<Resize, SvcError> {
     let parts: Vec<&str> = arg.split(':').collect();
     if parts.len() != 3 {
         return Err(SvcError::BadRequest("invalid resize format"));
@@ -169,9 +202,23 @@ fn parse_resize_directive(arg: &str) -> Result<Resize, SvcError> {
     Ok(Resize { mode, w, h })
 }
 
-/// Apply resize transformation based on the resize mode
-pub fn apply_resize(img: DynamicImage, resize: &Resize) -> DynamicImage {
+/// Apply resize transformation based on the resize mode.
+///
+/// `limits` is the same budget the decoder was handed, reused here because the
+/// resize step is what actually allocates the most: `imageops::resize` builds an
+/// `Rgba32F` intermediate at 16 bytes per pixel that `Limits::max_alloc` never
+/// sees. Without this check a legal-looking request asks for gigabytes, and a
+/// failed allocation is an `abort()` — not a panic, so `CpuPool` cannot contain
+/// it.
+pub fn apply_resize(
+    img: DynamicImage,
+    resize: &Resize,
+    limits: &Limits,
+) -> Result<DynamicImage, SvcError> {
     let (src_w, src_h) = img.dimensions();
+    if src_w == 0 || src_h == 0 {
+        return Err(SvcError::BadRequest("source image has a zero dimension"));
+    }
 
     // Calculate missing dimension based on aspect ratio
     let (target_w, target_h) = calculate_dimensions(src_w, src_h, resize.w, resize.h);
@@ -191,12 +238,59 @@ pub fn apply_resize(img: DynamicImage, resize: &Resize) -> DynamicImage {
     };
 
     match mode {
-        ResizeMode::Fit => apply_resize_fit(img, target_w, target_h),
-        ResizeMode::Fill => apply_resize_fill(img, target_w, target_h),
-        ResizeMode::FillDown => apply_resize_fill_down(img, target_w, target_h),
-        ResizeMode::Force => apply_resize_force(img, target_w, target_h),
+        ResizeMode::Fit => apply_resize_fit(img, target_w, target_h, limits),
+        ResizeMode::Fill => apply_resize_fill(img, target_w, target_h, limits),
+        ResizeMode::FillDown => apply_resize_fill_down(img, target_w, target_h, limits),
+        ResizeMode::Force => apply_resize_force(img, target_w, target_h, limits),
         ResizeMode::Auto => unreachable!(), // Already resolved above
     }
+}
+
+/// The one place a resize actually allocates, and therefore the one place the
+/// allocation is budgeted.
+///
+/// `imageops::resize` allocates an `Rgba32F` intermediate of `src_w × new_h` at
+/// 16 bytes per pixel regardless of the source colour type, plus the destination
+/// buffer. Neither is covered by `Limits::max_alloc`, which only bounds the
+/// decoder's own framebuffer.
+fn resize_checked(
+    img: DynamicImage,
+    new_w: u32,
+    new_h: u32,
+    limits: &Limits,
+) -> Result<DynamicImage, SvcError> {
+    if new_w == 0 || new_h == 0 {
+        return Err(SvcError::BadRequest("resize target rounds to zero"));
+    }
+
+    let max_dimension = max_output_dimension(limits);
+    if new_w > max_dimension || new_h > max_dimension {
+        return Err(SvcError::BadRequest("resize target too large"));
+    }
+
+    if let Some(budget) = limits.max_alloc {
+        let (src_w, _) = img.dimensions();
+        let intermediate = u64::from(src_w) * u64::from(new_h) * 16;
+        // 16 B/px is the widest `DynamicImage` variant, so this over-estimates
+        // for the common RGBA8 case rather than under-estimating for Rgba32F.
+        let destination = u64::from(new_w) * u64::from(new_h) * 16;
+        if intermediate.saturating_add(destination) > budget {
+            return Err(SvcError::BadRequest(
+                "resize would exceed the memory budget",
+            ));
+        }
+    }
+
+    Ok(img.resize_exact(new_w, new_h, FilterType::Lanczos3))
+}
+
+/// Per-axis ceiling for a resize target, derived from the decoder limits so
+/// `MAX_IMAGE_DIMENSION` stays the single source of truth.
+fn max_output_dimension(limits: &Limits) -> u32 {
+    limits
+        .max_image_width
+        .unwrap_or(u32::MAX)
+        .min(limits.max_image_height.unwrap_or(u32::MAX))
 }
 
 /// Calculate target dimensions, filling in missing dimension based on aspect ratio
@@ -220,7 +314,12 @@ fn calculate_dimensions(src_w: u32, src_h: u32, target_w: u32, target_h: u32) ->
 }
 
 /// Fit: Resize while keeping aspect ratio to fit within the given size
-fn apply_resize_fit(img: DynamicImage, target_w: u32, target_h: u32) -> DynamicImage {
+fn apply_resize_fit(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    limits: &Limits,
+) -> Result<DynamicImage, SvcError> {
     let (w, h) = img.dimensions();
 
     // Scale to fit within the box
@@ -229,31 +328,43 @@ fn apply_resize_fit(img: DynamicImage, target_w: u32, target_h: u32) -> DynamicI
     // Don't upscale if image is smaller
     let scale = f32::min(scale, 1.0);
 
-    let new_w = (w as f32 * scale).round() as u32;
-    let new_h = (h as f32 * scale).round() as u32;
+    // A degenerate aspect ratio rounds the short axis to zero, which every
+    // encoder rejects — one pixel is the smallest meaningful output.
+    let new_w = (w as f32 * scale).round().max(1.0) as u32;
+    let new_h = (h as f32 * scale).round().max(1.0) as u32;
 
-    img.resize_exact(new_w, new_h, FilterType::Lanczos3)
+    resize_checked(img, new_w, new_h, limits)
 }
 
 /// Fill: Resize while keeping aspect ratio to fill the given size, with center crop
-fn apply_resize_fill(img: DynamicImage, target_w: u32, target_h: u32) -> DynamicImage {
+fn apply_resize_fill(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    limits: &Limits,
+) -> Result<DynamicImage, SvcError> {
     let (w, h) = img.dimensions();
 
     // Scale to fill the box
     let scale = f32::max(target_w as f32 / w as f32, target_h as f32 / h as f32);
-    let new_w = (w as f32 * scale).ceil() as u32;
-    let new_h = (h as f32 * scale).ceil() as u32;
+    let new_w = (w as f32 * scale).ceil().max(1.0) as u32;
+    let new_h = (h as f32 * scale).ceil().max(1.0) as u32;
 
-    let resized = img.resize_exact(new_w, new_h, FilterType::Lanczos3);
+    let resized = resize_checked(img, new_w, new_h, limits)?;
 
     // Center crop
     let x = (new_w.saturating_sub(target_w)) / 2;
     let y = (new_h.saturating_sub(target_h)) / 2;
-    resized.crop_imm(x, y, target_w, target_h)
+    Ok(resized.crop_imm(x, y, target_w, target_h))
 }
 
 /// Fill-Down: Like fill, but if result is smaller, crop to maintain aspect ratio
-fn apply_resize_fill_down(img: DynamicImage, target_w: u32, target_h: u32) -> DynamicImage {
+fn apply_resize_fill_down(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    limits: &Limits,
+) -> Result<DynamicImage, SvcError> {
     let (w, h) = img.dimensions();
 
     // Scale to fill the box
@@ -262,10 +373,10 @@ fn apply_resize_fill_down(img: DynamicImage, target_w: u32, target_h: u32) -> Dy
     // Don't upscale
     let scale = f32::min(scale, 1.0);
 
-    let new_w = (w as f32 * scale).ceil() as u32;
-    let new_h = (h as f32 * scale).ceil() as u32;
+    let new_w = (w as f32 * scale).ceil().max(1.0) as u32;
+    let new_h = (h as f32 * scale).ceil().max(1.0) as u32;
 
-    let resized = img.resize_exact(new_w, new_h, FilterType::Lanczos3);
+    let resized = resize_checked(img, new_w, new_h, limits)?;
 
     // If smaller than target, crop to maintain aspect ratio
     let crop_w = new_w.min(target_w);
@@ -274,13 +385,23 @@ fn apply_resize_fill_down(img: DynamicImage, target_w: u32, target_h: u32) -> Dy
     // Center crop
     let x = (new_w.saturating_sub(crop_w)) / 2;
     let y = (new_h.saturating_sub(crop_h)) / 2;
-    resized.crop_imm(x, y, crop_w, crop_h)
+    Ok(resized.crop_imm(x, y, crop_w, crop_h))
 }
 
 /// Force: Resize without keeping aspect ratio
-fn apply_resize_force(img: DynamicImage, target_w: u32, target_h: u32) -> DynamicImage {
-    img.resize_exact(target_w, target_h, FilterType::Lanczos3)
+fn apply_resize_force(
+    img: DynamicImage,
+    target_w: u32,
+    target_h: u32,
+    limits: &Limits,
+) -> Result<DynamicImage, SvcError> {
+    resize_checked(img, target_w, target_h, limits)
 }
+
+/// Largest axis libwebp accepts (`WEBP_MAX_DIMENSION`). The `webp` crate's
+/// `encode` unwraps the resulting error, so exceeding it panics the encode
+/// thread instead of failing the request.
+const MAX_WEBP_DIMENSION: u32 = 16_383;
 
 /// Encode image to the specified format with quality settings
 pub fn encode_image(img: &DynamicImage, fmt: &OutFmt, quality: u8) -> Result<Vec<u8>, SvcError> {
@@ -295,10 +416,22 @@ pub fn encode_image(img: &DynamicImage, fmt: &OutFmt, quality: u8) -> Result<Vec
             img.write_with_encoder(enc)?;
         }
         OutFmt::Webp => {
-            // Use lossy WebP encoding with quality control
-            let webp_data = webp::Encoder::from_image(img)
-                .map_err(|e| SvcError::Io(std::io::Error::other(e)))?
-                .encode(quality as f32);
+            // `Encoder::from_image` refuses Luma and 16-bit variants outright,
+            // and `encode` unwraps libwebp's error — an axis over
+            // `WEBP_MAX_DIMENSION` would panic the worker. Normalising to RGBA8
+            // and using the fallible entry point removes both failure modes.
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            if w == 0 || h == 0 || w > MAX_WEBP_DIMENSION || h > MAX_WEBP_DIMENSION {
+                return Err(SvcError::BadRequest("output size unsupported by webp"));
+            }
+            let webp_data = webp::Encoder::from_rgba(rgba.as_raw(), w, h)
+                .encode_simple(false, quality as f32)
+                .map_err(|error| {
+                    SvcError::Io(std::io::Error::other(format!(
+                        "webp encode error: {error:?}"
+                    )))
+                })?;
             out.extend_from_slice(&webp_data);
         }
         OutFmt::Avif => {
@@ -310,8 +443,17 @@ pub fn encode_image(img: &DynamicImage, fmt: &OutFmt, quality: u8) -> Result<Vec
             // second full framebuffer for no benefit.
             let avif_img = ravif::Img::new(rgba.as_raw().as_rgba(), w as usize, h as usize);
             let encoder = ravif::Encoder::new()
-                .with_quality(quality as f32)
-                .with_speed(6);
+                // `ravif` asserts `1.0..=100.0`; a `q:0` request must not be
+                // able to panic the encode thread.
+                .with_quality(quality.clamp(1, 100) as f32)
+                .with_speed(6)
+                // rav1e defaults to the whole global rayon pool (one thread
+                // per core), so `cpu_concurrency` CPU permits would each fan
+                // out to the full core count — cores² runnable threads and
+                // the cpu.rs semaphore stops accounting for real work. One
+                // permit must equal one core. (`with_num_threads` exists
+                // because `ravif` is built with its `threading` feature.)
+                .with_num_threads(Some(1));
             let encoded = encoder.encode_rgba(avif_img).map_err(|e| {
                 SvcError::Io(std::io::Error::other(format!("AVIF encode error: {}", e)))
             })?;
@@ -330,6 +472,18 @@ pub fn decode_image(bytes: &[u8], limits: Limits) -> Result<DynamicImage, SvcErr
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| SvcError::Decode(image::ImageError::IoError(e)))?;
+    // Explicit input allowlist — not just a build-time feature list. Feature
+    // unification means some other crate in the graph can silently re-enable
+    // `image`'s default-formats (or a future decoder) without touching this
+    // manifest; and `ImageFormat` keeps every enum variant regardless of which
+    // decoders are compiled in. A format not on this list is refused *before*
+    // `decode()` runs, so it can never allocate a framebuffer here.
+    if !matches!(
+        reader.format(),
+        Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP)
+    ) {
+        return Err(SvcError::BadRequest("unsupported source format"));
+    }
     reader.limits(limits);
     Ok(reader.decode()?)
 }
@@ -339,8 +493,8 @@ pub fn decode_image(bytes: &[u8], limits: Limits) -> Result<DynamicImage, SvcErr
 /// Deliberately blocking and self-contained: callers hand this to
 /// [`crate::cpu::CpuPool`] so it never runs on an async worker thread.
 pub fn process_image(bytes: &[u8], dirs: &Directives, limits: Limits) -> Result<Vec<u8>, SvcError> {
-    let img = decode_image(bytes, limits)?;
-    let img = apply_resize(img, &dirs.resize);
+    let img = decode_image(bytes, limits.clone())?;
+    let img = apply_resize(img, &dirs.resize, &limits)?;
     encode_image(&img, &dirs.out_fmt, dirs.quality)
 }
 
@@ -356,6 +510,20 @@ mod tests {
 
     fn directives(rest: &str) -> Directives {
         parse_rest(rest).expect("directives parse").0
+    }
+
+    /// Production limits: the same shape `AppCfg::decode_limits` builds.
+    fn test_limits() -> Limits {
+        let mut limits = Limits::default();
+        limits.max_image_width = Some(16_384);
+        limits.max_image_height = Some(16_384);
+        limits.max_alloc = Some(256 * 1024 * 1024);
+        limits
+    }
+
+    /// Resize under production limits; these tests pin geometry, not the budget.
+    fn resized(img: DynamicImage, resize: &Resize) -> DynamicImage {
+        apply_resize(img, resize, &test_limits()).expect("resize must succeed")
     }
 
     // -----------------------------------------------------------------------
@@ -551,7 +719,7 @@ mod tests {
 
     #[test]
     fn fit_resize_preserves_aspect_within_the_box() {
-        let out = apply_resize(
+        let out = resized(
             img(400, 200),
             &Resize {
                 mode: ResizeMode::Fit,
@@ -565,7 +733,7 @@ mod tests {
 
     #[test]
     fn fit_resize_never_upscales_a_smaller_source() {
-        let out = apply_resize(
+        let out = resized(
             img(50, 40),
             &Resize {
                 mode: ResizeMode::Fit,
@@ -578,7 +746,7 @@ mod tests {
 
     #[test]
     fn fill_resize_returns_exactly_the_requested_box() {
-        let out = apply_resize(
+        let out = resized(
             img(400, 200),
             &Resize {
                 mode: ResizeMode::Fill,
@@ -591,7 +759,7 @@ mod tests {
 
     #[test]
     fn fill_resize_upscales_to_cover_a_larger_box() {
-        let out = apply_resize(
+        let out = resized(
             img(50, 50),
             &Resize {
                 mode: ResizeMode::Fill,
@@ -604,7 +772,7 @@ mod tests {
 
     #[test]
     fn fill_down_resize_does_not_upscale_and_clamps_to_source() {
-        let out = apply_resize(
+        let out = resized(
             img(80, 60),
             &Resize {
                 mode: ResizeMode::FillDown,
@@ -618,7 +786,7 @@ mod tests {
 
     #[test]
     fn force_resize_ignores_aspect_ratio() {
-        let out = apply_resize(
+        let out = resized(
             img(400, 200),
             &Resize {
                 mode: ResizeMode::Force,
@@ -632,7 +800,7 @@ mod tests {
     #[test]
     fn auto_resize_fills_when_orientation_matches() {
         // Landscape source, landscape target -> behaves like fill (exact box).
-        let out = apply_resize(
+        let out = resized(
             img(400, 200),
             &Resize {
                 mode: ResizeMode::Auto,
@@ -646,7 +814,7 @@ mod tests {
     #[test]
     fn auto_resize_fits_when_orientation_differs() {
         // Landscape source, portrait target -> behaves like fit (aspect kept).
-        let out = apply_resize(
+        let out = resized(
             img(400, 200),
             &Resize {
                 mode: ResizeMode::Auto,
@@ -659,7 +827,7 @@ mod tests {
 
     #[test]
     fn missing_height_is_derived_from_source_aspect() {
-        let out = apply_resize(
+        let out = resized(
             img(400, 200),
             &Resize {
                 mode: ResizeMode::Force,
@@ -672,7 +840,7 @@ mod tests {
 
     #[test]
     fn missing_width_is_derived_from_source_aspect() {
-        let out = apply_resize(
+        let out = resized(
             img(400, 200),
             &Resize {
                 mode: ResizeMode::Force,
@@ -747,5 +915,131 @@ mod tests {
             low.len(),
             high.len()
         );
+    }
+    // -----------------------------------------------------------------------
+    // resize and encode guards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resize_rejects_a_target_beyond_the_dimension_cap() {
+        // `rs:force:60000:60000` allocated 14.4 GB and died in
+        // `handle_alloc_error`, which is an abort the CpuPool cannot contain.
+        let error = apply_resize(
+            img(64, 64),
+            &Resize {
+                mode: ResizeMode::Force,
+                w: 60_000,
+                h: 60_000,
+            },
+            &test_limits(),
+        )
+        .expect_err("an oversized target must be refused");
+        assert!(matches!(
+            error,
+            SvcError::BadRequest("resize target too large")
+        ));
+    }
+
+    #[test]
+    fn resize_rejects_an_intermediate_buffer_over_the_alloc_budget() {
+        // `imageops::resize` builds an Rgba32F intermediate at 16 B/px that
+        // `Limits::max_alloc` never sees, so a scale-1.0 `fit` on a large source
+        // busts the budget without any upscaling at all.
+        let mut limits = test_limits();
+        limits.max_alloc = Some(64 * 1024);
+
+        let error = apply_resize(
+            img(800, 600),
+            &Resize {
+                mode: ResizeMode::Fit,
+                w: 800,
+                h: 600,
+            },
+            &limits,
+        )
+        .expect_err("an over-budget intermediate must be refused");
+        assert!(matches!(
+            error,
+            SvcError::BadRequest("resize would exceed the memory budget")
+        ));
+    }
+
+    #[test]
+    fn parse_rest_rejects_zero_quality() {
+        // `ravif::Encoder::with_quality` asserts `1.0..=100.0`.
+        let err = parse_rest("f:avif/q:0/rs:fit:10:10/plain/https://e.com/a.png").unwrap_err();
+        assert!(matches!(err, SvcError::BadRequest("bad quality")));
+    }
+
+    #[test]
+    fn resize_validate_rejects_a_target_over_the_cap_before_any_fetch() {
+        let resize = Resize {
+            mode: ResizeMode::Fit,
+            w: 60_000,
+            h: 10,
+        };
+        assert!(matches!(
+            resize.validate(16_384),
+            Err(SvcError::BadRequest("resize target too large"))
+        ));
+        assert!(resize.validate(65_535).is_ok());
+    }
+
+    #[test]
+    fn encode_image_encodes_a_grayscale_source_as_webp() {
+        // `webp::Encoder::from_image` returns "Unimplemented" for Luma8, so every
+        // grayscale PNG used to 500 on the Blossom default output format.
+        let gray =
+            DynamicImage::ImageLuma8(image::GrayImage::from_pixel(16, 16, image::Luma([128])));
+        let out = encode_image(&gray, &OutFmt::Webp, 80).expect("grayscale must encode");
+        assert_eq!(&out[..4], b"RIFF");
+        assert_eq!(&out[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn encode_image_rejects_a_webp_target_over_the_libwebp_cap() {
+        let error = encode_image(&img(16_384, 1), &OutFmt::Webp, 80)
+            .expect_err("libwebp cannot encode a 16384-wide image");
+        assert!(matches!(
+            error,
+            SvcError::BadRequest("output size unsupported by webp")
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_image — input format allowlist
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_image_rejects_gif_as_unsupported_source() {
+        // Minimal 1x1 GIF89a: the magic bytes are enough for the content
+        // sniff, but GIF is not on the input allowlist. Two rejections are
+        // permissible — the allowlist firing (`BadRequest`, the intended
+        // mechanism) or the decoder itself refusing (a build with no GIF
+        // decoder) — and the arms below distinguish them. A successful decode
+        // is the contract violation the test pins: "no decode".
+        let gif: &[u8] =
+            b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+        match decode_image(gif, test_limits()) {
+            Err(SvcError::BadRequest("unsupported source format")) => {} // allowlist fired
+            Err(SvcError::Decode(_)) => {} // decoder refused, still no decode
+            Err(other) => panic!("unexpected rejection: {other:?}"),
+            Ok(_) => panic!("a GIF was decoded: input format allowlist not enforced"),
+        }
+    }
+
+    #[test]
+    fn decode_image_rejects_avif_as_unsupported_source() {
+        // ISO-BMFF `ftyp` box with the "avif" brand: sniffed as AVIF, which is
+        // an output-only format since `avif-native` was dropped. The same
+        // allowlist rule applies — the behaviour change this pins is that
+        // `/thumb` on an AVIF blob now yields 400 instead of a thumbnail.
+        let avif: &[u8] = b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1";
+        match decode_image(avif, test_limits()) {
+            Err(SvcError::BadRequest("unsupported source format")) => {} // allowlist fired
+            Err(SvcError::Decode(_)) => {} // decoder refused, still no decode
+            Err(other) => panic!("unexpected rejection: {other:?}"),
+            Ok(_) => panic!("an AVIF was decoded: input format allowlist not enforced"),
+        }
     }
 }

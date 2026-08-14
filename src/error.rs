@@ -18,6 +18,10 @@ pub enum SvcError {
     Io(#[from] std::io::Error),
     #[error("internal error: {0}")]
     InternalError(String),
+    /// The node is at capacity and sheds this request rather than queueing it
+    /// behind work it cannot finish inside the request budget.
+    #[error("overloaded")]
+    Overloaded,
     /// An already-rendered failure, used when one request's error is replayed
     /// to the other requests that were coalesced onto it.
     #[error("{1}")]
@@ -32,16 +36,21 @@ impl SvcError {
     pub fn render(&self) -> (StatusCode, String) {
         match self {
             SvcError::BadRequest(msg) => (StatusCode::BAD_REQUEST, (*msg).to_string()),
-            SvcError::UpstreamError(code) => {
-                let status = StatusCode::from_u16(*code).unwrap_or(StatusCode::BAD_GATEWAY);
-                let message = match code {
-                    404 => "Source image not found".to_string(),
-                    403 => "Source image forbidden".to_string(),
-                    413 => "Source image too large".to_string(),
-                    _ => format!("Upstream server returned status {}", code),
-                };
-                (status, message)
-            }
+            // Upstream status codes are deliberately collapsed. Passing them
+            // through made this service a scanning oracle for any host an
+            // attacker could name via `xs=`, and let a third-party upstream pick
+            // the status code a CDN in front of us caches.
+            SvcError::UpstreamError(code) => match code {
+                403 | 404 | 410 => (StatusCode::NOT_FOUND, "Source not found".to_string()),
+                413 => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Source too large".to_string(),
+                ),
+                _ => (
+                    StatusCode::BAD_GATEWAY,
+                    "Failed to fetch source".to_string(),
+                ),
+            },
             SvcError::Fetch(_) => (
                 StatusCode::BAD_GATEWAY,
                 "Failed to fetch source image".to_string(),
@@ -54,7 +63,16 @@ impl SvcError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".to_string(),
             ),
-            SvcError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+            // The detail is logged in `into_response`, never returned: it can
+            // carry a decoder panic payload with library and path internals.
+            SvcError::InternalError(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            ),
+            SvcError::Overloaded => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Overloaded, retry shortly".to_string(),
+            ),
             SvcError::Rendered(status, message) => (*status, message.clone()),
         }
     }
@@ -62,6 +80,18 @@ impl SvcError {
 
 impl IntoResponse for SvcError {
     fn into_response(self) -> Response {
-        self.render().into_response()
+        if let SvcError::InternalError(detail) = &self {
+            tracing::error!(detail = %detail, "request failed internally");
+        }
+
+        let (status, body) = self.render();
+        let mut response = (status, body).into_response();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        response
     }
 }

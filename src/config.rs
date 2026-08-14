@@ -29,6 +29,29 @@ pub struct AppCfg {
     pub request_timeout: Duration,
     /// Wall-clock budget for one FFmpeg invocation.
     pub ffmpeg_timeout: Duration,
+    /// Ceiling on the total bytes both cache directories may occupy. The TTL
+    /// alone cannot bound the cache: an attacker requesting distinct URLs fills
+    /// the disk long before the oldest entry expires.
+    pub max_cache_bytes: u64,
+    /// Total remote bytes the local media proxy may relay while producing one
+    /// thumbnail. This bounds work without imposing a full-video-size cap, so
+    /// seekable multi-gigabyte sources remain usable.
+    pub max_video_probe_bytes: u64,
+    /// Total Blossom candidates tried for one blob, across request hints,
+    /// author servers, fallbacks and NIP-94 discovery. Bounds the fan-out a
+    /// single request can aim at third-party hosts.
+    pub max_blob_candidates: usize,
+    /// How many `xs=` request hints are honoured before the rest are dropped.
+    pub max_server_hints: usize,
+    /// Requests allowed to queue for a CPU permit before the node sheds load.
+    /// Each waiter pins the already-downloaded original in memory, so an
+    /// unbounded queue is an unbounded heap.
+    pub cpu_queue_depth: usize,
+    /// Separate listener for `/metrics`. `None` keeps it off the public router
+    /// entirely; operators opt in with a management-network address.
+    pub metrics_bind_addr: Option<String>,
+    /// Simultaneous FFmpeg processes allowed for video thumbnail extraction.
+    pub max_ffmpeg_concurrent: usize,
 }
 
 /// Read a `usize`/`u32`/`u64` style setting, falling back on absent or
@@ -91,6 +114,13 @@ impl AppCfg {
             max_inflight_requests: env_parsed("MAX_INFLIGHT_REQUESTS", 256usize).max(1),
             request_timeout: env_secs("REQUEST_TIMEOUT_SECS", 30),
             ffmpeg_timeout: env_secs("FFMPEG_TIMEOUT_SECS", 20),
+            max_cache_bytes: env_parsed("MAX_CACHE_BYTES", 8 * 1024 * 1024 * 1024),
+            max_video_probe_bytes: env_parsed("MAX_VIDEO_PROBE_BYTES", 64 * 1024 * 1024),
+            max_blob_candidates: env_parsed("MAX_BLOB_CANDIDATES", 8usize).max(1),
+            max_server_hints: env_parsed("MAX_SERVER_HINTS", 4usize),
+            cpu_queue_depth: env_parsed("MAX_CPU_QUEUE", 64usize).max(1),
+            metrics_bind_addr: std::env::var("METRICS_BIND_ADDR").ok(),
+            max_ffmpeg_concurrent: env_parsed("MAX_FFMPEG_CONCURRENT", 8usize).max(1),
         }
     }
 
@@ -164,6 +194,13 @@ mod tests {
         "MAX_INFLIGHT_REQUESTS",
         "REQUEST_TIMEOUT_SECS",
         "FFMPEG_TIMEOUT_SECS",
+        "MAX_CACHE_BYTES",
+        "MAX_VIDEO_PROBE_BYTES",
+        "MAX_BLOB_CANDIDATES",
+        "MAX_SERVER_HINTS",
+        "MAX_CPU_QUEUE",
+        "METRICS_BIND_ADDR",
+        "MAX_FFMPEG_CONCURRENT",
     ];
 
     fn clear_managed_vars() {
@@ -217,6 +254,13 @@ mod tests {
         assert_eq!(cfg.max_inflight_requests, 256);
         assert_eq!(cfg.request_timeout, Duration::from_secs(30));
         assert_eq!(cfg.ffmpeg_timeout, Duration::from_secs(20));
+        assert_eq!(cfg.max_cache_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.max_video_probe_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.max_blob_candidates, 8);
+        assert_eq!(cfg.max_server_hints, 4);
+        assert_eq!(cfg.cpu_queue_depth, 64);
+        assert_eq!(cfg.metrics_bind_addr, None);
+        assert_eq!(cfg.max_ffmpeg_concurrent, 8);
     }
 
     #[test]
@@ -247,6 +291,12 @@ mod tests {
                 ("MAX_INFLIGHT_REQUESTS", "42"),
                 ("REQUEST_TIMEOUT_SECS", "17"),
                 ("FFMPEG_TIMEOUT_SECS", "9"),
+                ("MAX_CACHE_BYTES", "4096"),
+                ("MAX_VIDEO_PROBE_BYTES", "8192"),
+                ("MAX_BLOB_CANDIDATES", "3"),
+                ("MAX_SERVER_HINTS", "1"),
+                ("MAX_CPU_QUEUE", "5"),
+                ("METRICS_BIND_ADDR", "127.0.0.1:9100"),
             ],
             AppCfg::from_env,
         );
@@ -266,6 +316,12 @@ mod tests {
         assert_eq!(cfg.max_inflight_requests, 42);
         assert_eq!(cfg.request_timeout, Duration::from_secs(17));
         assert_eq!(cfg.ffmpeg_timeout, Duration::from_secs(9));
+        assert_eq!(cfg.max_cache_bytes, 4096);
+        assert_eq!(cfg.max_video_probe_bytes, 8192);
+        assert_eq!(cfg.max_blob_candidates, 3);
+        assert_eq!(cfg.max_server_hints, 1);
+        assert_eq!(cfg.cpu_queue_depth, 5);
+        assert_eq!(cfg.metrics_bind_addr, Some("127.0.0.1:9100".to_string()));
     }
 
     #[test]

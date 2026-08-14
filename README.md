@@ -146,7 +146,7 @@ curl "http://127.0.0.1:8080/insecure/f:webp/rs:fill:200:200/plain/https%3A%2F%2F
 curl "http://127.0.0.1:8080/insecure/f:jpeg/rs:fit:800:600/plain/https%3A%2F%2Fexample.com%2Fvideo.mp4" -o thumb_large.jpg
 ```
 
-**Supported video formats:** `.mp4`, `.mov`, `.avi`, `.webm`, `.mkv`, `.flv`, `.wmv`, `.m4v`, `.mpg`, `.mpeg`, `.3gp`, `.ogv`, `.m3u8`
+**Supported video formats:** `.mp4`, `.mov`, `.avi`, `.webm`, `.mkv`, `.flv`, `.wmv`, `.m4v`, `.mpg`, `.mpeg`, `.3gp`, `.ogv`
 
 ### URL Structure
 
@@ -170,10 +170,11 @@ Works for **both images and videos**! Videos are automatically detected by file 
     - `auto` - Automatically choose fill or fit based on orientation
 
 **Video Handling:**
-- Detected by file extension (`.mp4`, `.mov`, `.webm`, etc.)
-- Thumbnail extracted at 0.5 seconds using FFmpeg
-- Thumbnail cached in `cache/original/` (subsequent requests reuse it)
-- Then processed like a regular image (resize, encode, cache in `cache/processed/`)
+- Detected by direct-container extension; HLS/DASH playlists are intentionally unsupported
+- FFmpeg extracts one frame at 0.5 seconds through a loopback-only, range-aware media gateway
+- The gateway preserves range seeking for large videos while enforcing source URL policy, timeout, and transfer budget
+- Video thumbnails are not disk-cached under a Blossom hash unless the complete source can be hash-verified
+- The thumbnail is processed like a regular image (resize and encode)
 
 ## Configuration
 
@@ -188,8 +189,14 @@ Configure via environment variables:
 | `BLOSSOM_NEGATIVE_CACHE_NOT_FOUND_TTL_SECS` | `900` (15m) | Cache 404/410 Blossom candidates; `0` disables this class |
 | `BLOSSOM_NEGATIVE_CACHE_PERMANENT_TTL_SECS` | `3600` (1h) | Cache 3xx and non-transient 4xx Blossom candidates; `0` disables this class |
 | `BLOSSOM_NEGATIVE_CACHE_TRANSIENT_TTL_SECS` | `60` | Cache timeouts, transport failures, 429, and 5xx Blossom candidates; `0` disables this class |
-| `MAX_IMAGE_BYTES` | `16777216` (16 MiB) | Max image size |
-| `MAX_FFMPEG_CONCURRENT` | `8` | Max concurrent FFmpeg processes (requests wait if limit reached) |
+| `MAX_IMAGE_BYTES` | `16777216` (16 MiB) | Max compressed image or generated thumbnail size |
+| `MAX_VIDEO_PROBE_BYTES` | `67108864` (64 MiB) | Total remote bytes the local media gateway may relay for one thumbnail; not a full-video size cap |
+| `MAX_FFMPEG_CONCURRENT` | `8` | Max concurrent FFmpeg processes; excess requests are shed with `503 Retry-After` |
+| `MAX_CPU_QUEUE` | `64` | Additional image decode/resize/encode jobs admitted to wait for CPU |
+| `MAX_CACHE_BYTES` | `8589934592` (8 GiB) | Disk budget shared by original and processed caches |
+| `MAX_BLOB_CANDIDATES` | `8` | Maximum Blossom source candidates tried per request |
+| `MAX_SERVER_HINTS` | `4` | Maximum `xs=` hints honoured per request |
+| `METRICS_BIND_ADDR` | unset | Optional separate bind address for the operator-only `/metrics` listener |
 | `RUST_LOG` | `info` | Log level |
 
 Blossom candidate failures are retained only in memory, per candidate URL, up to 10,000 entries.
@@ -203,20 +210,16 @@ BIND_ADDR=0.0.0.0:3000 CACHE_TTL_SECS=3600 MAX_FFMPEG_CONCURRENT=20 cargo run --
 
 ### FFmpeg Concurrency Control
 
-The service uses a **Semaphore pattern** to limit concurrent FFmpeg processes:
-
-- **Default limit**: 8 concurrent FFmpeg processes
-- **When limit reached**: Additional video requests wait in queue (non-blocking async)
-- **Automatic**: Permits are automatically released when processing completes
-- **Prevents**: Resource exhaustion (CPU/memory) under heavy video load
-- **Image requests**: Not affected by FFmpeg limit (only video thumbnail extraction)
+The service uses a semaphore to cap concurrent FFmpeg processes. Excess
+requests are rejected with `503 Retry-After` rather than accumulating an
+unbounded queue. Each process also has wall-clock, address-space, CPU-time,
+file-size, stderr, and generated-thumbnail limits.
 
 **Example scenario:**
 - 15 video requests arrive simultaneously
-- First 8 start FFmpeg immediately
-- Remaining 7 wait in queue
-- As FFmpeg processes complete, waiting requests proceed
-- Total server capacity: Limited only by system resources + configured limits
+- First 8 acquire FFmpeg permits
+- Excess work is rejected promptly with `503 Retry-After`
+- The client retries rather than forcing the service to retain unbounded work
 
 ## Resize Modes Explained
 
@@ -249,29 +252,27 @@ The service uses a **dual-cache architecture** for optimal performance:
 
 ```
 cache/
-├── original/   # Downloaded source images (raw)
-└── processed/  # Transformed images (by request URL)
+├── original/   # Validated image sources
+└── processed/  # Canonically keyed derivatives
 ```
 
 ### Original Cache
-- **Purpose**: Prevents redundant downloads/processing of source media
-- **Key**: SHA-256 hash of source URL
-- **Content**: 
-  - For images: Downloaded original image
-  - For videos: Extracted thumbnail (WebP, max 720p)
-- **Benefit**: Multiple transformations of the same source only process once
+- **Purpose**: Prevents redundant downloads and processing of validated images
+- **Key**: SHA-256 hash of the source URL or canonical Blossom blob name
+- **Content**: Downloaded original image after successful decode/transform
+- **Video exception**: Range-probed video thumbnails are not stored here because the full video hash is not available without a full download
 
 ### Processed Cache
-- **Purpose**: Serves previously transformed images instantly
-- **Key**: SHA-256 hash of the full request path (includes all directives)
-- **Format**: Includes file extension based on output format
-- **Benefit**: Same URL with same parameters = instant response
+- **Purpose**: Serves previously transformed, validated images instantly
+- **Key**: SHA-256 of canonical parsed directives, source identity, output format, quality, and resize mode
+- **Sharding**: Two digest-prefix directory levels prevent oversized cache directories
+- **Benefit**: Equivalent URLs with ignored or normalized directives share one entry
 
 ### General Cache Properties
-- **Atomic writes**: Uses temp files + rename for safety
-- **TTL cleanup**: Runs every 60 seconds, removes files older than `CACHE_TTL_SECS` from both caches
-- **Cache headers**: `Cache-Control: public, max-age=31536000, immutable` (1 year, indefinite browser caching)
-- **Hit/Miss indicator**: `X-Cache: hit` or `X-Cache: miss`
+- **Atomic writes**: Create-new temporary files, `fsync`, then rename; zero-byte entries are misses
+- **Cleanup**: Runs every 60 seconds, applies `CACHE_TTL_SECS`, and evicts oldest entries above `MAX_CACHE_BYTES`
+- **Cache headers**: Hash-verified image derivatives are immutable; `/insecure` and range-probed video responses are short-lived
+- **Hit/Miss indicator**: `X-Cache: hit`, `miss`, or `coalesced`
 
 ## Dependencies
 
@@ -285,21 +286,14 @@ cache/
 
 ## Build Notes
 
-- **AVIF Support**: Requires `meson` and `ninja` to build the dav1d decoder
-  - First build takes ~1-2 minutes as it compiles dav1d from source
-  - Subsequent builds are fast (incremental compilation)
-  - The `.cargo/config.toml` file sets `SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always` to build dav1d automatically
+- **AVIF output** is encoded by `ravif`.
+- **AVIF input** is intentionally unsupported: only PNG, JPEG, and WebP are accepted source formats.
 
-- **Video Support**: Requires system `ffmpeg` binary
-  - Videos are automatically detected by file extension
-  - FFmpeg is called as an external process via `std::process::Command`
-  - No Rust FFmpeg bindings required (avoids complex build dependencies)
-  - Make sure `ffmpeg` is in your PATH
-  - Thumbnail extraction: seeks to 0.5s, max 720p height, WebP output with quality 80
-  - **Concurrency Control**: Semaphore limits simultaneous FFmpeg processes (default: 10)
-    - When limit is reached, additional requests wait in queue (non-blocking)
-    - Prevents resource exhaustion under high video load
-    - Configure via `MAX_FFMPEG_CONCURRENT` environment variable
+- **Video Support**: Requires a system `ffmpeg` binary in `PATH`.
+  - FFmpeg is called as an external process through a loopback-only media gateway.
+  - The gateway relays bounded HTTP range requests; no Rust FFmpeg bindings are required.
+  - Thumbnail extraction seeks to 0.5s, emits one WebP frame, and caps output to 1280×720.
+  - Configure concurrent processes with `MAX_FFMPEG_CONCURRENT` and gateway transfer work with `MAX_VIDEO_PROBE_BYTES`.
 
 ## Roadmap
 

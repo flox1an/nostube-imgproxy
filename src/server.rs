@@ -1,8 +1,10 @@
 use axum::{
     body::Body,
-    extract::{Path as AxPath, State},
+    error_handling::HandleErrorLayer,
+    extract::{MatchedPath, Path as AxPath, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::Response,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -10,8 +12,11 @@ use axum_extra::extract::Query;
 use bytes::Bytes;
 use serde::Deserialize;
 use std::{path::Path, sync::Arc, time::Instant};
-use tower::limit::GlobalConcurrencyLimitLayer;
+use tower::{
+    limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer, BoxError, ServiceBuilder,
+};
 use tower_http::{
+    catch_panic::CatchPanicLayer,
     cors::{Any, CorsLayer},
     timeout::TimeoutLayer,
     trace::TraceLayer,
@@ -20,8 +25,8 @@ use tower_http::{
 use crate::{
     blossom::{combine_server_lists, fetch_blob, parse_blossom_filename, BlossomState},
     cache::{
-        cache_path_for, fresh_response_headers, original_cache_path_for, try_read_original_cache,
-        try_serve_cache, write_cache_atomic,
+        cache_path_for, derivative_cache_key, fresh_response_headers, original_cache_path_for,
+        try_read_original_cache, try_serve_cache, write_cache_atomic, ClientCachePolicy,
     },
     config::AppState,
     cpu::CpuPool,
@@ -31,7 +36,9 @@ use crate::{
     network_policy::validate_untrusted_url,
     singleflight::SingleFlight,
     thumbnail::{extract_video_thumbnail, is_video_url, ThumbnailState},
-    transform::{parse_rest, process_image, Directives, OutFmt, Resize, ResizeMode},
+    transform::{
+        parse_resize_directive, parse_rest, process_image, Directives, OutFmt, Resize, ResizeMode,
+    },
 };
 
 /// Combined state for image and video processing
@@ -48,13 +55,14 @@ pub struct CombinedState {
 
 impl CombinedState {
     pub fn new(app: AppState, thumbnail: Arc<ThumbnailState>, blossom: Arc<BlossomState>) -> Self {
-        let cpu = CpuPool::new(app.cfg.cpu_concurrency);
+        let cpu = CpuPool::new(app.cfg.cpu_concurrency, app.cfg.cpu_queue_depth);
+        let max_inflight = app.cfg.max_inflight_requests;
         Self {
             app,
             thumbnail,
             blossom,
             cpu,
-            inflight: Arc::new(SingleFlight::new()),
+            inflight: Arc::new(SingleFlight::new(max_inflight)),
         }
     }
 }
@@ -69,27 +77,39 @@ pub fn create_router(
     let max_inflight = state.cfg.max_inflight_requests;
     let combined = CombinedState::new(state, thumbnail_state, blossom_state);
 
-    // CORS layer - allow all origins
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    Router::new()
+    // CORS is needed by browser image consumers, not by health checks or the
+    // operator-only metrics listener. Keep it confined to public media routes.
+    let images = Router::new()
         .route("/insecure/{*rest}", get(handle_insecure))
         .route("/thumb/{filename}", get(handle_thumb))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        );
+
+    Router::new()
+        .merge(images)
         .route("/health", get(health_check))
-        .route("/metrics", get(handle_metrics))
         .with_state(combined)
-        .layer(cors)
-        // Every request gets a hard wall-clock bound, and the node refuses to
-        // hold more than `max_inflight` of them at once: both are what keep a
-        // traffic spike from turning into unbounded memory growth.
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            request_timeout,
-        ))
-        .layer(GlobalConcurrencyLimitLayer::new(max_inflight))
+        // Outer → inner: Trace, metrics, panic-to-500, timeout, load-shed,
+        // global concurrency, handlers. Timeout includes permit waiting; shed
+        // fails immediately instead of retaining an unbounded waiter queue.
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(|_: BoxError| async {
+                    SvcError::Overloaded.into_response()
+                }))
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    request_timeout,
+                ))
+                .layer(LoadShedLayer::new())
+                .layer(GlobalConcurrencyLimitLayer::new(max_inflight)),
+        )
+        .layer(CatchPanicLayer::new())
+        .layer(middleware::from_fn(record_response_metrics))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -143,6 +163,28 @@ async fn handle_metrics() -> Result<Response, SvcError> {
     Ok(resp)
 }
 
+/// Operator-only metrics router. It is deliberately not merged into the
+/// public image router; `main` binds it only when `METRICS_BIND_ADDR` is set.
+pub fn create_metrics_router() -> Router {
+    Router::new().route("/metrics", get(handle_metrics))
+}
+
+/// Record the response that actually leaves the service. `MatchedPath` keeps
+/// labels bounded even when attackers send arbitrary paths or query strings.
+async fn record_response_metrics(request: Request, next: Next) -> Response {
+    let started = Instant::now();
+    let endpoint = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("<unmatched>", MatchedPath::as_str)
+        .to_owned();
+    let method = request.method().as_str().to_owned();
+    let response = next.run(request).await;
+    metrics::observe_http_duration(&endpoint, &method, started.elapsed().as_secs_f64());
+    metrics::record_http_request(&endpoint, &method, response.status().as_u16());
+    response
+}
+
 /// Where the *original* bytes for a derivative come from.
 ///
 /// Owned rather than borrowed so the whole production job can be handed to
@@ -167,23 +209,26 @@ impl Source {
             Source::Direct { is_video, .. } | Source::Blossom { is_video, .. } => *is_video,
         }
     }
+
+    /// Range-probed video sources cannot be proven to match their advertised
+    /// SHA-256 without a full download. Never let their thumbnails enter a
+    /// hash-keyed disk cache or receive a reusable entity validator.
+    fn cacheable(&self) -> bool {
+        !self.is_video()
+    }
 }
 
-/// Serve a cached derivative if one exists, recording the hit.
+/// Serve a cached derivative if one exists, recording the cache hit.
 async fn serve_cached(
-    endpoint: &'static str,
     cache_path: &Path,
     mime: &str,
     request_headers: &HeaderMap,
-    start_time: Instant,
+    policy: ClientCachePolicy,
 ) -> Result<Option<Response>, SvcError> {
-    let Some(resp) = try_serve_cache(cache_path, mime, request_headers).await? else {
+    let Some(resp) = try_serve_cache(cache_path, mime, request_headers, policy).await? else {
         return Ok(None);
     };
     metrics::record_cache_hit("processed");
-    let status = resp.status().as_u16();
-    metrics::observe_http_duration(endpoint, "GET", start_time.elapsed().as_secs_f64());
-    metrics::record_http_request(endpoint, "GET", status);
     Ok(Some(resp))
 }
 
@@ -194,11 +239,13 @@ async fn load_original(
     original_cache_path: &Path,
     deadline: Instant,
 ) -> Result<Vec<u8>, SvcError> {
-    if let Some(cached) = try_read_original_cache(original_cache_path).await? {
-        metrics::record_cache_hit("original");
-        return Ok(cached);
+    if source.cacheable() {
+        if let Some(cached) = try_read_original_cache(original_cache_path).await? {
+            metrics::record_cache_hit("original");
+            return Ok(cached);
+        }
+        metrics::record_cache_miss("original");
     }
-    metrics::record_cache_miss("original");
 
     let cfg = &state.app.cfg;
     let bytes = match source {
@@ -213,17 +260,14 @@ async fn load_original(
                 &[],
                 &[],
                 None,
+                None,
+                cfg.max_blob_candidates,
+                cfg.max_video_probe_bytes,
+                cfg.max_image_bytes,
                 deadline,
                 cfg.ffmpeg_timeout,
             )
             .await?;
-            // FFmpeg output is ours, not an upstream body, so it is the one
-            // payload the streaming cap in `fetch` cannot bound.
-            if thumbnail.len() > cfg.max_image_bytes {
-                metrics::record_processing_error("thumbnail_too_large");
-                return Err(SvcError::BadRequest("thumbnail too large"));
-            }
-            metrics::record_bytes_downloaded("video", thumbnail.len());
             thumbnail
         }
         Source::Direct { url, .. } => {
@@ -252,15 +296,14 @@ async fn load_original(
                 servers,
                 discovered,
                 Some(state.blossom.candidate_failure_cache()),
+                Some(hash),
+                cfg.max_blob_candidates,
+                cfg.max_video_probe_bytes,
+                cfg.max_image_bytes,
                 deadline,
                 cfg.ffmpeg_timeout,
             )
             .await?;
-            if thumbnail.len() > cfg.max_image_bytes {
-                metrics::record_processing_error("thumbnail_too_large");
-                return Err(SvcError::BadRequest("thumbnail too large"));
-            }
-            metrics::record_bytes_downloaded("video", thumbnail.len());
             thumbnail
         }
         Source::Blossom {
@@ -279,6 +322,8 @@ async fn load_original(
                 ext.as_deref(),
                 deadline,
                 cfg.max_image_bytes,
+                cfg.max_blob_candidates,
+                cfg.fetch_timeout,
             )
             .await?;
             metrics::record_bytes_downloaded("blossom", bytes.len());
@@ -286,7 +331,6 @@ async fn load_original(
         }
     };
 
-    write_cache_atomic(original_cache_path, &bytes).await?;
     Ok(bytes)
 }
 
@@ -307,10 +351,16 @@ async fn produce_derivative(
     let limits = state.app.cfg.decode_limits();
     let out_fmt_str = dirs.out_fmt.label();
     // Decode/resize/encode is the only CPU-heavy step; it must never run on an
-    // async worker or a few concurrent encodes stall the whole reactor.
-    let encoded = state
+    // async worker or a few concurrent encodes stall the whole reactor. The
+    // closure moves `original` in and hands it back beside the encoded output
+    // so the original-cache write can wait for the decode to validate the
+    // bytes, without cloning a payload that can be tens of megabytes.
+    let (encoded, original) = state
         .cpu
-        .run(move || process_image(&original, &dirs, limits))
+        .run(move || {
+            let encoded = process_image(&original, &dirs, limits)?;
+            Ok::<_, SvcError>((encoded, original))
+        })
         .await??;
 
     if source.is_video() {
@@ -319,17 +369,29 @@ async fn produce_derivative(
         metrics::record_image_processed(out_fmt_str);
     }
 
-    write_cache_atomic(&cache_path, &encoded).await?;
+    if source.cacheable() {
+        // The original is persisted only after decode/resize/encode has proven
+        // it is an image. Range-probed videos deliberately skip this: their
+        // source hash cannot be verified without a full download.
+        write_cache_atomic(&cache_path, &encoded).await?;
+        write_cache_atomic(&original_cache_path, &original).await?;
+    }
     Ok(Bytes::from(encoded))
 }
 
 /// Build the response for a derivative that was produced rather than cached.
-fn fresh_response(encoded: Bytes, mime: &str, cache_path: &Path, coalesced: bool) -> Response {
+fn fresh_response(
+    encoded: Bytes,
+    mime: &str,
+    cache_path: &Path,
+    coalesced: bool,
+    policy: ClientCachePolicy,
+) -> Response {
     metrics::record_bytes_served(mime, encoded.len());
     let mut resp = Response::new(Body::from(encoded));
     *resp.status_mut() = StatusCode::OK;
     let cache_state = if coalesced { "coalesced" } else { "miss" };
-    fresh_response_headers(resp.headers_mut(), mime, cache_path, cache_state);
+    fresh_response_headers(resp.headers_mut(), mime, cache_path, cache_state, policy);
     resp
 }
 
@@ -346,30 +408,38 @@ async fn handle_insecure(
     AxPath(rest): AxPath<String>,
     request_headers: HeaderMap,
 ) -> Result<Response, SvcError> {
-    let start_time = Instant::now();
-
-    // full_url is the exact request path for cache keying
-    let full_request_url = format!("/insecure/{}", rest);
-
     // Parse and validate before any cache lookup. The request URL is untrusted
     // and must never become an FFmpeg or HTTP target on this server.
     let (dirs, src_url) = parse_rest(&rest)?;
+    dirs.resize.validate(state.app.cfg.max_image_dimension)?;
     validate_untrusted_url(&src_url)?;
 
-    let cache_path = cache_path_for(&state.app.cfg, &full_request_url, &dirs.out_fmt);
+    // Canonical key from the *parsed* directives, so requests that differ only
+    // in noise (`bogus:1/` vs `bogus:2/`, `f:JPG` vs `f:jpeg`) share one cache
+    // entry; the same string coalesces single-flight work.
+    let is_video = is_video_url(&src_url);
+    let cache_key = derivative_cache_key("insecure", &src_url, &dirs);
+    let cache_path = cache_path_for(&state.app.cfg, &cache_key, &dirs.out_fmt);
     let mime = dirs.out_fmt.mime_type();
 
-    if let Some(resp) =
-        serve_cached("/insecure", &cache_path, mime, &request_headers, start_time).await?
-    {
-        return Ok(resp);
+    if !is_video {
+        if let Some(resp) = serve_cached(
+            &cache_path,
+            mime,
+            &request_headers,
+            ClientCachePolicy::ShortLived,
+        )
+        .await?
+        {
+            return Ok(resp);
+        }
     }
     metrics::record_cache_miss("processed");
 
     let original_cache_path = original_cache_path_for(&state.app.cfg, &src_url);
     let deadline = Instant::now() + state.app.cfg.fetch_timeout;
     let source = Source::Direct {
-        is_video: is_video_url(&src_url),
+        is_video,
         url: src_url,
     };
 
@@ -379,7 +449,7 @@ async fn handle_insecure(
         let cache_path = cache_path.clone();
         let original_cache_path = original_cache_path.clone();
         inflight
-            .run(&full_request_url, move || {
+            .run(&cache_key, move || {
                 produce_derivative(
                     state,
                     source,
@@ -392,9 +462,16 @@ async fn handle_insecure(
             .await?
     };
 
-    let resp = fresh_response(outcome.bytes, mime, &cache_path, outcome.coalesced);
-    metrics::observe_http_duration("/insecure", "GET", start_time.elapsed().as_secs_f64());
-    metrics::record_http_request("/insecure", "GET", 200);
+    let mut resp = fresh_response(
+        outcome.bytes,
+        mime,
+        &cache_path,
+        outcome.coalesced,
+        ClientCachePolicy::ShortLived,
+    );
+    if is_video {
+        resp.headers_mut().remove(header::ETAG);
+    }
     Ok(resp)
 }
 
@@ -405,8 +482,6 @@ async fn handle_thumb(
     Query(params): Query<ThumbQuery>,
     request_headers: HeaderMap,
 ) -> Result<Response, SvcError> {
-    let start_time = Instant::now();
-
     // Accept both `<sha256>` and `<sha256>.<ext>` and canonicalize the hash
     // before using it as an upstream path or cache key.
     let (hash, ext) =
@@ -417,18 +492,28 @@ async fn handle_thumb(
         Some(ext) => format!("{hash}.{ext}"),
         None => hash.clone(),
     };
+    let is_video = ext
+        .as_deref()
+        .is_some_and(|extension| is_video_url(&format!("{hash}.{extension}")));
 
-    let dirs = parse_thumb_params(&params)?;
+    let dirs = parse_thumb_params(&params, state.app.cfg.max_image_dimension)?;
 
     // Build cache key from the canonical blob name and request parameters.
-    let cache_key = format!("/thumb/{}?{}", blob_name, build_query_string(&params));
+    let cache_key = derivative_cache_key("thumb", &blob_name, &dirs);
     let cache_path = cache_path_for(&state.app.cfg, &cache_key, &dirs.out_fmt);
     let mime = dirs.out_fmt.mime_type();
 
-    if let Some(resp) =
-        serve_cached("/thumb", &cache_path, mime, &request_headers, start_time).await?
-    {
-        return Ok(resp);
+    if !is_video {
+        if let Some(resp) = serve_cached(
+            &cache_path,
+            mime,
+            &request_headers,
+            ClientCachePolicy::Immutable,
+        )
+        .await?
+        {
+            return Ok(resp);
+        }
     }
     metrics::record_cache_miss("processed");
 
@@ -458,6 +543,7 @@ async fn handle_thumb(
         },
         author_servers.as_deref(),
         &state.app.cfg.blossom_fallback_servers,
+        state.app.cfg.max_server_hints,
     );
 
     let discovered = match state.blossom.discover_blob_urls(&hash).await {
@@ -480,9 +566,6 @@ async fn handle_thumb(
         blob_name
     );
 
-    let is_video = ext
-        .as_deref()
-        .is_some_and(|extension| is_video_url(&format!("{hash}.{extension}")));
     let original_cache_path = original_cache_path_for(&state.app.cfg, &blob_name);
     let source = Source::Blossom {
         hash,
@@ -511,14 +594,20 @@ async fn handle_thumb(
             .await?
     };
 
-    let resp = fresh_response(outcome.bytes, mime, &cache_path, outcome.coalesced);
-    metrics::observe_http_duration("/thumb", "GET", start_time.elapsed().as_secs_f64());
-    metrics::record_http_request("/thumb", "GET", 200);
+    let policy = if is_video {
+        ClientCachePolicy::ShortLived
+    } else {
+        ClientCachePolicy::Immutable
+    };
+    let mut resp = fresh_response(outcome.bytes, mime, &cache_path, outcome.coalesced, policy);
+    if is_video {
+        resp.headers_mut().remove(header::ETAG);
+    }
     Ok(resp)
 }
 
 /// Parse thumb query parameters into Directives
-fn parse_thumb_params(params: &ThumbQuery) -> Result<Directives, SvcError> {
+fn parse_thumb_params(params: &ThumbQuery, max_dimension: u32) -> Result<Directives, SvcError> {
     // Parse output format
     let out_fmt = if let Some(fmt) = &params.format {
         match fmt.to_ascii_lowercase().as_str() {
@@ -532,16 +621,16 @@ fn parse_thumb_params(params: &ThumbQuery) -> Result<Directives, SvcError> {
         OutFmt::Webp // Default to WebP for Blossom thumbs
     };
 
-    // Parse quality
+    // Parse quality. `ravif` asserts a floor of 1, so 0 is not a legal request.
     let quality = params.quality.unwrap_or(82);
-    if quality > 100 {
-        return Err(SvcError::BadRequest("quality must be 0-100"));
+    if !(1..=100).contains(&quality) {
+        return Err(SvcError::BadRequest("quality must be 1-100"));
     }
 
     // Parse resize directive.
     // Priority: explicit `rs` param > `width`/`height` > default 480×480 fit.
     let resize = if let Some(rs) = &params.resize {
-        parse_resize_from_query(rs)?
+        parse_resize_directive(rs)?
     } else {
         let w = params.width.unwrap_or(480);
         let h = params.height.unwrap_or(480);
@@ -552,64 +641,18 @@ fn parse_thumb_params(params: &ThumbQuery) -> Result<Directives, SvcError> {
         }
     };
 
+    // A zero-by-zero box means "keep the source size", which turns an arbitrary
+    // upstream image into an unbounded output. Require an explicit dimension.
+    if resize.w == 0 && resize.h == 0 {
+        return Err(SvcError::BadRequest("at least one dimension required"));
+    }
+    resize.validate(max_dimension)?;
+
     Ok(Directives {
         out_fmt,
         quality,
         resize,
     })
-}
-
-/// Parse resize directive from query param (e.g., "fit:480:480")
-fn parse_resize_from_query(rs: &str) -> Result<Resize, SvcError> {
-    let parts: Vec<&str> = rs.split(':').collect();
-    if parts.len() != 3 {
-        return Err(SvcError::BadRequest(
-            "invalid resize format, expected mode:width:height",
-        ));
-    }
-
-    let mode = match parts[0].to_ascii_lowercase().as_str() {
-        "fit" => ResizeMode::Fit,
-        "fill" => ResizeMode::Fill,
-        "fill-down" => ResizeMode::FillDown,
-        "force" => ResizeMode::Force,
-        "auto" => ResizeMode::Auto,
-        _ => return Err(SvcError::BadRequest("unsupported resize mode")),
-    };
-
-    let w = parts[1].parse().unwrap_or(0);
-    let h = parts[2].parse().unwrap_or(0);
-
-    Ok(Resize { mode, w, h })
-}
-
-/// Build query string for cache key
-fn build_query_string(params: &ThumbQuery) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(f) = &params.format {
-        parts.push(format!("f={}", f));
-    }
-    if let Some(rs) = &params.resize {
-        parts.push(format!("rs={}", rs));
-    }
-    if let Some(q) = params.quality {
-        parts.push(format!("q={}", q));
-    }
-    for xs in &params.server_hints {
-        parts.push(format!("xs={}", xs));
-    }
-    if let Some(as_) = &params.author_pubkey {
-        parts.push(format!("as={}", as_));
-    }
-    if let Some(w) = params.width {
-        parts.push(format!("width={}", w));
-    }
-    if let Some(h) = params.height {
-        parts.push(format!("height={}", h));
-    }
-
-    parts.join("&")
 }
 
 /// Fetch a non-Blossom source URL, bounded by `max_image_bytes`.
@@ -632,4 +675,24 @@ async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError
         bytes.len()
     );
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_probed_video_source_is_never_cacheable() {
+        let video = Source::Direct {
+            url: "https://cdn.example/video.mp4".into(),
+            is_video: true,
+        };
+        let image = Source::Direct {
+            url: "https://cdn.example/image.png".into(),
+            is_video: false,
+        };
+
+        assert!(!video.cacheable());
+        assert!(image.cacheable());
+    }
 }

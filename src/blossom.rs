@@ -1,11 +1,26 @@
 use crate::network_policy::is_allowed_untrusted_server;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
+
+/// NIP-01 replaceable event kind carrying a BUD-03 Blossom server list.
+const KIND_SERVER_LIST: u16 = 10063;
+/// NIP-94 file-metadata event kind carrying `x` (blob hash) and `url` tags.
+const KIND_FILE_METADATA: u16 = 1063;
+/// How many of the seed relays a single lookup actually queries (see
+/// `fetch_events` for the rationale behind the subset).
+const SEED_RELAY_SUBSET: usize = 3;
+/// Events timestamped more than this far into the future are rejected; clock
+/// skew between author and proxy is a few seconds, five minutes is generous.
+const FUTURE_EVENT_SKEW_SECS: u64 = 5 * 60;
+/// Maximum length of attacker-controlled values before they reach a log line.
+const MAX_LOG_VALUE_CHARS: usize = 128;
 
 /// Seed relays for fetching user server lists (kind 10063)
 const SEED_RELAYS: &[&str] = &[
@@ -84,9 +99,13 @@ struct CandidateFailureCacheEntry {
 }
 
 /// Bounded, in-memory negative cache for immutable blob candidate URLs.
+///
+/// Keys combine the expected blob hash and the candidate URL: a hash-specific
+/// mismatch (502) must not poison the URL for other hashes, and the video path
+/// shares this cache with the image path.
 #[derive(Clone)]
 pub struct CandidateFailureCache {
-    entries: Arc<RwLock<HashMap<String, CandidateFailureCacheEntry>>>,
+    entries: Arc<RwLock<HashMap<(String, String), CandidateFailureCacheEntry>>>,
     not_found_ttl: Duration,
     permanent_ttl: Duration,
     transient_ttl: Duration,
@@ -114,16 +133,27 @@ impl CandidateFailureCache {
         }
     }
 
-    /// Return an unexpired cached class, removing expired entries opportunistically.
-    pub async fn lookup(&self, url: &str) -> Option<CandidateFailureClass> {
+    /// Return an unexpired cached class for a (hash, URL) pair.
+    ///
+    /// The read path only takes a shared lock and checks expiry for the one
+    /// requested entry; the full expiry sweep is confined to the write path so
+    /// a cache hit never pays for sweeping up to the whole map.
+    pub async fn lookup(&self, hash: &str, url: &str) -> Option<CandidateFailureClass> {
         let now = Instant::now();
-        let mut entries = self.entries.write().await;
-        entries.retain(|_, entry| entry.expires_at > now);
-        entries.get(url).map(|entry| entry.class)
+        let key = (hash.to_ascii_lowercase(), url.to_string());
+        let entries = self.entries.read().await;
+        entries
+            .get(&key)
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| entry.class)
     }
 
     /// Remember a candidate failure unless its class is explicitly disabled with TTL zero.
-    pub async fn remember(&self, url: &str, class: CandidateFailureClass) {
+    ///
+    /// The key combines the expected blob hash and the candidate URL, so a
+    /// hash-specific mismatch cannot lock a legitimate URL out for its real
+    /// hash (the image and video paths share this cache).
+    pub async fn remember(&self, hash: &str, url: &str, class: CandidateFailureClass) {
         let ttl = self.ttl_for(class);
         if ttl.is_zero() {
             return;
@@ -133,23 +163,23 @@ impl CandidateFailureCache {
         let Some(expires_at) = now.checked_add(ttl) else {
             return;
         };
+        let key = (hash.to_ascii_lowercase(), url.to_string());
         let mut entries = self.entries.write().await;
+        // Opportunistic sweep: expired entries are freed when we are already
+        // holding the write lock, never on the hot read path.
         entries.retain(|_, entry| entry.expires_at > now);
 
-        if !entries.contains_key(url) && entries.len() >= MAX_CANDIDATE_FAILURE_CACHE_ENTRIES {
-            if let Some(oldest_url) = entries
+        if !entries.contains_key(&key) && entries.len() >= MAX_CANDIDATE_FAILURE_CACHE_ENTRIES {
+            if let Some(oldest_key) = entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(url, _)| url.clone())
+                .map(|(key, _)| key.clone())
             {
-                entries.remove(&oldest_url);
+                entries.remove(&oldest_key);
             }
         }
 
-        entries.insert(
-            url.to_string(),
-            CandidateFailureCacheEntry { class, expires_at },
-        );
+        entries.insert(key, CandidateFailureCacheEntry { class, expires_at });
     }
 }
 
@@ -167,10 +197,17 @@ enum AuthorServerLookup {
     Failed,
 }
 
+/// Cached outcome of a NIP-94 location lookup by blob hash.
+#[derive(Clone, Debug)]
+enum BlobLocationLookup {
+    Urls(Vec<String>),
+    Failed,
+}
+
 /// Cache entry for NIP-94 locations discovered by blob hash.
 #[derive(Clone, Debug)]
 struct BlobLocationCacheEntry {
-    urls: Vec<String>,
+    result: BlobLocationLookup,
     cached_at: Instant,
 }
 /// State for Blossom server resolution with caching.
@@ -203,7 +240,17 @@ impl BlossomState {
         candidate_failure_cache: CandidateFailureCache,
     ) -> Self {
         // Initialize Nostr client with seed relays.
-        let client = Client::default();
+        //
+        // `Client::default()` leaves `verify_subscriptions = false` (nostr-sdk
+        // default), meaning relays may deliver arbitrary *signed* events that
+        // do not match our subscription filter. Verification against the
+        // requested filter — plus banning relays that violate it — turns a
+        // hostile seed relay from an attacker-controlled event source into a
+        // relay that is simply excluded from future lookups.
+        let client = Client::builder()
+            .verify_subscriptions(true)
+            .ban_relay_on_mismatch(true)
+            .build();
 
         for relay in SEED_RELAYS {
             if let Err(e) = client.add_relay(*relay).await {
@@ -234,16 +281,33 @@ impl BlossomState {
         &self.candidate_failure_cache
     }
 
-    async fn fetch_events(&self, filter: Filter) -> Result<BTreeSet<Event>, String> {
+    async fn fetch_events(
+        &self,
+        filter: Filter,
+        query_key: &str,
+    ) -> Result<BTreeSet<Event>, String> {
         // The fetch builder bounds the relay request by `discovery_timeout`.
         // The outer timeout remains a backstop for the SDK hanging, so it must
         // be strictly longer — arming both at the same instant makes them race
         // and discards results that the inner call was about to return.
         let backstop = self.discovery_timeout + Duration::from_secs(2);
 
-        let targets = SEED_RELAYS
-            .iter()
-            .map(|relay| (*relay, vec![filter.clone()]))
+        // Query only a small deterministic subset of the seed relays instead of
+        // all ten. `as=` and blob discovery together trigger two lookups per
+        // HTTP request; fanning both out to every seed would open twenty relay
+        // connections per request — cheap for an attacker to amplify. A
+        // per-key rotation keeps the subset stable for repeated lookups of the
+        // same key (cache-friendly) while spreading load across all seeds, and
+        // the seed list is short enough that a ban still leaves plenty of
+        // redundancy.
+        let mut hasher = DefaultHasher::new();
+        query_key.hash(&mut hasher);
+        let start = (hasher.finish() as usize) % SEED_RELAYS.len();
+        let targets = (0..SEED_RELAY_SUBSET)
+            .map(|offset| {
+                let relay = SEED_RELAYS[(start + offset) % SEED_RELAYS.len()];
+                (relay, vec![filter.clone()])
+            })
             .collect::<Vec<_>>();
 
         tokio::time::timeout(
@@ -264,13 +328,17 @@ impl BlossomState {
         let events = self
             .fetch_events(
                 Filter::new()
-                    .kind(Kind::from(10063))
+                    .kind(Kind::from(KIND_SERVER_LIST))
                     .author(*pubkey)
                     .limit(10),
+                &pubkey.to_hex(),
             )
             .await?;
 
-        let servers = match best_event(events.iter()) {
+        // Defensive post-filter: a hostile seed relay can deliver signed events
+        // outside the requested filter, so only events that are genuinely the
+        // author's kind-10063 list may influence the server list.
+        let servers = match best_event(authoritative_server_list_events(events.iter(), pubkey)) {
             Some(event) => servers_from_event(event),
             None => {
                 debug!("No server list events found for pubkey {}", pubkey);
@@ -278,12 +346,9 @@ impl BlossomState {
             }
         };
 
-        info!(
-            "Found {} servers for pubkey {}: {:?}",
-            servers.len(),
-            pubkey,
-            servers
-        );
+        // Count only; the servers themselves are attacker-influenced and the
+        // author can publish arbitrarily many of them.
+        debug!("Found {} servers for pubkey {}", servers.len(), pubkey);
         Ok(servers)
     }
 
@@ -340,29 +405,57 @@ impl BlossomState {
         {
             let cache = self.blob_location_cache.read().await;
             if let Some(entry) = cache.get(&normalized_hash) {
-                if entry.cached_at.elapsed() < self.discovery_cache_ttl {
-                    return Ok(entry.urls.clone());
+                let ttl = match &entry.result {
+                    BlobLocationLookup::Urls(_) => self.discovery_cache_ttl,
+                    BlobLocationLookup::Failed => self.failure_cache_ttl,
+                };
+                if entry.cached_at.elapsed() < ttl {
+                    return match &entry.result {
+                        BlobLocationLookup::Urls(urls) => Ok(urls.clone()),
+                        BlobLocationLookup::Failed => {
+                            Err("cached blob discovery failure".to_string())
+                        }
+                    };
                 }
             }
         }
 
         let x_tag = SingleLetterTag::from_char('x')
             .expect("lowercase x is a valid Nostr single-letter tag");
-        let events = self
+        let events = match self
             .fetch_events(
                 Filter::new()
-                    .kind(Kind::from(1063))
+                    .kind(Kind::from(KIND_FILE_METADATA))
                     .custom_tag(x_tag, normalized_hash.clone())
                     .limit(20),
+                &normalized_hash,
             )
-            .await?;
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                // Negative-cache the failure (mirroring `get_author_servers`)
+                // so a dead relay fan-out is not repeated on every request.
+                warn!("Blob discovery failed for {}: {}", normalized_hash, error);
+                self.blob_location_cache.write().await.insert(
+                    normalized_hash,
+                    BlobLocationCacheEntry {
+                        result: BlobLocationLookup::Failed,
+                        cached_at: Instant::now(),
+                    },
+                );
+                return Err(error);
+            }
+        };
 
-        let urls = blob_urls_from_events(events.iter());
+        // Only events that actually attest to the requested hash may contribute
+        // URLs; relays can publish kind-1063 events for arbitrary hashes.
+        let urls = blob_urls_from_events(events.iter(), &normalized_hash);
 
         self.blob_location_cache.write().await.insert(
             normalized_hash,
             BlobLocationCacheEntry {
-                urls: urls.clone(),
+                result: BlobLocationLookup::Urls(urls.clone()),
                 cached_at: Instant::now(),
             },
         );
@@ -382,7 +475,11 @@ pub fn parse_pubkey(pubkey_str: &str) -> Result<PublicKey, String> {
     if let Ok(pubkey) = PublicKey::from_hex(pubkey_str) {
         return Ok(pubkey);
     }
-    Err(format!("Invalid pubkey format: {}", pubkey_str))
+    // `pubkey_str` is attacker-controlled (query parameter); never log it raw.
+    Err(format!(
+        "Invalid pubkey format: {}",
+        truncate_for_log(pubkey_str)
+    ))
 }
 
 /// Select the most recent event by `created_at`, breaking ties deterministically.
@@ -391,6 +488,35 @@ where
     I: IntoIterator<Item = &'a Event>,
 {
     events.into_iter().max_by_key(|event| event.created_at)
+}
+
+/// Filter events down to authoritative kind-10063 server lists for a pubkey.
+///
+/// A hostile seed relay can deliver any signed event it likes, so only events
+/// with exactly `KIND_SERVER_LIST`, signed by exactly `pubkey`, and not
+/// timestamped more than `FUTURE_EVENT_SKEW_SECS` into the future may feed
+/// `best_event` / `servers_from_event`. The future check tolerates small clock
+/// skew while rejecting events whose `created_at` has not happened yet.
+pub fn authoritative_server_list_events<'a, I>(events: I, pubkey: &PublicKey) -> Vec<&'a Event>
+where
+    I: IntoIterator<Item = &'a Event>,
+{
+    let horizon = Timestamp::now()
+        .as_secs()
+        .saturating_add(FUTURE_EVENT_SKEW_SECS);
+    events
+        .into_iter()
+        .filter(|event| event.kind == Kind::from(KIND_SERVER_LIST) && event.pubkey == *pubkey)
+        .filter(|event| event.created_at.as_secs() <= horizon)
+        .collect()
+}
+
+/// Cap attacker-controlled values at a sane length before they reach logs.
+fn truncate_for_log(value: &str) -> String {
+    match value.char_indices().nth(MAX_LOG_VALUE_CHARS) {
+        Some((idx, _)) => format!("{}…", &value[..idx]),
+        None => value.to_string(),
+    }
 }
 
 /// Extract and normalize BUD-03 `server` tags from a single kind-10063 event.
@@ -408,13 +534,25 @@ pub fn servers_from_event(event: &Event) -> Vec<String> {
 
 /// Extract deduplicated, SSRF-safe blob URLs from kind-1063 `url` and `fallback`
 /// tags. Order follows the source events; private/loopback hosts are filtered.
-pub fn blob_urls_from_events<'a, I>(events: I) -> Vec<String>
+///
+/// Only events carrying an `x` tag matching `expected_hash` contribute: relays
+/// can publish kind-1063 events for arbitrary hashes, and a hash-addressed blob
+/// must never be resolved through an event that attests to a different hash.
+pub fn blob_urls_from_events<'a, I>(events: I, expected_hash: &str) -> Vec<String>
 where
     I: IntoIterator<Item = &'a Event>,
 {
+    let expected_hash = expected_hash.to_ascii_lowercase();
     let mut urls = Vec::new();
     let mut seen = HashSet::new();
     for event in events {
+        let attests_to_hash = event.tags.iter().any(|tag| {
+            let parts = tag.clone().to_vec();
+            parts.len() >= 2 && parts[0] == "x" && parts[1].to_ascii_lowercase() == expected_hash
+        });
+        if !attests_to_hash {
+            continue;
+        }
         for tag in event.tags.iter() {
             let parts = tag.clone().to_vec();
             if parts.len() < 2 || !matches!(parts[0].as_str(), "url" | "fallback") {
@@ -470,10 +608,16 @@ pub fn normalize_server_url(url: &str) -> String {
 
 /// Combine and deduplicate server lists in priority order:
 /// xs (explicit hints, highest) → as (author servers) → fallback (lowest).
+///
+/// `max_server_hints` caps how many `xs=` hints are honoured: the query string
+/// can carry arbitrarily many hints, and each one becomes a candidate host the
+/// proxy may contact. Surplus hints are dropped (truncate), not rejected, so
+/// the API stays compatible.
 pub fn combine_server_lists(
     xs_servers: Option<&[String]>,
     as_servers: Option<&[String]>,
     fallback_servers: &[String],
+    max_server_hints: usize,
 ) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -482,7 +626,11 @@ pub fn combine_server_lists(
         for server in servers {
             let normalized = normalize_server_url(server);
             if !is_allowed_untrusted_server(&normalized) {
-                warn!("Ignoring private or invalid Blossom upstream: {}", server);
+                // `server` is attacker-controlled; never log it raw.
+                warn!(
+                    "Ignoring private or invalid Blossom upstream: {}",
+                    truncate_for_log(server)
+                );
                 continue;
             }
             let lowercase = normalized.to_lowercase();
@@ -493,7 +641,8 @@ pub fn combine_server_lists(
     };
 
     if let Some(xs) = xs_servers {
-        add_servers(xs);
+        let honored = xs.len().min(max_server_hints);
+        add_servers(&xs[..honored]);
     }
     if let Some(author_servers) = as_servers {
         add_servers(author_servers);
@@ -520,6 +669,7 @@ async fn fetch_candidate(
     hash: &str,
     deadline: Instant,
     max_bytes: usize,
+    fetch_timeout: Duration,
 ) -> Result<bytes::Bytes, crate::error::SvcError> {
     use crate::error::SvcError;
 
@@ -530,8 +680,12 @@ async fn fetch_candidate(
     if remaining.is_zero() {
         return Err(SvcError::UpstreamError(504));
     }
+    // Cap one candidate's share of the shared deadline (same pattern as the
+    // video path's `remaining.min(ffmpeg_timeout)`): otherwise a single
+    // stalled host would consume the whole 15 s budget and starve failover.
+    let attempt_timeout = remaining.min(fetch_timeout);
 
-    tokio::time::timeout(remaining, async {
+    tokio::time::timeout(attempt_timeout, async {
         let response = http.get(url).send().await?;
         if !response.status().is_success() {
             return Err(SvcError::UpstreamError(response.status().as_u16()));
@@ -552,7 +706,10 @@ async fn fetch_candidate(
 /// Fetch a hash-addressed blob through server-derived and NIP-94 direct URLs.
 ///
 /// All candidates share one deadline, every body is capped at `max_bytes`, and
-/// successful bytes must match `hash`.
+/// successful bytes must match `hash`. `max_blob_candidates` bounds the total
+/// fan-out a single request can aim at third-party hosts; `fetch_timeout` caps
+/// each individual attempt so one stalled host cannot consume the shared
+/// deadline.
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch_blob(
     http: &reqwest::Client,
@@ -563,6 +720,8 @@ pub async fn fetch_blob(
     ext: Option<&str>,
     deadline: Instant,
     max_bytes: usize,
+    max_blob_candidates: usize,
+    fetch_timeout: Duration,
 ) -> Result<bytes::Bytes, crate::error::SvcError> {
     let mut candidates = Vec::with_capacity(servers.len() + discovered_urls.len());
     let mut seen = HashSet::new();
@@ -578,6 +737,10 @@ pub async fn fetch_blob(
             candidates.push(url.clone());
         }
     }
+    // Truncate (not reject) the combined list so a single request can never
+    // turn the proxy into a reflector for an unbounded set of hosts; the
+    // highest-priority candidates (hints, author servers, fallbacks) survive.
+    candidates.truncate(max_blob_candidates);
 
     let mut failures = CandidateFailureSummary::default();
     let mut last_error = crate::error::SvcError::UpstreamError(404);
@@ -585,21 +748,30 @@ pub async fn fetch_blob(
     let mut skipped = 0;
 
     for url in candidates {
-        if let Some(class) = candidate_failure_cache.lookup(&url).await {
+        if let Some(class) = candidate_failure_cache.lookup(hash, &url).await {
             crate::metrics::record_cache_hit("blossom_negative");
-            debug!(?class, candidate = %url, "skipping negatively cached blob candidate");
+            debug!(
+                ?class,
+                candidate = %truncate_for_log(&url),
+                "skipping negatively cached blob candidate"
+            );
             failures.record(class);
             skipped += 1;
             continue;
         }
 
         attempted += 1;
-        match fetch_candidate(http, &url, hash, deadline, max_bytes).await {
+        match fetch_candidate(http, &url, hash, deadline, max_bytes, fetch_timeout).await {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 let class = CandidateFailureClass::from_error(&error);
-                debug!(?class, candidate = %url, ?error, "blob candidate failed");
-                candidate_failure_cache.remember(&url, class).await;
+                debug!(
+                    ?class,
+                    candidate = %truncate_for_log(&url),
+                    ?error,
+                    "blob candidate failed"
+                );
+                candidate_failure_cache.remember(hash, &url, class).await;
                 failures.record(class);
                 last_error = error;
             }
@@ -683,7 +855,7 @@ mod tests {
         let as_s = vec!["server2.com".to_string(), "SERVER1.COM".to_string()];
         let fallback = vec!["server3.com".to_string()];
 
-        let combined = combine_server_lists(Some(&xs), Some(&as_s), &fallback);
+        let combined = combine_server_lists(Some(&xs), Some(&as_s), &fallback, 4);
 
         assert_eq!(combined.len(), 3);
         assert_eq!(combined[0], "https://server1.com");
@@ -699,7 +871,7 @@ mod tests {
         ];
         let author_servers = vec!["http://10.0.0.2".to_string()];
 
-        let combined = combine_server_lists(Some(&xs), Some(&author_servers), &[]);
+        let combined = combine_server_lists(Some(&xs), Some(&author_servers), &[], 4);
 
         assert_eq!(combined, vec!["https://cdn.example.com"]);
     }
@@ -769,12 +941,18 @@ mod tests {
         let cache = CandidateFailureCache::new(Duration::ZERO, Duration::ZERO, Duration::ZERO);
         cache
             .remember(
+                &"a".repeat(64),
                 "https://missing.example/blob.jpg",
                 CandidateFailureClass::Missing,
             )
             .await;
 
-        assert_eq!(cache.lookup("https://missing.example/blob.jpg").await, None);
+        assert_eq!(
+            cache
+                .lookup(&"a".repeat(64), "https://missing.example/blob.jpg")
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -787,6 +965,7 @@ mod tests {
         for index in 0..MAX_CANDIDATE_FAILURE_CACHE_ENTRIES {
             cache
                 .remember(
+                    &"a".repeat(64),
                     &format!("https://missing.example/{index}"),
                     CandidateFailureClass::Transient,
                 )
@@ -794,6 +973,7 @@ mod tests {
         }
         cache
             .remember(
+                &"a".repeat(64),
                 "https://missing.example/new",
                 CandidateFailureClass::Missing,
             )
@@ -801,7 +981,7 @@ mod tests {
 
         let entries = cache.entries.read().await;
         assert_eq!(entries.len(), MAX_CANDIDATE_FAILURE_CACHE_ENTRIES);
-        assert!(entries.contains_key("https://missing.example/new"));
+        assert!(entries.contains_key(&("a".repeat(64), "https://missing.example/new".to_string())));
     }
 
     #[tokio::test]
@@ -834,6 +1014,8 @@ mod tests {
             Some("bin"),
             Instant::now() + Duration::from_secs(1),
             1024 * 1024,
+            8,
+            Duration::from_secs(5),
         )
         .await;
         assert!(matches!(first, Err(SvcError::UpstreamError(404))));
@@ -847,6 +1029,8 @@ mod tests {
             Some("bin"),
             Instant::now() + Duration::from_secs(1),
             1024 * 1024,
+            8,
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -886,6 +1070,8 @@ mod tests {
             Some("bin"),
             Instant::now() + Duration::from_secs(1),
             1024 * 1024,
+            8,
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -910,6 +1096,8 @@ mod tests {
             Some("jpg"),
             Instant::now(),
             1024 * 1024,
+            8,
+            Duration::from_secs(5),
         )
         .await;
 
