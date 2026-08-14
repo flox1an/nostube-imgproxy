@@ -1,5 +1,5 @@
-use crate::network_policy::public_dns_resolver;
-use reqwest::{redirect, Client};
+use crate::network_policy::{guarded_redirect_policy, public_dns_resolver};
+use reqwest::Client;
 use std::{path::PathBuf, time::Duration};
 
 #[derive(Clone)]
@@ -122,7 +122,7 @@ impl AppState {
 
         let http = Client::builder()
             .timeout(cfg.fetch_timeout)
-            .redirect(redirect::Policy::none())
+            .redirect(guarded_redirect_policy())
             .dns_resolver(public_dns_resolver())
             .user_agent("rust-imgproxy/0.1")
             .build()

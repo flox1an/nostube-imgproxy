@@ -128,21 +128,26 @@ pub async fn extract_video_thumbnail(
             url
         );
 
-        // Cheap guarded probe first: dead or redirecting candidates are
-        // rejected in milliseconds instead of costing an FFmpeg spawn.
-        if let Err(error) = preflight_candidate(http, url, deadline).await {
-            let class = CandidateFailureClass::from_error(&error);
-            if let Some(cache) = negative_cache {
-                cache.remember(url, class).await;
+        // Cheap guarded probe first: dead candidates are rejected in
+        // milliseconds instead of costing an FFmpeg spawn. It also resolves the
+        // redirect chain under our SSRF guard, so FFmpeg receives a terminal URL
+        // instead of chasing hops with its own resolver.
+        let resolved = match preflight_candidate(http, url, deadline).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let class = CandidateFailureClass::from_error(&error);
+                if let Some(cache) = negative_cache {
+                    cache.remember(url, class).await;
+                }
+                failures.record(class);
+                tracing::debug!(?class, candidate = %url, "preflight rejected video candidate");
+                last_error = error;
+                continue;
             }
-            failures.record(class);
-            tracing::debug!(?class, candidate = %url, "preflight rejected video candidate");
-            last_error = error;
-            continue;
-        }
+        };
 
         let attempt_budget = remaining.min(ffmpeg_timeout);
-        match extract_thumbnail_with_ffmpeg(url, attempt_budget).await {
+        match extract_thumbnail_with_ffmpeg(&resolved, attempt_budget).await {
             Ok(bytes) => {
                 tracing::info!(
                     "✓ thumbnail {}/{} ({} bytes) from {}",
@@ -185,14 +190,16 @@ pub async fn extract_video_thumbnail(
 /// Preflight a candidate with our own HTTP client before handing it to FFmpeg.
 ///
 /// FFmpeg resolves and follows redirects itself, so it bypasses the public-IP
-/// DNS resolver and `redirect::Policy::none()` that protect every other fetch
-/// in this service. Probing first with the guarded client means a candidate
-/// that redirects (or is simply dead) never reaches FFmpeg at all.
+/// DNS resolver and the hop validation that protect every other fetch in this
+/// service. Probing first with the guarded client means a dead candidate never
+/// reaches FFmpeg, and — because Blossom servers commonly 302 a blob to the
+/// bucket or CDN holding the bytes — that the chain is walked under our own
+/// guard. Returns the final URL, which is what FFmpeg is given.
 async fn preflight_candidate(
     http: &reqwest::Client,
     url: &str,
     deadline: Instant,
-) -> Result<(), SvcError> {
+) -> Result<String, SvcError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(SvcError::UpstreamError(504));
@@ -210,15 +217,17 @@ async fn preflight_candidate(
 
     let status = response.status();
     if status.is_redirection() {
-        // `redirect::Policy::none()` surfaces the 3xx instead of following it.
-        // Refuse rather than let FFmpeg chase it to an unvalidated host.
-        tracing::debug!(%url, %status, "refusing redirecting video candidate");
+        // The client follows validated hops, so a 3xx surviving to here is one
+        // we could not resolve at all (typically a missing `Location`). Report a
+        // gateway failure rather than passing a bare 3xx back to the caller.
+        tracing::debug!(%url, %status, "unresolvable redirect for video candidate");
         return Err(SvcError::UpstreamError(502));
     }
     if !status.is_success() {
         return Err(SvcError::UpstreamError(status.as_u16()));
     }
-    Ok(())
+
+    Ok(response.url().as_str().to_owned())
 }
 
 /// Extract a thumbnail from a video using the FFmpeg CLI.
@@ -381,5 +390,46 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(SvcError::UpstreamError(404))));
+    }
+
+    #[tokio::test]
+    async fn preflight_candidate_returns_the_redirect_target() {
+        // Regression: blossom.primal.net answers a blob GET with a 302 to
+        // r2a.primal.net. Refusing that hop failed every candidate and the
+        // request surfaced as a 502 without FFmpeg ever running.
+        crate::init_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let location = format!("http://cdn.example:{}/final.mp4", address.port());
+        tokio::spawn(async move {
+            let router = axum::Router::new()
+                .route(
+                    "/video.mp4",
+                    axum::routing::get(move || {
+                        let location = location.clone();
+                        async move { axum::response::Redirect::to(&location) }
+                    }),
+                )
+                .route("/final.mp4", axum::routing::get(|| async { "mp4 bytes" }));
+            axum::serve(listener, router).await.unwrap();
+        });
+        let http = reqwest::Client::builder()
+            .redirect(crate::network_policy::guarded_redirect_policy())
+            .resolve("cdn.example", address)
+            .build()
+            .unwrap();
+
+        let resolved = preflight_candidate(
+            &http,
+            &format!("http://cdn.example:{}/video.mp4", address.port()),
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a redirecting video candidate must preflight successfully");
+
+        assert!(
+            resolved.ends_with("/final.mp4"),
+            "FFmpeg must be handed the resolved target, got {resolved}"
+        );
     }
 }
