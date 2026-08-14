@@ -8,6 +8,13 @@ use thiserror::Error;
 pub enum SvcError {
     #[error("bad request: {0}")]
     BadRequest(&'static str),
+    #[error("forbidden: {0}")]
+    Forbidden(&'static str),
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("rate limited")]
+    RateLimited,
+
     #[error("upstream returned status {0}")]
     UpstreamError(u16),
     #[error("fetch failed")]
@@ -36,6 +43,12 @@ impl SvcError {
     pub fn render(&self) -> (StatusCode, String) {
         match self {
             SvcError::BadRequest(msg) => (StatusCode::BAD_REQUEST, (*msg).to_string()),
+            SvcError::Forbidden(msg) => (StatusCode::FORBIDDEN, (*msg).to_string()),
+            SvcError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
+            SvcError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limited, retry shortly".to_string(),
+            ),
             // Upstream status codes are deliberately collapsed. Passing them
             // through made this service a scanning oracle for any host an
             // attacker could name via `xs=`, and let a third-party upstream pick
@@ -86,7 +99,7 @@ impl IntoResponse for SvcError {
 
         let (status, body) = self.render();
         let mut response = (status, body).into_response();
-        if status == StatusCode::SERVICE_UNAVAILABLE {
+        if status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::TOO_MANY_REQUESTS {
             response.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static("1"),

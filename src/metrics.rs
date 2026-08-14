@@ -87,6 +87,15 @@ lazy_static! {
         &["cache_type"]
     )
     .unwrap();
+    /// Signed-URL admission results. It exposes bad token traffic without
+    /// placing attacker-controlled URL data in Prometheus labels.
+    pub static ref SIGNATURE_VERIFICATIONS_TOTAL: CounterVec = register_counter_vec!(
+        "imgproxy_signature_verifications_total",
+        "Signed URL verification results",
+        &["result"]
+    )
+    .unwrap();
+
 }
 
 /// Encode all metrics to Prometheus text format
@@ -168,6 +177,13 @@ pub fn set_cache_bytes(cache_type: &str, bytes: u64) {
     CACHE_BYTES
         .with_label_values(&[cache_type])
         .set(bytes as f64);
+}
+
+/// Record a signed URL verification outcome.
+pub fn record_signature_verification(result: &str) {
+    SIGNATURE_VERIFICATIONS_TOTAL
+        .with_label_values(&[result])
+        .inc();
 }
 
 #[cfg(test)]

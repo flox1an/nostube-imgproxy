@@ -4,8 +4,8 @@ A minimal, fast image resizing service written in Rust, inspired by imgproxy. Su
 
 ## Features
 
-- **imgproxy-compatible URL API** (insecure mode)
-- **Full format support**: JPEG, PNG, WebP, AVIF (input and output)
+- **Versioned signed URL API** with expiring HMAC capability URLs and a temporary imgproxy-compatible legacy API
+- **Output formats**: JPEG, PNG, WebP, AVIF; input decoders are limited to JPEG, PNG, and WebP
 - **Video thumbnails**: Extract thumbnails from videos using FFmpeg
 - **Resize operations**: Fit, Fill, Fill-Down, Force, Auto (Lanczos3)
 - **Quality control**: Configurable quality for lossy formats
@@ -150,11 +150,27 @@ curl "http://127.0.0.1:8080/insecure/f:jpeg/rs:fit:800:600/plain/https%3A%2F%2Fe
 
 ### URL Structure
 
-```
+Legacy URLs are enabled only while `ALLOW_UNSIGNED_URLS=true`:
+
+```text
 /insecure/<directives>/plain/<percent-encoded-source-url>
+/thumb/<sha256>[.<extension>]?f=...&rs=...&q=...&xs=...&as=...
 ```
 
-Works for **both images and videos**! Videos are automatically detected by file extension.
+Signed v1 URLs are the production API:
+
+```text
+/v1/<key-id>/<signature>/img/<directives>/plain/<percent-encoded-source-url>?exp=<unix-seconds>
+/v1/<key-id>/<signature>/thumb/<sha256>[.<extension>]?f=...&rs=...&q=...&xs=...&as=...&exp=<unix-seconds>
+```
+
+The signature covers the exact raw path and query after `/v1/<key-id>/<signature>`. A browser obtains these URLs through Lionfish's NIP-98-authenticated mint endpoint; it never receives an HMAC key. See [`docs/nostube-signed-url-spec.md`](docs/nostube-signed-url-spec.md) for the batch contract, NIP-98 checks, and rolling migration plan.
+
+### NIP-98 Batch Minting
+
+When enabled, `POST /v1/mint` accepts a NIP-98-authenticated JSON batch of hash-addressed Blossom media plus one fixed output preset. It returns the corresponding expiring v1 URLs. The mint route is deliberately not a general remote-URL proxy: direct `source_url`, arbitrary directives, and source-server hints are rejected.
+
+`Authorization: Nostr <event>` binds the exact request URL, `POST`, and the SHA-256 of the raw JSON body. Lionfish applies bounded in-memory replay protection and rate limits both peer IP and Nostr pubkey by minted item count.
 
 **Supported Directives:**
 - `f:<format>` - Output format: `jpeg`, `png`, `webp`, `avif`
@@ -197,6 +213,17 @@ Configure via environment variables:
 | `MAX_BLOB_CANDIDATES` | `8` | Maximum Blossom source candidates tried per request |
 | `MAX_SERVER_HINTS` | `4` | Maximum `xs=` hints honoured per request |
 | `METRICS_BIND_ADDR` | unset | Optional separate bind address for the operator-only `/metrics` listener |
+| `URL_SIGNING_KEYS` | unset | Comma-separated `key-id:base64url-secret` HMAC keys; secrets must decode to at least 32 bytes |
+| `ALLOW_UNSIGNED_URLS` | `true` | Temporary migration switch for legacy `/insecure` and `/thumb` routes |
+| `REQUIRE_SIGNED_URL_EXPIRY` | `true` | Require one signed `exp` Unix-seconds query parameter |
+| `NIP98_MINT_ENABLED` | `false` | Enable the NIP-98-authenticated `POST /v1/mint` endpoint |
+| `MINT_PUBLIC_BASE_URL` | unset | Required canonical Lionfish origin for NIP-98 validation and returned URLs |
+| `MINT_ALLOWED_ORIGINS` | unset | Comma-separated browser origins allowed to call `/v1/mint` |
+| `MAX_MINT_BATCH_ITEMS` | `100`, capped at 100 | Maximum hash-addressed items per mint request |
+| `MINT_RATE_IP_ITEMS_PER_MIN` | `300` | Minted-item budget per peer IP and minute |
+| `MINT_RATE_PUBKEY_ITEMS_PER_MIN` | `120` | Minted-item budget per Nostr pubkey and minute |
+| `NIP98_REPLAY_TTL_SECS` | `90`, minimum 60 | In-memory NIP-98 event replay retention |
+| `SIGNED_URL_TTL_SECS` | `21600` | Lifetime for minted signed URLs; expiry is bucketed for cache reuse |
 | `RUST_LOG` | `info` | Log level |
 
 Blossom candidate failures are retained only in memory, per candidate URL, up to 10,000 entries.

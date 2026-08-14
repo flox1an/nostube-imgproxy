@@ -90,13 +90,16 @@ async fn main() {
 
     info!(addr = bind_addr, "listening");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            let _ = shutdown_tx.send(());
-        })
-        .await
-        .unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(());
+    })
+    .await
+    .unwrap();
 
     info!("server shutdown complete");
 }

@@ -1,12 +1,14 @@
 use axum::{
     body::Body,
     error_handling::HandleErrorLayer,
-    extract::{MatchedPath, Path as AxPath, Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, MatchedPath, OriginalUri, Path as AxPath, Request, State,
+    },
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use axum_extra::extract::Query;
 use bytes::Bytes;
@@ -17,7 +19,7 @@ use tower::{
 };
 use tower_http::{
     catch_panic::CatchPanicLayer,
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, Any, CorsLayer},
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -33,7 +35,9 @@ use crate::{
     error::SvcError,
     fetch::read_body_capped,
     metrics,
+    mint::{MintResponse, MintState},
     network_policy::validate_untrusted_url,
+    signing::signature_error,
     singleflight::SingleFlight,
     thumbnail::{extract_video_thumbnail, is_video_url, ThumbnailState},
     transform::{
@@ -51,6 +55,13 @@ pub struct CombinedState {
     pub cpu: CpuPool,
     /// Collapses concurrent misses for the same derivative into one job.
     pub inflight: Arc<SingleFlight>,
+}
+
+#[derive(Clone)]
+struct MintRouterState {
+    cfg: crate::config::MintConfig,
+    signing_keys: crate::signing::UrlSigningKeys,
+    state: MintState,
 }
 
 impl CombinedState {
@@ -75,22 +86,68 @@ pub fn create_router(
 ) -> Router {
     let request_timeout = state.cfg.request_timeout;
     let max_inflight = state.cfg.max_inflight_requests;
+    let signed_urls_enabled = !state.cfg.url_signing_keys.is_empty();
+    let allow_unsigned_urls = state.cfg.allow_unsigned_urls;
+    let mint_enabled = state.cfg.mint.enabled;
+    let mint_origins = state.cfg.mint.allowed_origins.clone();
+    let mint_state = MintRouterState {
+        cfg: state.cfg.mint.clone(),
+        signing_keys: state.cfg.url_signing_keys.clone(),
+        state: MintState::default(),
+    };
     let combined = CombinedState::new(state, thumbnail_state, blossom_state);
+    let mut images = Router::new();
+    if signed_urls_enabled {
+        images = images
+            .route(
+                "/v1/{key_id}/{signature}/img/{*rest}",
+                get(handle_signed_image),
+            )
+            .route(
+                "/v1/{key_id}/{signature}/thumb/{filename}",
+                get(handle_signed_thumb),
+            );
+    } else {
+        tracing::warn!("URL_SIGNING_KEYS is unset; signed media routes are disabled");
+    }
+    if allow_unsigned_urls {
+        images = images
+            .route("/insecure/{*rest}", get(handle_insecure))
+            .route("/thumb/{filename}", get(handle_thumb));
+    }
+    let images = images.layer(
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    );
 
-    // CORS is needed by browser image consumers, not by health checks or the
-    // operator-only metrics listener. Keep it confined to public media routes.
-    let images = Router::new()
-        .route("/insecure/{*rest}", get(handle_insecure))
-        .route("/thumb/{filename}", get(handle_thumb))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        );
+    let mut mint = Router::new();
+    if mint_enabled {
+        mint = Router::new()
+            .route("/v1/mint", post(handle_mint))
+            .with_state(mint_state)
+            .layer(DefaultBodyLimit::max(64 * 1024));
+        if !mint_origins.is_empty() {
+            let origins = mint_origins
+                .iter()
+                .map(|origin| {
+                    HeaderValue::from_str(origin)
+                        .unwrap_or_else(|_| panic!("invalid MINT_ALLOWED_ORIGINS value"))
+                })
+                .collect::<Vec<_>>();
+            mint = mint.layer(
+                CorsLayer::new()
+                    .allow_origin(AllowOrigin::list(origins))
+                    .allow_methods([Method::POST])
+                    .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+            );
+        }
+    }
 
     Router::new()
         .merge(images)
+        .merge(mint)
         .route("/health", get(health_check))
         .with_state(combined)
         // Outer → inner: Trace, metrics, panic-to-500, timeout, load-shed,
@@ -143,6 +200,43 @@ struct ThumbQuery {
     height: Option<u32>,
 }
 
+/// Mint a bounded batch of short-lived v1 capability URLs after NIP-98 binds
+/// the authenticated Nostr identity to these exact JSON bytes.
+async fn handle_mint(
+    State(mint): State<MintRouterState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<MintResponse>, SvcError> {
+    let request =
+        serde_json::from_slice(&body).map_err(|_| SvcError::BadRequest("invalid mint request"))?;
+    MintState::validate_request(&request, &mint.cfg)?;
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(SvcError::Unauthorized)?;
+    let expected_url = format!(
+        "{}/v1/mint",
+        mint.cfg
+            .public_base_url
+            .as_deref()
+            .ok_or_else(|| SvcError::InternalError("mint public URL is unavailable".into()))?
+    );
+    mint.state.authorize(
+        authorization,
+        &expected_url,
+        &body,
+        peer.ip(),
+        u32::try_from(request.items.len())
+            .map_err(|_| SvcError::BadRequest("invalid mint batch size"))?,
+        &mint.cfg,
+    )?;
+    Ok(Json(mint.state.mint(
+        request,
+        &mint.signing_keys,
+        &mint.cfg,
+    )?))
+}
 /// Simple health check endpoint
 async fn health_check() -> &'static str {
     "OK"
@@ -402,11 +496,32 @@ fn blossom_blob_url(server: &str, hash: &str, ext: Option<&str>) -> String {
     }
 }
 
-/// Main handler for /insecure/{*} requests (handles both images and videos)
+/// Legacy unsigned `/insecure/{*}` route. It remains available only while
+/// `ALLOW_UNSIGNED_URLS=true` during the signed-URL migration.
 async fn handle_insecure(
     State(state): State<CombinedState>,
     AxPath(rest): AxPath<String>,
     request_headers: HeaderMap,
+) -> Result<Response, SvcError> {
+    handle_image_request(state, rest, request_headers, None).await
+}
+
+/// Versioned signed direct-media route.
+async fn handle_signed_image(
+    State(state): State<CombinedState>,
+    OriginalUri(uri): OriginalUri,
+    AxPath((key_id, signature, rest)): AxPath<(String, String, String)>,
+    request_headers: HeaderMap,
+) -> Result<Response, SvcError> {
+    let expiry = verify_signed_request(&state, &uri, &key_id, &signature, "/img/")?;
+    handle_image_request(state, rest, request_headers, expiry).await
+}
+
+async fn handle_image_request(
+    state: CombinedState,
+    rest: String,
+    request_headers: HeaderMap,
+    signed_expiry: Option<std::time::SystemTime>,
 ) -> Result<Response, SvcError> {
     // Parse and validate before any cache lookup. The request URL is untrusted
     // and must never become an FFmpeg or HTTP target on this server.
@@ -414,23 +529,18 @@ async fn handle_insecure(
     dirs.resize.validate(state.app.cfg.max_image_dimension)?;
     validate_untrusted_url(&src_url)?;
 
-    // Canonical key from the *parsed* directives, so requests that differ only
-    // in noise (`bogus:1/` vs `bogus:2/`, `f:JPG` vs `f:jpeg`) share one cache
-    // entry; the same string coalesces single-flight work.
+    // Signed and legacy direct media deliberately share this namespace: access
+    // control changes who may request a derivative, not its output bytes.
     let is_video = is_video_url(&src_url);
     let cache_key = derivative_cache_key("insecure", &src_url, &dirs);
     let cache_path = cache_path_for(&state.app.cfg, &cache_key, &dirs.out_fmt);
     let mime = dirs.out_fmt.mime_type();
+    let policy = signed_expiry
+        .map(ClientCachePolicy::ExpiresAt)
+        .unwrap_or(ClientCachePolicy::ShortLived);
 
     if !is_video {
-        if let Some(resp) = serve_cached(
-            &cache_path,
-            mime,
-            &request_headers,
-            ClientCachePolicy::ShortLived,
-        )
-        .await?
-        {
+        if let Some(resp) = serve_cached(&cache_path, mime, &request_headers, policy).await? {
             return Ok(resp);
         }
     }
@@ -462,25 +572,42 @@ async fn handle_insecure(
             .await?
     };
 
-    let mut resp = fresh_response(
-        outcome.bytes,
-        mime,
-        &cache_path,
-        outcome.coalesced,
-        ClientCachePolicy::ShortLived,
-    );
+    let mut resp = fresh_response(outcome.bytes, mime, &cache_path, outcome.coalesced, policy);
     if is_video {
         resp.headers_mut().remove(header::ETAG);
     }
     Ok(resp)
 }
 
-/// Handler for /thumb/<sha256>.<ext> endpoint (Blossom-specialized)
+/// Legacy unsigned `/thumb/{filename}` route. It remains available only while
+/// `ALLOW_UNSIGNED_URLS=true` during the signed-URL migration.
 async fn handle_thumb(
     State(state): State<CombinedState>,
     AxPath(filename): AxPath<String>,
     Query(params): Query<ThumbQuery>,
     request_headers: HeaderMap,
+) -> Result<Response, SvcError> {
+    handle_thumb_request(state, filename, params, request_headers, None).await
+}
+
+/// Versioned signed Blossom thumbnail route.
+async fn handle_signed_thumb(
+    State(state): State<CombinedState>,
+    OriginalUri(uri): OriginalUri,
+    AxPath((key_id, signature, filename)): AxPath<(String, String, String)>,
+    Query(params): Query<ThumbQuery>,
+    request_headers: HeaderMap,
+) -> Result<Response, SvcError> {
+    let expiry = verify_signed_request(&state, &uri, &key_id, &signature, "/thumb/")?;
+    handle_thumb_request(state, filename, params, request_headers, expiry).await
+}
+
+async fn handle_thumb_request(
+    state: CombinedState,
+    filename: String,
+    params: ThumbQuery,
+    request_headers: HeaderMap,
+    signed_expiry: Option<std::time::SystemTime>,
 ) -> Result<Response, SvcError> {
     // Accept both `<sha256>` and `<sha256>.<ext>` and canonicalize the hash
     // before using it as an upstream path or cache key.
@@ -502,16 +629,16 @@ async fn handle_thumb(
     let cache_key = derivative_cache_key("thumb", &blob_name, &dirs);
     let cache_path = cache_path_for(&state.app.cfg, &cache_key, &dirs.out_fmt);
     let mime = dirs.out_fmt.mime_type();
+    let policy = signed_expiry
+        .map(ClientCachePolicy::ExpiresAt)
+        .unwrap_or(if is_video {
+            ClientCachePolicy::ShortLived
+        } else {
+            ClientCachePolicy::Immutable
+        });
 
     if !is_video {
-        if let Some(resp) = serve_cached(
-            &cache_path,
-            mime,
-            &request_headers,
-            ClientCachePolicy::Immutable,
-        )
-        .await?
-        {
+        if let Some(resp) = serve_cached(&cache_path, mime, &request_headers, policy).await? {
             return Ok(resp);
         }
     }
@@ -594,16 +721,46 @@ async fn handle_thumb(
             .await?
     };
 
-    let policy = if is_video {
-        ClientCachePolicy::ShortLived
-    } else {
-        ClientCachePolicy::Immutable
-    };
     let mut resp = fresh_response(outcome.bytes, mime, &cache_path, outcome.coalesced, policy);
     if is_video {
         resp.headers_mut().remove(header::ETAG);
     }
     Ok(resp)
+}
+
+fn verify_signed_request(
+    state: &CombinedState,
+    uri: &http::Uri,
+    key_id: &str,
+    signature: &str,
+    expected_path_prefix: &str,
+) -> Result<Option<std::time::SystemTime>, SvcError> {
+    let raw = uri
+        .path_and_query()
+        .map(|path_and_query| path_and_query.as_str())
+        .ok_or(SvcError::Forbidden("invalid signed URL"))?;
+    let prefix = format!("/v1/{key_id}/{signature}");
+    let path_and_query = raw
+        .strip_prefix(&prefix)
+        .filter(|value| value.starts_with(expected_path_prefix))
+        .ok_or(SvcError::Forbidden("invalid signed URL"))?;
+
+    match state.app.cfg.url_signing_keys.verify(
+        key_id,
+        signature,
+        path_and_query,
+        state.app.cfg.require_signed_url_expiry,
+        std::time::SystemTime::now(),
+    ) {
+        Ok(verified) => {
+            metrics::record_signature_verification("ok");
+            Ok(verified.expires_at)
+        }
+        Err(failure) => {
+            metrics::record_signature_verification(failure.as_str());
+            Err(signature_error(failure))
+        }
+    }
 }
 
 /// Parse thumb query parameters into Directives
@@ -694,5 +851,68 @@ mod tests {
 
         assert!(!video.cacheable());
         assert!(image.cacheable());
+    }
+
+    fn mint_router_state() -> MintRouterState {
+        MintRouterState {
+            cfg: crate::config::MintConfig {
+                enabled: true,
+                public_base_url: Some("https://img.example".into()),
+                allowed_origins: vec!["https://nostube.example".into()],
+                max_batch_items: 100,
+                rate_ip_items_per_min: 10,
+                rate_pubkey_items_per_min: 10,
+                replay_ttl: std::time::Duration::from_secs(90),
+                signed_url_ttl: std::time::Duration::from_secs(21_600),
+            },
+            signing_keys: crate::signing::UrlSigningKeys::parse(
+                "nostube-2026-08:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            )
+            .unwrap(),
+            state: MintState::default(),
+        }
+    }
+
+    fn nip98_authorization(body: &[u8]) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+        use sha2::{Digest, Sha256};
+
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags([
+                Tag::parse(["u", "https://img.example/v1/mint"]).unwrap(),
+                Tag::parse(["method", "POST"]).unwrap(),
+                Tag::parse(["payload", &hex::encode(Sha256::digest(body))]).unwrap(),
+            ])
+            .finalize(&Keys::generate())
+            .unwrap();
+        format!("Nostr {}", STANDARD.encode(event.as_json()))
+    }
+
+    #[tokio::test]
+    async fn mint_handler_returns_signed_urls_for_a_bound_nip98_batch() {
+        let body = Bytes::from_static(
+            br#"{"preset":"feed-preview-v1","items":[{"id":"event:1:media:0","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","extension":"webp"}]}"#,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&nip98_authorization(&body)).unwrap(),
+        );
+
+        let Json(response) = handle_mint(
+            State(mint_router_state()),
+            ConnectInfo("203.0.113.10:443".parse().unwrap()),
+            headers,
+            body,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].id, "event:1:media:0");
+        assert!(response.items[0]
+            .url
+            .starts_with("https://img.example/v1/nostube-2026-08/"));
     }
 }

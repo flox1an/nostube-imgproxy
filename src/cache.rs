@@ -39,6 +39,9 @@ pub enum ClientCachePolicy {
     /// URL-addressed content (`/insecure`): the source can change behind the
     /// URL, so client-side caching is capped short.
     ShortLived,
+    /// A signed capability URL. Its response must not remain reusable after
+    /// the token expires, even when the underlying Blossom blob is immutable.
+    ExpiresAt(SystemTime),
 }
 
 /// Canonical, versioned key for a derivative.
@@ -135,6 +138,14 @@ fn decorate(
     let cache_control = match policy {
         ClientCachePolicy::Immutable => IMMUTABLE_CACHE_CONTROL,
         ClientCachePolicy::ShortLived => SHORT_CACHE_CONTROL,
+        ClientCachePolicy::ExpiresAt(expires_at) => {
+            let seconds = expires_at
+                .duration_since(SystemTime::now())
+                .unwrap_or(Duration::ZERO)
+                .as_secs();
+            HeaderValue::from_str(&format!("public, max-age={seconds}"))
+                .unwrap_or_else(|_| HeaderValue::from_static("public, max-age=0"))
+        }
     };
     headers.insert(header::CACHE_CONTROL, cache_control);
     if let Ok(state) = HeaderValue::from_str(cache_state) {
@@ -410,6 +421,19 @@ mod tests {
             blossom_negative_transient_ttl: Duration::from_secs(1),
             max_image_dimension: 4096,
             max_decode_alloc_bytes: 64 * 1024 * 1024,
+            url_signing_keys: crate::signing::UrlSigningKeys::default(),
+            allow_unsigned_urls: true,
+            require_signed_url_expiry: true,
+            mint: crate::config::MintConfig {
+                enabled: false,
+                public_base_url: None,
+                allowed_origins: Vec::new(),
+                max_batch_items: 100,
+                rate_ip_items_per_min: 300,
+                rate_pubkey_items_per_min: 120,
+                replay_ttl: Duration::from_secs(90),
+                signed_url_ttl: Duration::from_secs(21_600),
+            },
             cpu_concurrency: 1,
             max_inflight_requests: 8,
             request_timeout: Duration::from_secs(5),

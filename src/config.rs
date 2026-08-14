@@ -1,6 +1,74 @@
-use crate::network_policy::{guarded_redirect_policy, public_dns_resolver};
+use crate::{
+    network_policy::{guarded_redirect_policy, public_dns_resolver},
+    signing::UrlSigningKeys,
+};
+
 use reqwest::Client;
 use std::{path::PathBuf, time::Duration};
+
+#[derive(Clone)]
+pub struct MintConfig {
+    /// Opt-in switch for the public NIP-98 capability-minting endpoint.
+    pub enabled: bool,
+    /// Canonical public Lionfish origin used in NIP-98 `u` verification and
+    /// returned signed URLs. Never derive this from an attacker-controlled Host.
+    pub public_base_url: Option<String>,
+    /// Browser origins allowed to invoke the cross-origin mint endpoint.
+    pub allowed_origins: Vec<String>,
+    /// Each item in a batch costs one token in both rate-limit buckets.
+    pub max_batch_items: usize,
+    pub rate_ip_items_per_min: u32,
+    pub rate_pubkey_items_per_min: u32,
+    pub replay_ttl: Duration,
+    pub signed_url_ttl: Duration,
+}
+
+fn canonical_http_origin(value: &str, env_name: &str) -> String {
+    let url = url::Url::parse(value).unwrap_or_else(|error| panic!("invalid {env_name}: {error}"));
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        panic!(
+            "{env_name} must be an http(s) origin without credentials, path, query, or fragment"
+        );
+    }
+    url.as_str().trim_end_matches('/').to_owned()
+}
+
+impl MintConfig {
+    fn from_env() -> Self {
+        let public_base_url = std::env::var("MINT_PUBLIC_BASE_URL")
+            .ok()
+            .map(|value| canonical_http_origin(&value, "MINT_PUBLIC_BASE_URL"));
+        let allowed_origins = std::env::var("MINT_ALLOWED_ORIGINS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|origin| !origin.is_empty())
+                    .map(|origin| canonical_http_origin(origin, "MINT_ALLOWED_ORIGINS"))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Self {
+            enabled: env_parsed("NIP98_MINT_ENABLED", false),
+            public_base_url,
+            allowed_origins,
+            max_batch_items: env_parsed("MAX_MINT_BATCH_ITEMS", 100usize).clamp(1, 100),
+            rate_ip_items_per_min: env_parsed("MINT_RATE_IP_ITEMS_PER_MIN", 300u32).max(1),
+            rate_pubkey_items_per_min: env_parsed("MINT_RATE_PUBKEY_ITEMS_PER_MIN", 120u32).max(1),
+            replay_ttl: env_secs("NIP98_REPLAY_TTL_SECS", 90).max(Duration::from_secs(60)),
+            signed_url_ttl: env_secs("SIGNED_URL_TTL_SECS", 21_600).max(Duration::from_secs(1)),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppCfg {
@@ -52,6 +120,17 @@ pub struct AppCfg {
     pub metrics_bind_addr: Option<String>,
     /// Simultaneous FFmpeg processes allowed for video thumbnail extraction.
     pub max_ffmpeg_concurrent: usize,
+    /// Versioned HMAC keys accepted by `/v1/{key_id}/{signature}/...`.
+    /// Secrets remain opaque and are never formatted into logs.
+    pub url_signing_keys: UrlSigningKeys,
+    /// Temporary migration switch for the legacy unsigned `/insecure` and
+    /// `/thumb` routes. Turn this off after every caller emits signed v1 URLs.
+    pub allow_unsigned_urls: bool,
+    /// Require `exp=<unix-seconds>` in every signed URL. This is on by default
+    /// so leaked capability URLs have a bounded lifetime.
+    pub require_signed_url_expiry: bool,
+    /// NIP-98-authenticated mint endpoint configuration. Disabled by default.
+    pub mint: MintConfig,
 }
 
 /// Read a `usize`/`u32`/`u64` style setting, falling back on absent or
@@ -88,6 +167,27 @@ impl AppCfg {
             .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
             .unwrap_or(default_fallbacks);
 
+        let url_signing_keys = std::env::var("URL_SIGNING_KEYS")
+            .ok()
+            .map(|value| {
+                UrlSigningKeys::parse(&value)
+                    .unwrap_or_else(|error| panic!("invalid URL_SIGNING_KEYS: {error}"))
+            })
+            .unwrap_or_default();
+        let allow_unsigned_urls = env_parsed("ALLOW_UNSIGNED_URLS", true);
+        let require_signed_url_expiry = env_parsed("REQUIRE_SIGNED_URL_EXPIRY", true);
+        if url_signing_keys.is_empty() && !allow_unsigned_urls {
+            panic!("URL_SIGNING_KEYS must be configured when ALLOW_UNSIGNED_URLS=false");
+        }
+
+        let mint = MintConfig::from_env();
+        if mint.enabled && url_signing_keys.is_empty() {
+            panic!("URL_SIGNING_KEYS must be configured when NIP98_MINT_ENABLED=true");
+        }
+        if mint.enabled && mint.public_base_url.is_none() {
+            panic!("MINT_PUBLIC_BASE_URL must be configured when NIP98_MINT_ENABLED=true");
+        }
+
         Self {
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into()),
             cache_dir: PathBuf::from(std::env::var("CACHE_DIR").unwrap_or_else(|_| "cache".into())),
@@ -121,6 +221,10 @@ impl AppCfg {
             cpu_queue_depth: env_parsed("MAX_CPU_QUEUE", 64usize).max(1),
             metrics_bind_addr: std::env::var("METRICS_BIND_ADDR").ok(),
             max_ffmpeg_concurrent: env_parsed("MAX_FFMPEG_CONCURRENT", 8usize).max(1),
+            url_signing_keys,
+            allow_unsigned_urls,
+            require_signed_url_expiry,
+            mint,
         }
     }
 
@@ -201,6 +305,17 @@ mod tests {
         "MAX_CPU_QUEUE",
         "METRICS_BIND_ADDR",
         "MAX_FFMPEG_CONCURRENT",
+        "URL_SIGNING_KEYS",
+        "ALLOW_UNSIGNED_URLS",
+        "REQUIRE_SIGNED_URL_EXPIRY",
+        "NIP98_MINT_ENABLED",
+        "MINT_PUBLIC_BASE_URL",
+        "MINT_ALLOWED_ORIGINS",
+        "MAX_MINT_BATCH_ITEMS",
+        "MINT_RATE_IP_ITEMS_PER_MIN",
+        "MINT_RATE_PUBKEY_ITEMS_PER_MIN",
+        "NIP98_REPLAY_TTL_SECS",
+        "SIGNED_URL_TTL_SECS",
     ];
 
     fn clear_managed_vars() {
@@ -261,6 +376,17 @@ mod tests {
         assert_eq!(cfg.cpu_queue_depth, 64);
         assert_eq!(cfg.metrics_bind_addr, None);
         assert_eq!(cfg.max_ffmpeg_concurrent, 8);
+        assert!(cfg.url_signing_keys.is_empty());
+        assert!(cfg.allow_unsigned_urls);
+        assert!(cfg.require_signed_url_expiry);
+        assert!(!cfg.mint.enabled);
+        assert_eq!(cfg.mint.public_base_url, None);
+        assert!(cfg.mint.allowed_origins.is_empty());
+        assert_eq!(cfg.mint.max_batch_items, 100);
+        assert_eq!(cfg.mint.rate_ip_items_per_min, 300);
+        assert_eq!(cfg.mint.rate_pubkey_items_per_min, 120);
+        assert_eq!(cfg.mint.replay_ttl, Duration::from_secs(90));
+        assert_eq!(cfg.mint.signed_url_ttl, Duration::from_secs(21_600));
     }
 
     #[test]
@@ -297,6 +423,23 @@ mod tests {
                 ("MAX_SERVER_HINTS", "1"),
                 ("MAX_CPU_QUEUE", "5"),
                 ("METRICS_BIND_ADDR", "127.0.0.1:9100"),
+                (
+                    "URL_SIGNING_KEYS",
+                    "nostube-2026-08:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                ),
+                ("ALLOW_UNSIGNED_URLS", "false"),
+                ("REQUIRE_SIGNED_URL_EXPIRY", "false"),
+                ("NIP98_MINT_ENABLED", "true"),
+                ("MINT_PUBLIC_BASE_URL", "https://img.example"),
+                (
+                    "MINT_ALLOWED_ORIGINS",
+                    "https://nostube.example, https://embed.example",
+                ),
+                ("MAX_MINT_BATCH_ITEMS", "25"),
+                ("MINT_RATE_IP_ITEMS_PER_MIN", "40"),
+                ("MINT_RATE_PUBKEY_ITEMS_PER_MIN", "30"),
+                ("NIP98_REPLAY_TTL_SECS", "120"),
+                ("SIGNED_URL_TTL_SECS", "600"),
             ],
             AppCfg::from_env,
         );
@@ -322,6 +465,54 @@ mod tests {
         assert_eq!(cfg.max_server_hints, 1);
         assert_eq!(cfg.cpu_queue_depth, 5);
         assert_eq!(cfg.metrics_bind_addr, Some("127.0.0.1:9100".to_string()));
+        assert!(!cfg.url_signing_keys.is_empty());
+        assert!(!cfg.allow_unsigned_urls);
+        assert!(!cfg.require_signed_url_expiry);
+        assert!(cfg.mint.enabled);
+        assert_eq!(
+            cfg.mint.public_base_url.as_deref(),
+            Some("https://img.example")
+        );
+        assert_eq!(
+            cfg.mint.allowed_origins,
+            vec![
+                "https://nostube.example".to_string(),
+                "https://embed.example".to_string()
+            ]
+        );
+        assert_eq!(cfg.mint.max_batch_items, 25);
+        assert_eq!(cfg.mint.rate_ip_items_per_min, 40);
+        assert_eq!(cfg.mint.rate_pubkey_items_per_min, 30);
+        assert_eq!(cfg.mint.replay_ttl, Duration::from_secs(120));
+        assert_eq!(cfg.mint.signed_url_ttl, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn from_env_rejects_enabled_minting_without_its_required_configuration() {
+        with_env(
+            &[
+                (
+                    "URL_SIGNING_KEYS",
+                    "nostube-2026-08:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                ),
+                ("NIP98_MINT_ENABLED", "true"),
+            ],
+            || assert!(std::panic::catch_unwind(AppCfg::from_env).is_err()),
+        );
+        with_env(
+            &[
+                ("NIP98_MINT_ENABLED", "true"),
+                ("MINT_PUBLIC_BASE_URL", "https://img.example"),
+            ],
+            || assert!(std::panic::catch_unwind(AppCfg::from_env).is_err()),
+        );
+    }
+
+    #[test]
+    fn from_env_rejects_disabling_legacy_routes_without_a_signing_key() {
+        with_env(&[("ALLOW_UNSIGNED_URLS", "false")], || {
+            assert!(std::panic::catch_unwind(AppCfg::from_env).is_err());
+        });
     }
 
     #[test]
