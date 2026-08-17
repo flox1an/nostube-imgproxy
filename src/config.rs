@@ -10,7 +10,7 @@ use std::{path::PathBuf, time::Duration};
 pub struct MintConfig {
     /// Opt-in switch for the public NIP-98 capability-minting endpoint.
     pub enabled: bool,
-    /// Canonical public Lionfish origin used in NIP-98 `u` verification and
+    /// Canonical public image-proxy origin used in NIP-98 `u` verification and
     /// returned signed URLs. Never derive this from an attacker-controlled Host.
     pub public_base_url: Option<String>,
     /// Browser origins allowed to invoke the cross-origin mint endpoint.

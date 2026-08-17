@@ -164,13 +164,13 @@ Signed v1 URLs are the production API:
 /v1/<key-id>/<signature>/thumb/<sha256>[.<extension>]?f=...&rs=...&q=...&xs=...&as=...&exp=<unix-seconds>
 ```
 
-The signature covers the exact raw path and query after `/v1/<key-id>/<signature>`. A browser obtains these URLs through Lionfish's NIP-98-authenticated mint endpoint; it never receives an HMAC key. See [`docs/nostube-signed-url-spec.md`](docs/nostube-signed-url-spec.md) for the batch contract, NIP-98 checks, and rolling migration plan.
+The signature covers the exact raw path and query after `/v1/<key-id>/<signature>`. A browser obtains these URLs through the image proxy's NIP-98-authenticated mint endpoint; it never receives an HMAC key. See [`docs/nostube-signed-url-spec.md`](docs/nostube-signed-url-spec.md) for the batch contract, NIP-98 checks, and rolling migration plan.
 
 ### NIP-98 Batch Minting
 
 When enabled, `POST /v1/mint` accepts a NIP-98-authenticated JSON batch of hash-addressed Blossom media plus one fixed output preset. It returns the corresponding expiring v1 URLs. The mint route is deliberately not a general remote-URL proxy: direct `source_url`, arbitrary directives, and source-server hints are rejected.
 
-`Authorization: Nostr <event>` binds the exact request URL, `POST`, and the SHA-256 of the raw JSON body. Lionfish applies bounded in-memory replay protection and rate limits both peer IP and Nostr pubkey by minted item count.
+`Authorization: Nostr <event>` binds the exact request URL, `POST`, and the SHA-256 of the raw JSON body. The image proxy applies bounded in-memory replay protection and rate limits both peer IP and Nostr pubkey by minted item count.
 
 **Supported Directives:**
 - `f:<format>` - Output format: `jpeg`, `png`, `webp`, `avif`
@@ -217,7 +217,7 @@ Configure via environment variables:
 | `ALLOW_UNSIGNED_URLS` | `true` | Temporary migration switch for legacy `/insecure` and `/thumb` routes |
 | `REQUIRE_SIGNED_URL_EXPIRY` | `true` | Require one signed `exp` Unix-seconds query parameter |
 | `NIP98_MINT_ENABLED` | `false` | Enable the NIP-98-authenticated `POST /v1/mint` endpoint |
-| `MINT_PUBLIC_BASE_URL` | unset | Required canonical Lionfish origin for NIP-98 validation and returned URLs |
+| `MINT_PUBLIC_BASE_URL` | unset | Required canonical image-proxy origin for NIP-98 validation and returned URLs |
 | `MINT_ALLOWED_ORIGINS` | unset | Comma-separated browser origins allowed to call `/v1/mint` |
 | `MAX_MINT_BATCH_ITEMS` | `100`, capped at 100 | Maximum hash-addressed items per mint request |
 | `MINT_RATE_IP_ITEMS_PER_MIN` | `300` | Minted-item budget per peer IP and minute |
