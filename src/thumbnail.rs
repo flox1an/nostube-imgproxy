@@ -468,6 +468,14 @@ async fn extract_thumbnail_with_ffmpeg(
             "5000000",
             "-probesize",
             "5000000",
+            // Frame-parallel decode of certain VP9 streams triggers a known
+            // libavcodec/libvpx assertion failure ("A decoder returned an
+            // unexpected error code. This is a bug, please report it."),
+            // deterministically crashing the decode for that file every time
+            // rather than intermittently. Pinning decode to one thread avoids
+            // the frame-threaded code path entirely.
+            "-threads",
+            "1",
             "-ss",
             "0.5",
             "-f",
