@@ -1,6 +1,6 @@
 [package]
 name = "rust-imgproxy"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 
 [dependencies]
@@ -28,14 +28,14 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 parking_lot = "0.12"
 # `default-features = false` is load-bearing: the `default-formats` feature
 # would activate a dozen extra decoders (exr, dds, hdr, tga, pnm, qoi, ico,
-# bmp, gif, tiff) of which only PNG/JPEG/GIF/TIFF budget memory via
-# `set_limits` — every other default decoder sniffs magic bytes and allocates
-# an unbounded intermediate buffer. `avif-native` (dav1d) is dropped because
-# its decoder runs the full dav1d decode before `image::Limits` can apply.
-# AVIF stays an *output* format via `ravif` (see `transform.rs::encode_image`).
-# `decode_image` enforces the PNG/JPEG/WebP input allowlist at runtime as
+# bmp, tiff) of which only PNG/JPEG/GIF/TIFF budget memory via `set_limits` —
+# every other default decoder sniffs magic bytes and allocates an unbounded
+# intermediate buffer. `avif-native` is dropped because its decoder runs the
+# full dav1d decode before `image::Limits` can apply. AVIF stays an *output*
+# format via `ravif` (see `transform.rs::encode_image`).
+# `decode_image` enforces the PNG/JPEG/WebP/GIF input allowlist at runtime as
 # defense-in-depth against feature unification re-enabling decoders.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 webp = "0.3"
 ravif = "0.13"
 rgb = "0.8"

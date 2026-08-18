@@ -477,10 +477,14 @@ pub fn decode_image(bytes: &[u8], limits: Limits) -> Result<DynamicImage, SvcErr
     // `image`'s default-formats (or a future decoder) without touching this
     // manifest; and `ImageFormat` keeps every enum variant regardless of which
     // decoders are compiled in. A format not on this list is refused *before*
-    // `decode()` runs, so it can never allocate a framebuffer here.
+    // `decode()` runs, so it can never allocate a framebuffer here. GIF is
+    // allowlisted because its decoder budgets memory via `image::Limits`
+    // (unlike most default decoders, which sniff magic bytes and allocate an
+    // unbounded intermediate buffer before any limit applies); `decode()`
+    // yields only the first frame — animation is dropped, not an error.
     if !matches!(
         reader.format(),
-        Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP)
+        Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif)
     ) {
         return Err(SvcError::BadRequest("unsupported source format"));
     }
@@ -1011,21 +1015,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn decode_image_rejects_gif_as_unsupported_source() {
-        // Minimal 1x1 GIF89a: the magic bytes are enough for the content
-        // sniff, but GIF is not on the input allowlist. Two rejections are
-        // permissible — the allowlist firing (`BadRequest`, the intended
-        // mechanism) or the decoder itself refusing (a build with no GIF
-        // decoder) — and the arms below distinguish them. A successful decode
-        // is the contract violation the test pins: "no decode".
-        let gif: &[u8] =
-            b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
-        match decode_image(gif, test_limits()) {
-            Err(SvcError::BadRequest("unsupported source format")) => {} // allowlist fired
-            Err(SvcError::Decode(_)) => {} // decoder refused, still no decode
-            Err(other) => panic!("unexpected rejection: {other:?}"),
-            Ok(_) => panic!("a GIF was decoded: input format allowlist not enforced"),
-        }
+    fn decode_image_accepts_gif_and_yields_the_first_frame() {
+        // Minimal 1x1 GIF89a with a 2-entry global color table (white
+        // pixel). GIF is on the input allowlist because its decoder budgets
+        // memory via `image::Limits`, unlike most default decoders.
+        // `decode()` on a multi-frame source yields only the first frame —
+        // this pins that "first frame, not an error" is the contract, not
+        // full animation support.
+        let gif: &[u8] = &[
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xff, 0xff, 0xff, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0x00, 0x02, 0x01, 0x4c, 0x00, 0x3b,
+        ];
+        let img = decode_image(gif, test_limits()).expect("allowlisted GIF must decode");
+        assert_eq!((img.width(), img.height()), (1, 1));
     }
 
     #[test]
