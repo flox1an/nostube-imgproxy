@@ -457,9 +457,13 @@ async fn extract_thumbnail_with_ffmpeg(
             "error",
             // FFmpeg may contact only our loopback media proxy. Explicit input
             // demuxing below blocks playlist parsing from introducing nested
-            // remote URLs under this otherwise narrow whitelist.
+            // remote URLs under this otherwise narrow whitelist. `tcp` must be
+            // listed explicitly: FFmpeg opens HTTP's transport through the
+            // `tcp` protocol, and without it every range fetch fails with
+            // "Protocol 'tcp' not on whitelist". `https`/`tls` stay excluded so
+            // the loopback proxy remains the only network path.
             "-protocol_whitelist",
-            "file,http",
+            "file,http,tcp",
             "-analyzeduration",
             "5000000",
             "-probesize",
