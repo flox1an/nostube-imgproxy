@@ -7,72 +7,6 @@ use reqwest::Client;
 use std::{path::PathBuf, time::Duration};
 
 #[derive(Clone)]
-pub struct MintConfig {
-    /// Opt-in switch for the public capability-minting endpoint.
-    pub enabled: bool,
-    /// Canonical public image-proxy origin used to construct returned signed
-    /// URLs. Never derive this from an attacker-controlled Host.
-    pub public_base_url: Option<String>,
-    /// Browser origins allowed to invoke the cross-origin mint endpoint via
-    /// CORS. This is a browser-enforced convenience, not authorization: it
-    /// does not stop a non-browser client from calling the endpoint.
-    pub allowed_origins: Vec<String>,
-    /// Each item in a batch costs one token in the per-IP rate limit.
-    pub max_batch_items: usize,
-    /// Per-peer-IP mint-item budget per minute. The endpoint mints URLs only
-    /// for already-public, hash-addressed Blossom media behind a fixed set
-    /// of presets, so this is a flood guard rather than an authorization
-    /// check.
-    pub rate_ip_items_per_min: u32,
-    pub signed_url_ttl: Duration,
-}
-
-fn canonical_http_origin(value: &str, env_name: &str) -> String {
-    let url = url::Url::parse(value).unwrap_or_else(|error| panic!("invalid {env_name}: {error}"));
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        panic!(
-            "{env_name} must be an http(s) origin without credentials, path, query, or fragment"
-        );
-    }
-    url.as_str().trim_end_matches('/').to_owned()
-}
-
-impl MintConfig {
-    fn from_env() -> Self {
-        let public_base_url = std::env::var("MINT_PUBLIC_BASE_URL")
-            .ok()
-            .map(|value| canonical_http_origin(&value, "MINT_PUBLIC_BASE_URL"));
-        let allowed_origins = std::env::var("MINT_ALLOWED_ORIGINS")
-            .ok()
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|origin| !origin.is_empty())
-                    .map(|origin| canonical_http_origin(origin, "MINT_ALLOWED_ORIGINS"))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Self {
-            enabled: env_parsed("MINT_ENABLED", false),
-            public_base_url,
-            allowed_origins,
-            max_batch_items: env_parsed("MAX_MINT_BATCH_ITEMS", 100usize).clamp(1, 100),
-            rate_ip_items_per_min: env_parsed("MINT_RATE_IP_ITEMS_PER_MIN", 300u32).max(1),
-            signed_url_ttl: env_secs("SIGNED_URL_TTL_SECS", 21_600).max(Duration::from_secs(1)),
-        }
-    }
-}
-
-#[derive(Clone)]
 pub struct AppCfg {
     pub bind_addr: String,
     pub cache_dir: PathBuf,
@@ -131,9 +65,11 @@ pub struct AppCfg {
     /// Require `exp=<unix-seconds>` in every signed URL. This is on by default
     /// so leaked capability URLs have a bounded lifetime.
     pub require_signed_url_expiry: bool,
-    /// Public capability-minting endpoint configuration (`POST /v1/mint`).
-    /// Disabled by default.
-    pub mint: MintConfig,
+    /// Registers the unsigned preset-bounded thumbnail route
+    /// (`GET /v1/preset/{preset}/{filename}`). Safe by construction — no
+    /// secret to misconfigure, output shape is fixed to a small published
+    /// preset set — so it is enabled by default.
+    pub preset_thumbnails_enabled: bool,
     /// General per-IP request budget across every image/thumb route, hit or
     /// miss. Generous: a cache hit is cheap to serve.
     pub rate_ip_requests_per_min: u32,
@@ -191,14 +127,6 @@ impl AppCfg {
             panic!("URL_SIGNING_KEYS must be configured when ALLOW_UNSIGNED_URLS=false");
         }
 
-        let mint = MintConfig::from_env();
-        if mint.enabled && url_signing_keys.is_empty() {
-            panic!("URL_SIGNING_KEYS must be configured when MINT_ENABLED=true");
-        }
-        if mint.enabled && mint.public_base_url.is_none() {
-            panic!("MINT_PUBLIC_BASE_URL must be configured when MINT_ENABLED=true");
-        }
-
         Self {
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into()),
             cache_dir: PathBuf::from(std::env::var("CACHE_DIR").unwrap_or_else(|_| "cache".into())),
@@ -235,7 +163,7 @@ impl AppCfg {
             url_signing_keys,
             allow_unsigned_urls,
             require_signed_url_expiry,
-            mint,
+            preset_thumbnails_enabled: env_parsed("PRESET_THUMBNAILS_ENABLED", true),
             rate_ip_requests_per_min: env_parsed("RATE_IP_REQUESTS_PER_MIN", 600u32).max(1),
             rate_ip_image_generations_per_min: env_parsed(
                 "RATE_IP_IMAGE_GENERATIONS_PER_MIN",
@@ -330,11 +258,7 @@ mod tests {
         "URL_SIGNING_KEYS",
         "ALLOW_UNSIGNED_URLS",
         "REQUIRE_SIGNED_URL_EXPIRY",
-        "MINT_ENABLED",
-        "MINT_PUBLIC_BASE_URL",
-        "MINT_ALLOWED_ORIGINS",
-        "MAX_MINT_BATCH_ITEMS",
-        "MINT_RATE_IP_ITEMS_PER_MIN",
+        "PRESET_THUMBNAILS_ENABLED",
         "SIGNED_URL_TTL_SECS",
         "RATE_IP_REQUESTS_PER_MIN",
         "RATE_IP_IMAGE_GENERATIONS_PER_MIN",
@@ -402,12 +326,7 @@ mod tests {
         assert!(cfg.url_signing_keys.is_empty());
         assert!(cfg.allow_unsigned_urls);
         assert!(cfg.require_signed_url_expiry);
-        assert!(!cfg.mint.enabled);
-        assert_eq!(cfg.mint.public_base_url, None);
-        assert!(cfg.mint.allowed_origins.is_empty());
-        assert_eq!(cfg.mint.max_batch_items, 100);
-        assert_eq!(cfg.mint.rate_ip_items_per_min, 300);
-        assert_eq!(cfg.mint.signed_url_ttl, Duration::from_secs(21_600));
+        assert!(cfg.preset_thumbnails_enabled);
         assert_eq!(cfg.rate_ip_requests_per_min, 600);
         assert_eq!(cfg.rate_ip_image_generations_per_min, 30);
         assert_eq!(cfg.rate_ip_video_generations_per_min, 5);
@@ -453,15 +372,7 @@ mod tests {
                 ),
                 ("ALLOW_UNSIGNED_URLS", "false"),
                 ("REQUIRE_SIGNED_URL_EXPIRY", "false"),
-                ("MINT_ENABLED", "true"),
-                ("MINT_PUBLIC_BASE_URL", "https://img.example"),
-                (
-                    "MINT_ALLOWED_ORIGINS",
-                    "https://nostube.example, https://embed.example",
-                ),
-                ("MAX_MINT_BATCH_ITEMS", "25"),
-                ("MINT_RATE_IP_ITEMS_PER_MIN", "40"),
-                ("SIGNED_URL_TTL_SECS", "600"),
+                ("PRESET_THUMBNAILS_ENABLED", "false"),
                 ("RATE_IP_REQUESTS_PER_MIN", "50"),
                 ("RATE_IP_IMAGE_GENERATIONS_PER_MIN", "10"),
                 ("RATE_IP_VIDEO_GENERATIONS_PER_MIN", "2"),
@@ -493,45 +404,10 @@ mod tests {
         assert!(!cfg.url_signing_keys.is_empty());
         assert!(!cfg.allow_unsigned_urls);
         assert!(!cfg.require_signed_url_expiry);
-        assert!(cfg.mint.enabled);
-        assert_eq!(
-            cfg.mint.public_base_url.as_deref(),
-            Some("https://img.example")
-        );
-        assert_eq!(
-            cfg.mint.allowed_origins,
-            vec![
-                "https://nostube.example".to_string(),
-                "https://embed.example".to_string()
-            ]
-        );
-        assert_eq!(cfg.mint.max_batch_items, 25);
-        assert_eq!(cfg.mint.rate_ip_items_per_min, 40);
-        assert_eq!(cfg.mint.signed_url_ttl, Duration::from_secs(600));
+        assert!(!cfg.preset_thumbnails_enabled);
         assert_eq!(cfg.rate_ip_requests_per_min, 50);
         assert_eq!(cfg.rate_ip_image_generations_per_min, 10);
         assert_eq!(cfg.rate_ip_video_generations_per_min, 2);
-    }
-
-    #[test]
-    fn from_env_rejects_enabled_minting_without_its_required_configuration() {
-        with_env(
-            &[
-                (
-                    "URL_SIGNING_KEYS",
-                    "nostube-2026-08:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
-                ),
-                ("MINT_ENABLED", "true"),
-            ],
-            || assert!(std::panic::catch_unwind(AppCfg::from_env).is_err()),
-        );
-        with_env(
-            &[
-                ("MINT_ENABLED", "true"),
-                ("MINT_PUBLIC_BASE_URL", "https://img.example"),
-            ],
-            || assert!(std::panic::catch_unwind(AppCfg::from_env).is_err()),
-        );
     }
 
     #[test]

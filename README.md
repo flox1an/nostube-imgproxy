@@ -157,18 +157,33 @@ Legacy URLs are enabled only while `ALLOW_UNSIGNED_URLS=true`:
 /thumb/<sha256>[.<extension>]?f=...&rs=...&q=...&xs=...&as=...
 ```
 
-Signed v1 URLs are the production API:
+Signed v1 URLs remain available for trusted, arbitrary-directive use (e.g. an internal tool minting a one-off crop) once a signing key is configured:
 
 ```text
 /v1/<key-id>/<signature>/img/<directives>/plain/<percent-encoded-source-url>?exp=<unix-seconds>
 /v1/<key-id>/<signature>/thumb/<sha256>[.<extension>]?f=...&rs=...&q=...&xs=...&as=...&exp=<unix-seconds>
 ```
 
-The signature covers the exact raw path and query after `/v1/<key-id>/<signature>`. A browser obtains these URLs through the image proxy's public mint endpoint; it never receives an HMAC key. See [`docs/nostube-signed-url-spec.md`](docs/nostube-signed-url-spec.md) for the batch contract and rolling migration plan.
+The signature covers the exact raw path and query after `/v1/<key-id>/<signature>`. Producing a signed URL requires the HMAC secret, so it is never done in a browser.
 
-### Batch Minting
+### Preset Thumbnails
 
-When enabled, `POST /v1/mint` accepts an unauthenticated JSON batch of hash-addressed Blossom media plus one fixed output preset. It returns the corresponding expiring v1 URLs. The mint route is deliberately not a general remote-URL proxy: direct `source_url`, arbitrary directives, and source-server hints are rejected. It is safe to leave unauthenticated because it only ever mints URLs for already-public, hash-addressed Blossom media behind a handful of fixed presets — the same bytes anyone can already fetch straight from a Blossom server. Admission is a per-IP flood guard, not an authorization check, which keeps the endpoint usable by anonymous browsers, embeds, and crawlers.
+```text
+/v1/preset/<preset>/<sha256>[.<extension>]?xs=...&as=...
+```
+
+```bash
+curl "http://127.0.0.1:8080/v1/preset/feed-preview-v1/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.webp"
+```
+
+This is the production API for browser clients such as Nostube. It is unauthenticated by design, and safe to leave that way: `<preset>` selects one of a small, published set of fixed output shapes (below), and `<sha256>` is a Blossom content hash — both are already public, so there is nothing to authorize. A client builds this URL directly; there is no signing or minting round-trip. Admission is a per-IP tiered rate limit (see `RATE_IP_*` below), not an authorization check, which keeps the route usable by anonymous browsers, embeds, and crawlers.
+
+**Presets:**
+- `feed-preview-v1`: WebP, quality 82, fit 480×480
+- `profile-avatar-v1`: WebP, quality 85, fill 160×160
+- `embed-card-v1`: WebP, quality 82, fit 1200×630
+
+No other directive may be supplied on this route: `f`, `rs`, `q`, `width`, and `height` query parameters are rejected outright (`400`) rather than silently ignored. Only `xs=` (server hints) and `as=` (author pubkey) are accepted, for Blossom server discovery. See [`docs/nostube-preset-thumbnails-spec.md`](docs/nostube-preset-thumbnails-spec.md) for the Nostube client integration contract.
 
 **Supported Directives:**
 - `f:<format>` - Output format: `jpeg`, `png`, `webp`, `avif`
@@ -214,12 +229,7 @@ Configure via environment variables:
 | `URL_SIGNING_KEYS` | unset | Comma-separated `key-id:base64url-secret` HMAC keys; secrets must decode to at least 32 bytes |
 | `ALLOW_UNSIGNED_URLS` | `true` | Temporary migration switch for legacy `/insecure` and `/thumb` routes |
 | `REQUIRE_SIGNED_URL_EXPIRY` | `true` | Require one signed `exp` Unix-seconds query parameter |
-| `MINT_ENABLED` | `false` | Enable the public `POST /v1/mint` endpoint |
-| `MINT_PUBLIC_BASE_URL` | unset | Required canonical image-proxy origin used to construct returned URLs |
-| `MINT_ALLOWED_ORIGINS` | unset | Comma-separated browser origins allowed to call `/v1/mint` |
-| `MAX_MINT_BATCH_ITEMS` | `100`, capped at 100 | Maximum hash-addressed items per mint request |
-| `MINT_RATE_IP_ITEMS_PER_MIN` | `300` | Minted-item budget per peer IP and minute |
-| `SIGNED_URL_TTL_SECS` | `21600` | Lifetime for minted signed URLs; expiry is bucketed for cache reuse |
+| `PRESET_THUMBNAILS_ENABLED` | `true` | Enable the unsigned `GET /v1/preset/{preset}/{filename}` route |
 | `RATE_IP_REQUESTS_PER_MIN` | `600` | Per-IP budget across every image/thumb request, cache hit or miss |
 | `RATE_IP_IMAGE_GENERATIONS_PER_MIN` | `30` | Per-IP budget for cache-miss image decode/resize/encode work |
 | `RATE_IP_VIDEO_GENERATIONS_PER_MIN` | `5` | Per-IP budget for cache-miss FFmpeg video-thumbnail work |

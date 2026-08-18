@@ -1,14 +1,12 @@
 use axum::{
     body::Body,
     error_handling::HandleErrorLayer,
-    extract::{
-        ConnectInfo, DefaultBodyLimit, MatchedPath, OriginalUri, Path as AxPath, Request, State,
-    },
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    extract::{ConnectInfo, MatchedPath, OriginalUri, Path as AxPath, Request, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
+    routing::get,
+    Router,
 };
 use axum_extra::extract::Query;
 use bytes::Bytes;
@@ -19,7 +17,7 @@ use tower::{
 };
 use tower_http::{
     catch_panic::CatchPanicLayer,
-    cors::{AllowOrigin, Any, CorsLayer},
+    cors::{Any, CorsLayer},
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -35,8 +33,8 @@ use crate::{
     error::SvcError,
     fetch::read_body_capped,
     metrics,
-    mint::{MintResponse, MintState},
     network_policy::validate_untrusted_url,
+    preset::Preset,
     ratelimit::MediaRateLimiters,
     signing::signature_error,
     singleflight::SingleFlight,
@@ -59,13 +57,6 @@ pub struct CombinedState {
     /// Three-tier per-IP flood guard: general requests, image-generation
     /// cache misses, and video-generation cache misses.
     pub media_rate_limits: Arc<MediaRateLimiters>,
-}
-
-#[derive(Clone)]
-struct MintRouterState {
-    cfg: crate::config::MintConfig,
-    signing_keys: crate::signing::UrlSigningKeys,
-    state: MintState,
 }
 
 impl CombinedState {
@@ -98,13 +89,7 @@ pub fn create_router(
     let max_inflight = state.cfg.max_inflight_requests;
     let signed_urls_enabled = !state.cfg.url_signing_keys.is_empty();
     let allow_unsigned_urls = state.cfg.allow_unsigned_urls;
-    let mint_enabled = state.cfg.mint.enabled;
-    let mint_origins = state.cfg.mint.allowed_origins.clone();
-    let mint_state = MintRouterState {
-        cfg: state.cfg.mint.clone(),
-        signing_keys: state.cfg.url_signing_keys.clone(),
-        state: MintState::new(state.cfg.mint.rate_ip_items_per_min),
-    };
+    let preset_thumbnails_enabled = state.cfg.preset_thumbnails_enabled;
     let combined = CombinedState::new(state, thumbnail_state, blossom_state);
     let mut images = Router::new();
     if signed_urls_enabled {
@@ -125,6 +110,13 @@ pub fn create_router(
             .route("/insecure/{*rest}", get(handle_insecure))
             .route("/thumb/{filename}", get(handle_thumb));
     }
+    if preset_thumbnails_enabled {
+        images = images.route("/v1/preset/{preset}/{filename}", get(handle_preset_thumb));
+    } else {
+        tracing::warn!(
+            "PRESET_THUMBNAILS_ENABLED=false; the unsigned preset thumbnail route is disabled"
+        );
+    }
     let images = images.layer(
         CorsLayer::new()
             .allow_origin(Any)
@@ -132,32 +124,8 @@ pub fn create_router(
             .allow_headers(Any),
     );
 
-    let mut mint = Router::new();
-    if mint_enabled {
-        mint = Router::new()
-            .route("/v1/mint", post(handle_mint))
-            .with_state(mint_state)
-            .layer(DefaultBodyLimit::max(64 * 1024));
-        if !mint_origins.is_empty() {
-            let origins = mint_origins
-                .iter()
-                .map(|origin| {
-                    HeaderValue::from_str(origin)
-                        .unwrap_or_else(|_| panic!("invalid MINT_ALLOWED_ORIGINS value"))
-                })
-                .collect::<Vec<_>>();
-            mint = mint.layer(
-                CorsLayer::new()
-                    .allow_origin(AllowOrigin::list(origins))
-                    .allow_methods([Method::POST])
-                    .allow_headers([header::CONTENT_TYPE]),
-            );
-        }
-    }
-
     Router::new()
         .merge(images)
-        .merge(mint)
         .route("/health", get(health_check))
         .with_state(combined)
         // Outer → inner: Trace, metrics, panic-to-500, timeout, load-shed,
@@ -210,33 +178,52 @@ struct ThumbQuery {
     height: Option<u32>,
 }
 
-/// Mint a bounded batch of short-lived v1 capability URLs.
+/// Query parameters accepted by the unsigned preset thumbnail route. No
+/// directive fields are accepted: `deny_unknown_fields` rejects `f`, `rs`,
+/// `q`, `width`, or `height` outright, so a caller cannot smuggle a
+/// directive override past the preset name. Only Blossom server-discovery
+/// hints are meaningful here.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresetQuery {
+    /// Server hints — hostnames or full URLs (xs= can repeat)
+    #[serde(rename = "xs", default)]
+    server_hints: Vec<String>,
+
+    /// Author pubkey (npub or hex) for kind 10063 relay lookup
+    #[serde(rename = "as")]
+    author_pubkey: Option<String>,
+}
+
+/// Unsigned, fixed-preset Blossom thumbnail route: `GET
+/// /v1/preset/{preset}/{filename}`.
 ///
-/// Deliberately unauthenticated: the batch may only reference already-public,
-/// hash-addressed Blossom media through a fixed preset, so admission is a
-/// per-IP flood guard rather than an authorization check. This keeps the
-/// endpoint usable from anonymous browsers, embeds, and crawlers, none of
-/// which can hold a Nostr signing key.
-async fn handle_mint(
-    State(mint): State<MintRouterState>,
+/// Deliberately unauthenticated and un-minted: the preset name is the only
+/// server-authoritative source of output directives, so there is no open
+/// value space for a client to abuse. Admission is the same per-IP tiered
+/// rate limiter every other image/thumb route uses.
+async fn handle_preset_thumb(
+    State(state): State<CombinedState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    body: Bytes,
-) -> Result<Json<MintResponse>, SvcError> {
-    let request =
-        serde_json::from_slice(&body).map_err(|_| SvcError::BadRequest("invalid mint request"))?;
-    MintState::validate_request(&request, &mint.cfg)?;
-    mint.state
-        .admit(
-            peer.ip(),
-            u32::try_from(request.items.len())
-                .map_err(|_| SvcError::BadRequest("invalid mint batch size"))?,
-        )
-        .inspect_err(|_| metrics::record_rate_limit_rejection("mint"))?;
-    Ok(Json(mint.state.mint(
-        request,
-        &mint.signing_keys,
-        &mint.cfg,
-    )?))
+    AxPath((preset, filename)): AxPath<(String, String)>,
+    Query(params): Query<PresetQuery>,
+    request_headers: HeaderMap,
+) -> Result<Response, SvcError> {
+    let preset = Preset::parse(&preset).ok_or(SvcError::BadRequest("unknown preset"))?;
+    let hints = BlossomHints {
+        server_hints: &params.server_hints,
+        author_pubkey: params.author_pubkey.as_deref(),
+    };
+    handle_thumb_request(
+        state,
+        filename,
+        preset.directives(),
+        hints,
+        request_headers,
+        None,
+        peer.ip(),
+    )
+    .await
 }
 /// Simple health check endpoint
 async fn health_check() -> &'static str {
@@ -606,7 +593,21 @@ async fn handle_thumb(
     Query(params): Query<ThumbQuery>,
     request_headers: HeaderMap,
 ) -> Result<Response, SvcError> {
-    handle_thumb_request(state, filename, params, request_headers, None, peer.ip()).await
+    let dirs = parse_thumb_params(&params, state.app.cfg.max_image_dimension)?;
+    let hints = BlossomHints {
+        server_hints: &params.server_hints,
+        author_pubkey: params.author_pubkey.as_deref(),
+    };
+    handle_thumb_request(
+        state,
+        filename,
+        dirs,
+        hints,
+        request_headers,
+        None,
+        peer.ip(),
+    )
+    .await
 }
 
 /// Versioned signed Blossom thumbnail route.
@@ -619,13 +620,36 @@ async fn handle_signed_thumb(
     request_headers: HeaderMap,
 ) -> Result<Response, SvcError> {
     let expiry = verify_signed_request(&state, &uri, &key_id, &signature, "/thumb/")?;
-    handle_thumb_request(state, filename, params, request_headers, expiry, peer.ip()).await
+    let dirs = parse_thumb_params(&params, state.app.cfg.max_image_dimension)?;
+    let hints = BlossomHints {
+        server_hints: &params.server_hints,
+        author_pubkey: params.author_pubkey.as_deref(),
+    };
+    handle_thumb_request(
+        state,
+        filename,
+        dirs,
+        hints,
+        request_headers,
+        expiry,
+        peer.ip(),
+    )
+    .await
+}
+
+/// Which Blossom servers to try for a hash, gathered from optional request
+/// hints. Bundled so `handle_thumb_request` stays under clippy's argument
+/// count lint.
+struct BlossomHints<'a> {
+    server_hints: &'a [String],
+    author_pubkey: Option<&'a str>,
 }
 
 async fn handle_thumb_request(
     state: CombinedState,
     filename: String,
-    params: ThumbQuery,
+    dirs: Directives,
+    hints: BlossomHints<'_>,
     request_headers: HeaderMap,
     signed_expiry: Option<std::time::SystemTime>,
     peer_ip: IpAddr,
@@ -643,8 +667,6 @@ async fn handle_thumb_request(
     let is_video = ext
         .as_deref()
         .is_some_and(|extension| is_video_url(&format!("{hash}.{extension}")));
-
-    let dirs = parse_thumb_params(&params, state.app.cfg.max_image_dimension)?;
 
     state
         .media_rate_limits
@@ -681,7 +703,7 @@ async fn handle_thumb_request(
         })?;
 
     // Get author servers if pubkey provided
-    let author_servers = if let Some(pubkey) = &params.author_pubkey {
+    let author_servers = if let Some(pubkey) = hints.author_pubkey {
         match state.blossom.get_author_servers(pubkey).await {
             Ok(s) => Some(s),
             Err(e) => {
@@ -699,10 +721,10 @@ async fn handle_thumb_request(
 
     // Combine servers: xs (highest priority) -> as -> fallback
     let servers = combine_server_lists(
-        if params.server_hints.is_empty() {
+        if hints.server_hints.is_empty() {
             None
         } else {
-            Some(&params.server_hints)
+            Some(hints.server_hints)
         },
         author_servers.as_deref(),
         &state.app.cfg.blossom_fallback_servers,
@@ -887,71 +909,5 @@ mod tests {
 
         assert!(!video.cacheable());
         assert!(image.cacheable());
-    }
-
-    fn mint_router_state() -> MintRouterState {
-        MintRouterState {
-            cfg: crate::config::MintConfig {
-                enabled: true,
-                public_base_url: Some("https://img.example".into()),
-                allowed_origins: vec!["https://nostube.example".into()],
-                max_batch_items: 100,
-                rate_ip_items_per_min: 10,
-                signed_url_ttl: std::time::Duration::from_secs(21_600),
-            },
-            signing_keys: crate::signing::UrlSigningKeys::parse(
-                "nostube-2026-08:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
-            )
-            .unwrap(),
-            state: MintState::new(10),
-        }
-    }
-
-    #[tokio::test]
-    async fn mint_handler_returns_signed_urls_without_authentication() {
-        let body = Bytes::from_static(
-            br#"{"preset":"feed-preview-v1","items":[{"id":"event:1:media:0","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","extension":"webp"}]}"#,
-        );
-
-        let Json(response) = handle_mint(
-            State(mint_router_state()),
-            ConnectInfo("203.0.113.10:443".parse().unwrap()),
-            body,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.items.len(), 1);
-        assert_eq!(response.items[0].id, "event:1:media:0");
-        assert!(response.items[0]
-            .url
-            .starts_with("https://img.example/v1/nostube-2026-08/"));
-    }
-
-    #[tokio::test]
-    async fn mint_handler_enforces_the_per_ip_item_rate_limit() {
-        let body = Bytes::from_static(
-            br#"{"preset":"feed-preview-v1","items":[{"id":"event:1:media:0","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","extension":"webp"}]}"#,
-        );
-        let mut cfg = mint_router_state();
-        cfg.state = MintState::new(1);
-
-        let _ = handle_mint(
-            State(cfg.clone()),
-            ConnectInfo("203.0.113.10:443".parse().unwrap()),
-            body.clone(),
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            handle_mint(
-                State(cfg),
-                ConnectInfo("203.0.113.10:443".parse().unwrap()),
-                body,
-            )
-            .await,
-            Err(SvcError::RateLimited)
-        ));
     }
 }
