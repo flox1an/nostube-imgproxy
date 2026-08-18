@@ -95,6 +95,14 @@ lazy_static! {
         &["result"]
     )
     .unwrap();
+    /// Per-IP rate-limit rejections, by tier. Exposes abuse pressure and
+    /// which budget is binding without placing attacker IPs in labels.
+    pub static ref RATE_LIMIT_REJECTIONS_TOTAL: CounterVec = register_counter_vec!(
+        "imgproxy_rate_limit_rejections_total",
+        "Requests rejected by a per-IP rate limit, by tier",
+        &["tier"]
+    )
+    .unwrap();
 
 }
 
@@ -184,6 +192,12 @@ pub fn record_signature_verification(result: &str) {
     SIGNATURE_VERIFICATIONS_TOTAL
         .with_label_values(&[result])
         .inc();
+}
+
+/// Record a per-IP rate-limit rejection for `tier` (e.g. `mint`, `request`,
+/// `image_generation`, `video_generation`).
+pub fn record_rate_limit_rejection(tier: &str) {
+    RATE_LIMIT_REJECTIONS_TOTAL.with_label_values(&[tier]).inc();
 }
 
 #[cfg(test)]

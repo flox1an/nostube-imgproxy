@@ -164,13 +164,11 @@ Signed v1 URLs are the production API:
 /v1/<key-id>/<signature>/thumb/<sha256>[.<extension>]?f=...&rs=...&q=...&xs=...&as=...&exp=<unix-seconds>
 ```
 
-The signature covers the exact raw path and query after `/v1/<key-id>/<signature>`. A browser obtains these URLs through the image proxy's NIP-98-authenticated mint endpoint; it never receives an HMAC key. See [`docs/nostube-signed-url-spec.md`](docs/nostube-signed-url-spec.md) for the batch contract, NIP-98 checks, and rolling migration plan.
+The signature covers the exact raw path and query after `/v1/<key-id>/<signature>`. A browser obtains these URLs through the image proxy's public mint endpoint; it never receives an HMAC key. See [`docs/nostube-signed-url-spec.md`](docs/nostube-signed-url-spec.md) for the batch contract and rolling migration plan.
 
-### NIP-98 Batch Minting
+### Batch Minting
 
-When enabled, `POST /v1/mint` accepts a NIP-98-authenticated JSON batch of hash-addressed Blossom media plus one fixed output preset. It returns the corresponding expiring v1 URLs. The mint route is deliberately not a general remote-URL proxy: direct `source_url`, arbitrary directives, and source-server hints are rejected.
-
-`Authorization: Nostr <event>` binds the exact request URL, `POST`, and the SHA-256 of the raw JSON body. The image proxy applies bounded in-memory replay protection and rate limits both peer IP and Nostr pubkey by minted item count.
+When enabled, `POST /v1/mint` accepts an unauthenticated JSON batch of hash-addressed Blossom media plus one fixed output preset. It returns the corresponding expiring v1 URLs. The mint route is deliberately not a general remote-URL proxy: direct `source_url`, arbitrary directives, and source-server hints are rejected. It is safe to leave unauthenticated because it only ever mints URLs for already-public, hash-addressed Blossom media behind a handful of fixed presets — the same bytes anyone can already fetch straight from a Blossom server. Admission is a per-IP flood guard, not an authorization check, which keeps the endpoint usable by anonymous browsers, embeds, and crawlers.
 
 **Supported Directives:**
 - `f:<format>` - Output format: `jpeg`, `png`, `webp`, `avif`
@@ -216,14 +214,15 @@ Configure via environment variables:
 | `URL_SIGNING_KEYS` | unset | Comma-separated `key-id:base64url-secret` HMAC keys; secrets must decode to at least 32 bytes |
 | `ALLOW_UNSIGNED_URLS` | `true` | Temporary migration switch for legacy `/insecure` and `/thumb` routes |
 | `REQUIRE_SIGNED_URL_EXPIRY` | `true` | Require one signed `exp` Unix-seconds query parameter |
-| `NIP98_MINT_ENABLED` | `false` | Enable the NIP-98-authenticated `POST /v1/mint` endpoint |
-| `MINT_PUBLIC_BASE_URL` | unset | Required canonical image-proxy origin for NIP-98 validation and returned URLs |
+| `MINT_ENABLED` | `false` | Enable the public `POST /v1/mint` endpoint |
+| `MINT_PUBLIC_BASE_URL` | unset | Required canonical image-proxy origin used to construct returned URLs |
 | `MINT_ALLOWED_ORIGINS` | unset | Comma-separated browser origins allowed to call `/v1/mint` |
 | `MAX_MINT_BATCH_ITEMS` | `100`, capped at 100 | Maximum hash-addressed items per mint request |
 | `MINT_RATE_IP_ITEMS_PER_MIN` | `300` | Minted-item budget per peer IP and minute |
-| `MINT_RATE_PUBKEY_ITEMS_PER_MIN` | `120` | Minted-item budget per Nostr pubkey and minute |
-| `NIP98_REPLAY_TTL_SECS` | `90`, minimum 60 | In-memory NIP-98 event replay retention |
 | `SIGNED_URL_TTL_SECS` | `21600` | Lifetime for minted signed URLs; expiry is bucketed for cache reuse |
+| `RATE_IP_REQUESTS_PER_MIN` | `600` | Per-IP budget across every image/thumb request, cache hit or miss |
+| `RATE_IP_IMAGE_GENERATIONS_PER_MIN` | `30` | Per-IP budget for cache-miss image decode/resize/encode work |
+| `RATE_IP_VIDEO_GENERATIONS_PER_MIN` | `5` | Per-IP budget for cache-miss FFmpeg video-thumbnail work |
 | `RUST_LOG` | `info` | Log level |
 
 Blossom candidate failures are retained only in memory, per candidate URL, up to 10,000 entries.

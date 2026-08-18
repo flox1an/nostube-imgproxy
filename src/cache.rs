@@ -430,8 +430,6 @@ mod tests {
                 allowed_origins: Vec::new(),
                 max_batch_items: 100,
                 rate_ip_items_per_min: 300,
-                rate_pubkey_items_per_min: 120,
-                replay_ttl: Duration::from_secs(90),
                 signed_url_ttl: Duration::from_secs(21_600),
             },
             cpu_concurrency: 1,
@@ -445,6 +443,9 @@ mod tests {
             cpu_queue_depth: 64,
             metrics_bind_addr: None,
             max_ffmpeg_concurrent: 1,
+            rate_ip_requests_per_min: 600,
+            rate_ip_image_generations_per_min: 30,
+            rate_ip_video_generations_per_min: 5,
         }
     }
 

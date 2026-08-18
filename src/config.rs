@@ -8,18 +8,22 @@ use std::{path::PathBuf, time::Duration};
 
 #[derive(Clone)]
 pub struct MintConfig {
-    /// Opt-in switch for the public NIP-98 capability-minting endpoint.
+    /// Opt-in switch for the public capability-minting endpoint.
     pub enabled: bool,
-    /// Canonical public image-proxy origin used in NIP-98 `u` verification and
-    /// returned signed URLs. Never derive this from an attacker-controlled Host.
+    /// Canonical public image-proxy origin used to construct returned signed
+    /// URLs. Never derive this from an attacker-controlled Host.
     pub public_base_url: Option<String>,
-    /// Browser origins allowed to invoke the cross-origin mint endpoint.
+    /// Browser origins allowed to invoke the cross-origin mint endpoint via
+    /// CORS. This is a browser-enforced convenience, not authorization: it
+    /// does not stop a non-browser client from calling the endpoint.
     pub allowed_origins: Vec<String>,
-    /// Each item in a batch costs one token in both rate-limit buckets.
+    /// Each item in a batch costs one token in the per-IP rate limit.
     pub max_batch_items: usize,
+    /// Per-peer-IP mint-item budget per minute. The endpoint mints URLs only
+    /// for already-public, hash-addressed Blossom media behind a fixed set
+    /// of presets, so this is a flood guard rather than an authorization
+    /// check.
     pub rate_ip_items_per_min: u32,
-    pub rate_pubkey_items_per_min: u32,
-    pub replay_ttl: Duration,
     pub signed_url_ttl: Duration,
 }
 
@@ -58,13 +62,11 @@ impl MintConfig {
             .unwrap_or_default();
 
         Self {
-            enabled: env_parsed("NIP98_MINT_ENABLED", false),
+            enabled: env_parsed("MINT_ENABLED", false),
             public_base_url,
             allowed_origins,
             max_batch_items: env_parsed("MAX_MINT_BATCH_ITEMS", 100usize).clamp(1, 100),
             rate_ip_items_per_min: env_parsed("MINT_RATE_IP_ITEMS_PER_MIN", 300u32).max(1),
-            rate_pubkey_items_per_min: env_parsed("MINT_RATE_PUBKEY_ITEMS_PER_MIN", 120u32).max(1),
-            replay_ttl: env_secs("NIP98_REPLAY_TTL_SECS", 90).max(Duration::from_secs(60)),
             signed_url_ttl: env_secs("SIGNED_URL_TTL_SECS", 21_600).max(Duration::from_secs(1)),
         }
     }
@@ -129,8 +131,17 @@ pub struct AppCfg {
     /// Require `exp=<unix-seconds>` in every signed URL. This is on by default
     /// so leaked capability URLs have a bounded lifetime.
     pub require_signed_url_expiry: bool,
-    /// NIP-98-authenticated mint endpoint configuration. Disabled by default.
+    /// Public capability-minting endpoint configuration (`POST /v1/mint`).
+    /// Disabled by default.
     pub mint: MintConfig,
+    /// General per-IP request budget across every image/thumb route, hit or
+    /// miss. Generous: a cache hit is cheap to serve.
+    pub rate_ip_requests_per_min: u32,
+    /// Per-IP budget for cache-miss image decode/resize/encode work.
+    pub rate_ip_image_generations_per_min: u32,
+    /// Per-IP budget for cache-miss video-thumbnail FFmpeg work — the most
+    /// expensive path per request, budgeted far below image generation.
+    pub rate_ip_video_generations_per_min: u32,
 }
 
 /// Read a `usize`/`u32`/`u64` style setting, falling back on absent or
@@ -182,10 +193,10 @@ impl AppCfg {
 
         let mint = MintConfig::from_env();
         if mint.enabled && url_signing_keys.is_empty() {
-            panic!("URL_SIGNING_KEYS must be configured when NIP98_MINT_ENABLED=true");
+            panic!("URL_SIGNING_KEYS must be configured when MINT_ENABLED=true");
         }
         if mint.enabled && mint.public_base_url.is_none() {
-            panic!("MINT_PUBLIC_BASE_URL must be configured when NIP98_MINT_ENABLED=true");
+            panic!("MINT_PUBLIC_BASE_URL must be configured when MINT_ENABLED=true");
         }
 
         Self {
@@ -225,6 +236,17 @@ impl AppCfg {
             allow_unsigned_urls,
             require_signed_url_expiry,
             mint,
+            rate_ip_requests_per_min: env_parsed("RATE_IP_REQUESTS_PER_MIN", 600u32).max(1),
+            rate_ip_image_generations_per_min: env_parsed(
+                "RATE_IP_IMAGE_GENERATIONS_PER_MIN",
+                30u32,
+            )
+            .max(1),
+            rate_ip_video_generations_per_min: env_parsed(
+                "RATE_IP_VIDEO_GENERATIONS_PER_MIN",
+                5u32,
+            )
+            .max(1),
         }
     }
 
@@ -308,14 +330,15 @@ mod tests {
         "URL_SIGNING_KEYS",
         "ALLOW_UNSIGNED_URLS",
         "REQUIRE_SIGNED_URL_EXPIRY",
-        "NIP98_MINT_ENABLED",
+        "MINT_ENABLED",
         "MINT_PUBLIC_BASE_URL",
         "MINT_ALLOWED_ORIGINS",
         "MAX_MINT_BATCH_ITEMS",
         "MINT_RATE_IP_ITEMS_PER_MIN",
-        "MINT_RATE_PUBKEY_ITEMS_PER_MIN",
-        "NIP98_REPLAY_TTL_SECS",
         "SIGNED_URL_TTL_SECS",
+        "RATE_IP_REQUESTS_PER_MIN",
+        "RATE_IP_IMAGE_GENERATIONS_PER_MIN",
+        "RATE_IP_VIDEO_GENERATIONS_PER_MIN",
     ];
 
     fn clear_managed_vars() {
@@ -384,9 +407,10 @@ mod tests {
         assert!(cfg.mint.allowed_origins.is_empty());
         assert_eq!(cfg.mint.max_batch_items, 100);
         assert_eq!(cfg.mint.rate_ip_items_per_min, 300);
-        assert_eq!(cfg.mint.rate_pubkey_items_per_min, 120);
-        assert_eq!(cfg.mint.replay_ttl, Duration::from_secs(90));
         assert_eq!(cfg.mint.signed_url_ttl, Duration::from_secs(21_600));
+        assert_eq!(cfg.rate_ip_requests_per_min, 600);
+        assert_eq!(cfg.rate_ip_image_generations_per_min, 30);
+        assert_eq!(cfg.rate_ip_video_generations_per_min, 5);
     }
 
     #[test]
@@ -429,7 +453,7 @@ mod tests {
                 ),
                 ("ALLOW_UNSIGNED_URLS", "false"),
                 ("REQUIRE_SIGNED_URL_EXPIRY", "false"),
-                ("NIP98_MINT_ENABLED", "true"),
+                ("MINT_ENABLED", "true"),
                 ("MINT_PUBLIC_BASE_URL", "https://img.example"),
                 (
                     "MINT_ALLOWED_ORIGINS",
@@ -437,9 +461,10 @@ mod tests {
                 ),
                 ("MAX_MINT_BATCH_ITEMS", "25"),
                 ("MINT_RATE_IP_ITEMS_PER_MIN", "40"),
-                ("MINT_RATE_PUBKEY_ITEMS_PER_MIN", "30"),
-                ("NIP98_REPLAY_TTL_SECS", "120"),
                 ("SIGNED_URL_TTL_SECS", "600"),
+                ("RATE_IP_REQUESTS_PER_MIN", "50"),
+                ("RATE_IP_IMAGE_GENERATIONS_PER_MIN", "10"),
+                ("RATE_IP_VIDEO_GENERATIONS_PER_MIN", "2"),
             ],
             AppCfg::from_env,
         );
@@ -482,9 +507,10 @@ mod tests {
         );
         assert_eq!(cfg.mint.max_batch_items, 25);
         assert_eq!(cfg.mint.rate_ip_items_per_min, 40);
-        assert_eq!(cfg.mint.rate_pubkey_items_per_min, 30);
-        assert_eq!(cfg.mint.replay_ttl, Duration::from_secs(120));
         assert_eq!(cfg.mint.signed_url_ttl, Duration::from_secs(600));
+        assert_eq!(cfg.rate_ip_requests_per_min, 50);
+        assert_eq!(cfg.rate_ip_image_generations_per_min, 10);
+        assert_eq!(cfg.rate_ip_video_generations_per_min, 2);
     }
 
     #[test]
@@ -495,13 +521,13 @@ mod tests {
                     "URL_SIGNING_KEYS",
                     "nostube-2026-08:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 ),
-                ("NIP98_MINT_ENABLED", "true"),
+                ("MINT_ENABLED", "true"),
             ],
             || assert!(std::panic::catch_unwind(AppCfg::from_env).is_err()),
         );
         with_env(
             &[
-                ("NIP98_MINT_ENABLED", "true"),
+                ("MINT_ENABLED", "true"),
                 ("MINT_PUBLIC_BASE_URL", "https://img.example"),
             ],
             || assert!(std::panic::catch_unwind(AppCfg::from_env).is_err()),

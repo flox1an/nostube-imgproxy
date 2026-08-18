@@ -13,7 +13,7 @@ use axum::{
 use axum_extra::extract::Query;
 use bytes::Bytes;
 use serde::Deserialize;
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{net::IpAddr, path::Path, sync::Arc, time::Instant};
 use tower::{
     limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer, BoxError, ServiceBuilder,
 };
@@ -37,6 +37,7 @@ use crate::{
     metrics,
     mint::{MintResponse, MintState},
     network_policy::validate_untrusted_url,
+    ratelimit::MediaRateLimiters,
     signing::signature_error,
     singleflight::SingleFlight,
     thumbnail::{extract_video_thumbnail, is_video_url, ThumbnailState},
@@ -55,6 +56,9 @@ pub struct CombinedState {
     pub cpu: CpuPool,
     /// Collapses concurrent misses for the same derivative into one job.
     pub inflight: Arc<SingleFlight>,
+    /// Three-tier per-IP flood guard: general requests, image-generation
+    /// cache misses, and video-generation cache misses.
+    pub media_rate_limits: Arc<MediaRateLimiters>,
 }
 
 #[derive(Clone)]
@@ -68,12 +72,18 @@ impl CombinedState {
     pub fn new(app: AppState, thumbnail: Arc<ThumbnailState>, blossom: Arc<BlossomState>) -> Self {
         let cpu = CpuPool::new(app.cfg.cpu_concurrency, app.cfg.cpu_queue_depth);
         let max_inflight = app.cfg.max_inflight_requests;
+        let media_rate_limits = Arc::new(MediaRateLimiters::new(
+            app.cfg.rate_ip_requests_per_min,
+            app.cfg.rate_ip_image_generations_per_min,
+            app.cfg.rate_ip_video_generations_per_min,
+        ));
         Self {
             app,
             thumbnail,
             blossom,
             cpu,
             inflight: Arc::new(SingleFlight::new(max_inflight)),
+            media_rate_limits,
         }
     }
 }
@@ -93,7 +103,7 @@ pub fn create_router(
     let mint_state = MintRouterState {
         cfg: state.cfg.mint.clone(),
         signing_keys: state.cfg.url_signing_keys.clone(),
-        state: MintState::default(),
+        state: MintState::new(state.cfg.mint.rate_ip_items_per_min),
     };
     let combined = CombinedState::new(state, thumbnail_state, blossom_state);
     let mut images = Router::new();
@@ -140,7 +150,7 @@ pub fn create_router(
                 CorsLayer::new()
                     .allow_origin(AllowOrigin::list(origins))
                     .allow_methods([Method::POST])
-                    .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+                    .allow_headers([header::CONTENT_TYPE]),
             );
         }
     }
@@ -200,37 +210,28 @@ struct ThumbQuery {
     height: Option<u32>,
 }
 
-/// Mint a bounded batch of short-lived v1 capability URLs after NIP-98 binds
-/// the authenticated Nostr identity to these exact JSON bytes.
+/// Mint a bounded batch of short-lived v1 capability URLs.
+///
+/// Deliberately unauthenticated: the batch may only reference already-public,
+/// hash-addressed Blossom media through a fixed preset, so admission is a
+/// per-IP flood guard rather than an authorization check. This keeps the
+/// endpoint usable from anonymous browsers, embeds, and crawlers, none of
+/// which can hold a Nostr signing key.
 async fn handle_mint(
     State(mint): State<MintRouterState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<MintResponse>, SvcError> {
     let request =
         serde_json::from_slice(&body).map_err(|_| SvcError::BadRequest("invalid mint request"))?;
     MintState::validate_request(&request, &mint.cfg)?;
-    let authorization = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .ok_or(SvcError::Unauthorized)?;
-    let expected_url = format!(
-        "{}/v1/mint",
-        mint.cfg
-            .public_base_url
-            .as_deref()
-            .ok_or_else(|| SvcError::InternalError("mint public URL is unavailable".into()))?
-    );
-    mint.state.authorize(
-        authorization,
-        &expected_url,
-        &body,
-        peer.ip(),
-        u32::try_from(request.items.len())
-            .map_err(|_| SvcError::BadRequest("invalid mint batch size"))?,
-        &mint.cfg,
-    )?;
+    mint.state
+        .admit(
+            peer.ip(),
+            u32::try_from(request.items.len())
+                .map_err(|_| SvcError::BadRequest("invalid mint batch size"))?,
+        )
+        .inspect_err(|_| metrics::record_rate_limit_rejection("mint"))?;
     Ok(Json(mint.state.mint(
         request,
         &mint.signing_keys,
@@ -500,21 +501,23 @@ fn blossom_blob_url(server: &str, hash: &str, ext: Option<&str>) -> String {
 /// `ALLOW_UNSIGNED_URLS=true` during the signed-URL migration.
 async fn handle_insecure(
     State(state): State<CombinedState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     AxPath(rest): AxPath<String>,
     request_headers: HeaderMap,
 ) -> Result<Response, SvcError> {
-    handle_image_request(state, rest, request_headers, None).await
+    handle_image_request(state, rest, request_headers, None, peer.ip()).await
 }
 
 /// Versioned signed direct-media route.
 async fn handle_signed_image(
     State(state): State<CombinedState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     OriginalUri(uri): OriginalUri,
     AxPath((key_id, signature, rest)): AxPath<(String, String, String)>,
     request_headers: HeaderMap,
 ) -> Result<Response, SvcError> {
     let expiry = verify_signed_request(&state, &uri, &key_id, &signature, "/img/")?;
-    handle_image_request(state, rest, request_headers, expiry).await
+    handle_image_request(state, rest, request_headers, expiry, peer.ip()).await
 }
 
 async fn handle_image_request(
@@ -522,12 +525,18 @@ async fn handle_image_request(
     rest: String,
     request_headers: HeaderMap,
     signed_expiry: Option<std::time::SystemTime>,
+    peer_ip: IpAddr,
 ) -> Result<Response, SvcError> {
     // Parse and validate before any cache lookup. The request URL is untrusted
     // and must never become an FFmpeg or HTTP target on this server.
     let (dirs, src_url) = parse_rest(&rest)?;
     dirs.resize.validate(state.app.cfg.max_image_dimension)?;
     validate_untrusted_url(&src_url)?;
+
+    state
+        .media_rate_limits
+        .admit_request(peer_ip)
+        .inspect_err(|_| metrics::record_rate_limit_rejection("request"))?;
 
     // Signed and legacy direct media deliberately share this namespace: access
     // control changes who may request a derivative, not its output bytes.
@@ -545,7 +554,16 @@ async fn handle_image_request(
         }
     }
     metrics::record_cache_miss("processed");
-
+    state
+        .media_rate_limits
+        .admit_generation(peer_ip, is_video)
+        .inspect_err(|_| {
+            metrics::record_rate_limit_rejection(if is_video {
+                "video_generation"
+            } else {
+                "image_generation"
+            })
+        })?;
     let original_cache_path = original_cache_path_for(&state.app.cfg, &src_url);
     let deadline = Instant::now() + state.app.cfg.fetch_timeout;
     let source = Source::Direct {
@@ -583,23 +601,25 @@ async fn handle_image_request(
 /// `ALLOW_UNSIGNED_URLS=true` during the signed-URL migration.
 async fn handle_thumb(
     State(state): State<CombinedState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     AxPath(filename): AxPath<String>,
     Query(params): Query<ThumbQuery>,
     request_headers: HeaderMap,
 ) -> Result<Response, SvcError> {
-    handle_thumb_request(state, filename, params, request_headers, None).await
+    handle_thumb_request(state, filename, params, request_headers, None, peer.ip()).await
 }
 
 /// Versioned signed Blossom thumbnail route.
 async fn handle_signed_thumb(
     State(state): State<CombinedState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     OriginalUri(uri): OriginalUri,
     AxPath((key_id, signature, filename)): AxPath<(String, String, String)>,
     Query(params): Query<ThumbQuery>,
     request_headers: HeaderMap,
 ) -> Result<Response, SvcError> {
     let expiry = verify_signed_request(&state, &uri, &key_id, &signature, "/thumb/")?;
-    handle_thumb_request(state, filename, params, request_headers, expiry).await
+    handle_thumb_request(state, filename, params, request_headers, expiry, peer.ip()).await
 }
 
 async fn handle_thumb_request(
@@ -608,6 +628,7 @@ async fn handle_thumb_request(
     params: ThumbQuery,
     request_headers: HeaderMap,
     signed_expiry: Option<std::time::SystemTime>,
+    peer_ip: IpAddr,
 ) -> Result<Response, SvcError> {
     // Accept both `<sha256>` and `<sha256>.<ext>` and canonicalize the hash
     // before using it as an upstream path or cache key.
@@ -624,6 +645,11 @@ async fn handle_thumb_request(
         .is_some_and(|extension| is_video_url(&format!("{hash}.{extension}")));
 
     let dirs = parse_thumb_params(&params, state.app.cfg.max_image_dimension)?;
+
+    state
+        .media_rate_limits
+        .admit_request(peer_ip)
+        .inspect_err(|_| metrics::record_rate_limit_rejection("request"))?;
 
     // Build cache key from the canonical blob name and request parameters.
     let cache_key = derivative_cache_key("thumb", &blob_name, &dirs);
@@ -643,6 +669,16 @@ async fn handle_thumb_request(
         }
     }
     metrics::record_cache_miss("processed");
+    state
+        .media_rate_limits
+        .admit_generation(peer_ip, is_video)
+        .inspect_err(|_| {
+            metrics::record_rate_limit_rejection(if is_video {
+                "video_generation"
+            } else {
+                "image_generation"
+            })
+        })?;
 
     // Get author servers if pubkey provided
     let author_servers = if let Some(pubkey) = &params.author_pubkey {
@@ -861,49 +897,25 @@ mod tests {
                 allowed_origins: vec!["https://nostube.example".into()],
                 max_batch_items: 100,
                 rate_ip_items_per_min: 10,
-                rate_pubkey_items_per_min: 10,
-                replay_ttl: std::time::Duration::from_secs(90),
                 signed_url_ttl: std::time::Duration::from_secs(21_600),
             },
             signing_keys: crate::signing::UrlSigningKeys::parse(
                 "nostube-2026-08:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             )
             .unwrap(),
-            state: MintState::default(),
+            state: MintState::new(10),
         }
     }
 
-    fn nip98_authorization(body: &[u8]) -> String {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
-        use sha2::{Digest, Sha256};
-
-        let event = EventBuilder::new(Kind::HttpAuth, "")
-            .tags([
-                Tag::parse(["u", "https://img.example/v1/mint"]).unwrap(),
-                Tag::parse(["method", "POST"]).unwrap(),
-                Tag::parse(["payload", &hex::encode(Sha256::digest(body))]).unwrap(),
-            ])
-            .finalize(&Keys::generate())
-            .unwrap();
-        format!("Nostr {}", STANDARD.encode(event.as_json()))
-    }
-
     #[tokio::test]
-    async fn mint_handler_returns_signed_urls_for_a_bound_nip98_batch() {
+    async fn mint_handler_returns_signed_urls_without_authentication() {
         let body = Bytes::from_static(
             br#"{"preset":"feed-preview-v1","items":[{"id":"event:1:media:0","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","extension":"webp"}]}"#,
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_str(&nip98_authorization(&body)).unwrap(),
         );
 
         let Json(response) = handle_mint(
             State(mint_router_state()),
             ConnectInfo("203.0.113.10:443".parse().unwrap()),
-            headers,
             body,
         )
         .await
@@ -914,5 +926,32 @@ mod tests {
         assert!(response.items[0]
             .url
             .starts_with("https://img.example/v1/nostube-2026-08/"));
+    }
+
+    #[tokio::test]
+    async fn mint_handler_enforces_the_per_ip_item_rate_limit() {
+        let body = Bytes::from_static(
+            br#"{"preset":"feed-preview-v1","items":[{"id":"event:1:media:0","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","extension":"webp"}]}"#,
+        );
+        let mut cfg = mint_router_state();
+        cfg.state = MintState::new(1);
+
+        let _ = handle_mint(
+            State(cfg.clone()),
+            ConnectInfo("203.0.113.10:443".parse().unwrap()),
+            body.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            handle_mint(
+                State(cfg),
+                ConnectInfo("203.0.113.10:443".parse().unwrap()),
+                body,
+            )
+            .await,
+            Err(SvcError::RateLimited)
+        ));
     }
 }

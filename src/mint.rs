@@ -1,41 +1,15 @@
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use nostr_sdk::prelude::{Event, Kind, Timestamp};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     net::IpAddr,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
-    config::MintConfig, error::SvcError, signing::UrlSigningKeys, thumbnail::is_video_url,
+    config::MintConfig, error::SvcError, ratelimit::IpRateLimiter, signing::UrlSigningKeys,
+    thumbnail::is_video_url,
 };
-
-const MAX_AUTHORIZATION_BYTES: usize = 16 * 1024;
-const MAX_ADMISSION_ENTRIES: usize = 10_000;
-const NIP98_MAX_FUTURE_SECS: u64 = 30;
-const NIP98_MAX_PAST_SECS: u64 = 60;
-
-#[derive(Clone, Default)]
-pub struct MintState {
-    admission: Arc<Mutex<AdmissionState>>,
-}
-
-#[derive(Default)]
-struct AdmissionState {
-    used_events: HashMap<String, Instant>,
-    ip_windows: HashMap<IpAddr, RateWindow>,
-    pubkey_windows: HashMap<String, RateWindow>,
-}
-
-#[derive(Clone, Copy)]
-struct RateWindow {
-    started: Instant,
-    used: u32,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,26 +67,33 @@ pub struct MintedItem {
     pub url: String,
 }
 
+/// Anonymous, IP-rate-limited capability minting.
+///
+/// The endpoint is deliberately public: it only ever mints URLs for
+/// already-public, hash-addressed Blossom media (anyone can fetch the same
+/// bytes directly from a Blossom server), restricted to a handful of fixed
+/// presets. Admission is therefore a flood guard, not an authorization
+/// check, so it costs nothing to keep the endpoint usable by anonymous
+/// browsers, embeds, and crawlers.
+#[derive(Clone)]
+pub struct MintState {
+    admission: Arc<IpRateLimiter>,
+}
+
 impl MintState {
-    /// Validate one NIP-98 authorization and atomically consume its replay and
-    /// rate-limit budget. Caller supplies the exact raw JSON bytes, not a
-    /// reserialized value, because NIP-98 binds the payload hash to those bytes.
-    pub fn authorize(
-        &self,
-        authorization: &str,
-        expected_url: &str,
-        body: &[u8],
-        peer_ip: IpAddr,
-        cost: u32,
-        cfg: &MintConfig,
-    ) -> Result<(), SvcError> {
-        let event = parse_nip98_event(authorization)?;
-        validate_nip98_event(&event, expected_url, body)?;
-        self.admit(event.id.to_hex(), event.pubkey.to_hex(), peer_ip, cost, cfg)
+    pub fn new(rate_ip_items_per_min: u32) -> Self {
+        Self {
+            admission: Arc::new(IpRateLimiter::new(rate_ip_items_per_min)),
+        }
     }
 
     pub fn validate_request(request: &MintRequest, cfg: &MintConfig) -> Result<(), SvcError> {
         validate_request(request, cfg)
+    }
+
+    /// Consume `cost` mint-item budget for `peer_ip`.
+    pub fn admit(&self, peer_ip: IpAddr, cost: u32) -> Result<(), SvcError> {
+        self.admission.admit(peer_ip, cost)
     }
 
     pub fn mint(
@@ -161,105 +142,6 @@ impl MintState {
             items,
         })
     }
-
-    fn admit(
-        &self,
-        event_id: String,
-        pubkey: String,
-        peer_ip: IpAddr,
-        cost: u32,
-        cfg: &MintConfig,
-    ) -> Result<(), SvcError> {
-        let now = Instant::now();
-        let mut state = self.admission.lock();
-        state.used_events.retain(|_, expiry| *expiry > now);
-        state
-            .ip_windows
-            .retain(|_, window| now.duration_since(window.started) < Duration::from_secs(60));
-        state
-            .pubkey_windows
-            .retain(|_, window| now.duration_since(window.started) < Duration::from_secs(60));
-
-        if state.used_events.contains_key(&event_id) {
-            return Err(SvcError::Unauthorized);
-        }
-        if state.used_events.len() >= MAX_ADMISSION_ENTRIES {
-            return Err(SvcError::Overloaded);
-        }
-        if !can_consume(
-            state.ip_windows.get(&peer_ip),
-            cost,
-            cfg.rate_ip_items_per_min,
-        ) || !can_consume(
-            state.pubkey_windows.get(&pubkey),
-            cost,
-            cfg.rate_pubkey_items_per_min,
-        ) {
-            return Err(SvcError::RateLimited);
-        }
-        if state.ip_windows.len() >= MAX_ADMISSION_ENTRIES
-            && !state.ip_windows.contains_key(&peer_ip)
-        {
-            return Err(SvcError::RateLimited);
-        }
-        if state.pubkey_windows.len() >= MAX_ADMISSION_ENTRIES
-            && !state.pubkey_windows.contains_key(&pubkey)
-        {
-            return Err(SvcError::RateLimited);
-        }
-
-        state.used_events.insert(event_id, now + cfg.replay_ttl);
-        consume(&mut state.ip_windows, peer_ip, cost, now);
-        consume(&mut state.pubkey_windows, pubkey, cost, now);
-        Ok(())
-    }
-}
-
-fn parse_nip98_event(authorization: &str) -> Result<Event, SvcError> {
-    let encoded = authorization
-        .strip_prefix("Nostr ")
-        .filter(|encoded| !encoded.is_empty() && encoded.len() <= MAX_AUTHORIZATION_BYTES)
-        .ok_or(SvcError::Unauthorized)?;
-    let decoded = STANDARD
-        .decode(encoded)
-        .map_err(|_| SvcError::Unauthorized)?;
-    Event::from_json(decoded).map_err(|_| SvcError::Unauthorized)
-}
-
-fn validate_nip98_event(event: &Event, expected_url: &str, body: &[u8]) -> Result<(), SvcError> {
-    if event.kind != Kind::HttpAuth || !event.content.is_empty() || event.verify().is_err() {
-        return Err(SvcError::Unauthorized);
-    }
-
-    let now = Timestamp::now().as_secs();
-    let created_at = event.created_at.as_secs();
-    if created_at > now.saturating_add(NIP98_MAX_FUTURE_SECS)
-        || now.saturating_sub(created_at) > NIP98_MAX_PAST_SECS
-    {
-        return Err(SvcError::Unauthorized);
-    }
-
-    let url = unique_tag_value(event, "u").ok_or(SvcError::Unauthorized)?;
-    let method = unique_tag_value(event, "method").ok_or(SvcError::Unauthorized)?;
-    let payload = unique_tag_value(event, "payload").ok_or(SvcError::Unauthorized)?;
-    if url != expected_url || method != "POST" || payload.len() != 64 {
-        return Err(SvcError::Unauthorized);
-    }
-
-    let body_hash = hex::encode(Sha256::digest(body));
-    if payload != body_hash {
-        return Err(SvcError::Unauthorized);
-    }
-    Ok(())
-}
-
-fn unique_tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
-    let mut values = event.tags.iter().filter_map(|tag| {
-        let values = tag.as_slice();
-        (values.len() == 2 && values[0] == name).then(|| values[1].as_str())
-    });
-    let value = values.next()?;
-    values.next().is_none().then_some(value)
 }
 
 fn validate_request(request: &MintRequest, cfg: &MintConfig) -> Result<(), SvcError> {
@@ -308,100 +190,23 @@ fn expiry_bucket(now: SystemTime, ttl: Duration) -> u64 {
     buckets.saturating_mul(ttl_secs)
 }
 
-fn can_consume(window: Option<&RateWindow>, cost: u32, limit: u32) -> bool {
-    window
-        .map(|window| window.used.saturating_add(cost) <= limit)
-        .unwrap_or(cost <= limit)
-}
-
-fn consume<K: std::cmp::Eq + std::hash::Hash>(
-    windows: &mut HashMap<K, RateWindow>,
-    key: K,
-    cost: u32,
-    now: Instant,
-) {
-    let window = windows.entry(key).or_insert(RateWindow {
-        started: now,
-        used: 0,
-    });
-    window.used = window.used.saturating_add(cost);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn authorization(body: &[u8], url: &str, keys: &nostr_sdk::prelude::Keys) -> String {
-        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Tag};
-
-        let payload = hex::encode(Sha256::digest(body));
-        let event = EventBuilder::new(Kind::HttpAuth, "")
-            .tags([
-                Tag::parse(["u", url]).unwrap(),
-                Tag::parse(["method", "POST"]).unwrap(),
-                Tag::parse(["payload", &payload]).unwrap(),
-            ])
-            .finalize(keys)
-            .unwrap();
-        format!("Nostr {}", STANDARD.encode(event.as_json()))
-    }
-
     #[test]
-    fn nip98_authorization_binds_the_exact_body_and_rejects_replay() {
-        let cfg = config();
-        let keys = nostr_sdk::prelude::Keys::generate();
-        let body = br#"{"preset":"feed-preview-v1","items":[]}"#;
-        let auth = authorization(body, "https://img.example/v1/mint", &keys);
-        let state = MintState::default();
-
-        state
-            .authorize(
-                &auth,
-                "https://img.example/v1/mint",
-                body,
-                "203.0.113.10".parse().unwrap(),
-                1,
-                &cfg,
-            )
-            .unwrap();
-        assert!(matches!(
-            state.authorize(
-                &auth,
-                "https://img.example/v1/mint",
-                body,
-                "203.0.113.10".parse().unwrap(),
-                1,
-                &cfg,
-            ),
-            Err(SvcError::Unauthorized)
-        ));
-        assert!(matches!(
-            MintState::default().authorize(
-                &auth,
-                "https://img.example/v1/mint",
-                br#"{"preset":"embed-card-v1","items":[]}"#,
-                "203.0.113.10".parse().unwrap(),
-                1,
-                &cfg,
-            ),
-            Err(SvcError::Unauthorized)
-        ));
-    }
-
-    #[test]
-    fn admission_requires_both_ip_and_pubkey_budget() {
-        let mut cfg = config();
-        cfg.rate_ip_items_per_min = 2;
-        cfg.rate_pubkey_items_per_min = 2;
-        let state = MintState::default();
+    fn admission_enforces_the_per_ip_item_budget() {
+        let state = MintState::new(2);
         let ip = "203.0.113.10".parse().unwrap();
-        state
-            .admit("event-1".into(), "pubkey-1".into(), ip, 2, &cfg)
-            .unwrap();
-        assert!(matches!(
-            state.admit("event-2".into(), "pubkey-2".into(), ip, 1, &cfg),
-            Err(SvcError::RateLimited)
-        ));
+        state.admit(ip, 2).unwrap();
+        assert!(matches!(state.admit(ip, 1), Err(SvcError::RateLimited)));
+    }
+
+    #[test]
+    fn admission_tracks_ips_independently() {
+        let state = MintState::new(1);
+        state.admit("203.0.113.10".parse().unwrap(), 1).unwrap();
+        assert!(state.admit("198.51.100.20".parse().unwrap(), 1).is_ok());
     }
 
     #[test]
@@ -409,7 +214,7 @@ mod tests {
         let keys =
             UrlSigningKeys::parse("nostube-2026-08:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
                 .unwrap();
-        let response = MintState::default()
+        let response = MintState::new(10)
             .mint(
                 MintRequest {
                     preset: MintPreset::FeedPreviewV1,
@@ -439,6 +244,7 @@ mod tests {
         )
         .unwrap();
     }
+
     fn config() -> MintConfig {
         MintConfig {
             enabled: true,
@@ -446,8 +252,6 @@ mod tests {
             allowed_origins: vec!["https://nostube.example".into()],
             max_batch_items: 100,
             rate_ip_items_per_min: 10,
-            rate_pubkey_items_per_min: 10,
-            replay_ttl: Duration::from_secs(90),
             signed_url_ttl: Duration::from_secs(21_600),
         }
     }

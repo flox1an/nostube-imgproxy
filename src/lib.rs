@@ -12,6 +12,7 @@ pub mod fetch;
 pub mod metrics;
 pub mod mint;
 pub mod network_policy;
+pub mod ratelimit;
 pub mod server;
 pub mod signing;
 pub mod singleflight;
