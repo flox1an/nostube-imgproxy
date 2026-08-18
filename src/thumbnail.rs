@@ -176,12 +176,27 @@ async fn serve_media_range(
         return Err(StatusCode::GATEWAY_TIMEOUT);
     }
 
+    // FFmpeg's mov/mp4 demuxer opens with an unbounded `Range: bytes=0-`
+    // probe (and reopens the same way after every seek) — it relies on
+    // reading only as much of the stream as it needs before seeking again,
+    // not on the origin's declared length. Forwarding that request verbatim
+    // makes a multi-gigabyte origin answer with a multi-gigabyte
+    // Content-Length, which used to fail the whole candidate before a single
+    // byte was read. Bounding the outbound end to the remaining budget keeps
+    // the origin's declared length honest without limiting how large a video
+    // FFmpeg can seek around in.
+    let budget = state.remaining_bytes.load(Ordering::Acquire);
+    if budget == 0 {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let outbound_range = clamp_open_range(range, budget);
+
     let upstream = tokio::time::timeout(
         remaining,
         state
             .http
             .get(&state.source_url)
-            .header(reqwest::header::RANGE, range)
+            .header(reqwest::header::RANGE, outbound_range)
             .send(),
     )
     .await
@@ -196,8 +211,11 @@ async fn serve_media_range(
         });
     }
 
+    // Safety net for an origin that ignores our bounded end and answers with
+    // more than it was asked for; the per-chunk counter below is the actual
+    // enforcement for a compliant origin.
     let announced = upstream.content_length().unwrap_or(0);
-    if announced > state.remaining_bytes.load(Ordering::Acquire) {
+    if announced > budget {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -239,6 +257,25 @@ async fn serve_media_range(
         response.headers_mut().insert(name, value);
     }
     Ok(response)
+}
+
+/// Bound an incoming, open-ended byte-range spec (`bytes=N-`) to `budget`
+/// bytes so the outbound request to the origin can never be answered with
+/// more than the remaining probe allowance. Explicit-end ranges (`bytes=N-M`)
+/// and suffix ranges (`bytes=-N`) are passed through unchanged: they already
+/// bound the origin's response themselves.
+fn clamp_open_range(range: &str, budget: u64) -> String {
+    if let Some((start, end)) = range
+        .strip_prefix("bytes=")
+        .and_then(|spec| spec.split_once('-'))
+    {
+        if end.is_empty() {
+            if let Ok(start) = start.parse::<u64>() {
+                return format!("bytes={start}-{}", start.saturating_add(budget - 1));
+            }
+        }
+    }
+    range.to_string()
 }
 
 fn proxy_token() -> String {
@@ -694,5 +731,84 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.bytes().await.unwrap().as_ref(), b"clip");
+    }
+
+    #[test]
+    fn clamp_open_range_bounds_an_open_ended_spec_to_the_budget() {
+        assert_eq!(clamp_open_range("bytes=0-", 64), "bytes=0-63");
+        assert_eq!(clamp_open_range("bytes=1000-", 64), "bytes=1000-1063");
+    }
+
+    #[test]
+    fn clamp_open_range_leaves_bounded_and_suffix_specs_untouched() {
+        assert_eq!(clamp_open_range("bytes=0-3", 64), "bytes=0-3");
+        assert_eq!(clamp_open_range("bytes=-500", 64), "bytes=-500");
+    }
+
+    #[tokio::test]
+    async fn media_proxy_clamps_an_open_ended_probe_against_a_huge_origin() {
+        crate::init_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = Router::new().route(
+                "/video.mp4",
+                get(|request_headers: HeaderMap| async move {
+                    // A real origin answers an open-ended `bytes=0-` request
+                    // with the entire remaining file. Simulating a
+                    // multi-gigabyte source proves the proxy never forwards
+                    // that request unbounded: an unclamped forward would make
+                    // this handler report a multi-gigabyte Content-Length and
+                    // the caller would see 413 instead of 206.
+                    let range = request_headers
+                        .get(header::RANGE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let (start, end) = range
+                        .strip_prefix("bytes=")
+                        .and_then(|spec| spec.split_once('-'))
+                        .unwrap_or_default();
+                    assert!(!end.is_empty(), "expected a bounded range, got {range:?}");
+                    let start: u64 = start.parse().unwrap();
+                    let end: u64 = end.parse().unwrap();
+                    let body = vec![b'x'; (end - start + 1) as usize];
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        [
+                            (
+                                header::CONTENT_RANGE,
+                                format!("bytes {start}-{end}/2000000000"),
+                            ),
+                            (header::ACCEPT_RANGES, "bytes".to_string()),
+                        ],
+                        body,
+                    )
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let http = reqwest::Client::builder()
+            .resolve("cdn.example", address)
+            .build()
+            .unwrap();
+        let proxy = LocalMediaProxy::start(
+            format!("http://cdn.example:{}/video.mp4", address.port()),
+            http,
+            Instant::now() + Duration::from_secs(1),
+            16,
+        )
+        .await
+        .unwrap();
+        let response = reqwest::Client::new()
+            .get(&proxy.input_url)
+            .header(reqwest::header::RANGE, "bytes=0-")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.bytes().await.unwrap().len(), 16);
     }
 }
