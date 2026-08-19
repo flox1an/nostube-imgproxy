@@ -213,13 +213,17 @@ Configure via environment variables:
 |----------|---------|-------------|
 | `BIND_ADDR` | `127.0.0.1:8080` | Server bind address |
 | `CACHE_DIR` | `./cache` | Cache directory path |
-| `CACHE_TTL_SECS` | `86400` (24h) | Cache TTL in seconds |
+| `CACHE_TTL_SECS` | `86400` (24h) | TTL for URL-addressed (`/insecure`) cache entries |
+| `CACHE_TTL_IMMUTABLE_SECS` | `2592000` (30d) | TTL for hash-verified (`thumb`) cache entries; these cannot go stale behind their key, so `MAX_CACHE_BYTES` is the real bound |
 | `FETCH_TIMEOUT_SECS` | `10` | HTTP fetch timeout |
 | `BLOSSOM_NEGATIVE_CACHE_NOT_FOUND_TTL_SECS` | `900` (15m) | Cache 404/410 Blossom candidates; `0` disables this class |
 | `BLOSSOM_NEGATIVE_CACHE_PERMANENT_TTL_SECS` | `3600` (1h) | Cache 3xx and non-transient 4xx Blossom candidates; `0` disables this class |
 | `BLOSSOM_NEGATIVE_CACHE_TRANSIENT_TTL_SECS` | `60` | Cache timeouts, transport failures, 429, and 5xx Blossom candidates; `0` disables this class |
 | `MAX_IMAGE_BYTES` | `16777216` (16 MiB) | Max compressed image or generated thumbnail size |
-| `MAX_VIDEO_PROBE_BYTES` | `67108864` (64 MiB) | Total remote bytes the local media gateway may relay for one thumbnail; not a full-video size cap |
+| `MAX_VIDEO_PROBE_BYTES` | `67108864` (64 MiB) | Total remote bytes the local media gateway may relay for one thumbnail; not a full-video size cap. The only video budget on the request path |
+| `MAX_VERIFY_VIDEO_BYTES` | `33554432` (32 MiB) | Ceiling on a background verification's full blob download; larger videos stay uncacheable and keep being range-probed |
+| `VIDEO_VERIFY_AFTER_MISSES` | `2` | Range-probed misses one video must accumulate before a single background hash-verification runs. Above `1`, a video thumbnailed once never costs a full download |
+| `MAX_CONCURRENT_VIDEO_VERIFICATIONS` | `2` | Simultaneous background video verifications |
 | `MAX_FFMPEG_CONCURRENT` | `8` | Max concurrent FFmpeg processes; excess requests are shed with `503 Retry-After` |
 | `MAX_CPU_QUEUE` | `64` | Additional image decode/resize/encode jobs admitted to wait for CPU |
 | `MAX_CACHE_BYTES` | `8589934592` (8 GiB) | Disk budget shared by original and processed caches |
@@ -277,6 +281,7 @@ src/
 ├── server.rs     # HTTP server and route handlers (unified image/video handling)
 ├── transform.rs  # Image transformation logic (resize, encode, parse)
 ├── thumbnail.rs  # Video thumbnail extraction (FFmpeg integration)
+├── verify.rs     # Background hash-verification gating for video blobs
 └── cache.rs      # Cache operations (read, write, cleanup)
 ```
 
@@ -288,15 +293,24 @@ The service uses a **dual-cache architecture** for optimal performance:
 
 ```
 cache/
-├── original/   # Validated image sources
-└── processed/  # Canonically keyed derivatives
+├── original/
+│   ├── thumb/     # Hash-verified Blossom sources      → CACHE_TTL_IMMUTABLE_SECS
+│   └── insecure/  # URL-addressed sources              → CACHE_TTL_SECS
+└── processed/
+    ├── thumb/     # Hash-verified derivatives          → CACHE_TTL_IMMUTABLE_SECS
+    └── insecure/  # URL-addressed derivatives          → CACHE_TTL_SECS
 ```
 
+The `thumb` namespace only ever receives bytes that were hash-verified
+against the requested SHA-256, so those entries cannot go stale behind their
+key and earn a much longer TTL. The `insecure` namespace is URL-addressed —
+the bytes behind a URL can change — so it keeps the short TTL.
+
 ### Original Cache
-- **Purpose**: Prevents redundant downloads and processing of validated images
+- **Purpose**: Prevents redundant downloads and processing of validated sources
 - **Key**: SHA-256 hash of the source URL or canonical Blossom blob name
-- **Content**: Downloaded original image after successful decode/transform
-- **Video exception**: Range-probed video thumbnails are not stored here because the full video hash is not available without a full download
+- **Content**: Downloaded original image, or the extracted frame for a video
+- **Preset-agnostic**: One entry serves every size, format, and quality of that source
 
 ### Processed Cache
 - **Purpose**: Serves previously transformed, validated images instantly
@@ -304,10 +318,24 @@ cache/
 - **Sharding**: Two digest-prefix directory levels prevent oversized cache directories
 - **Benefit**: Equivalent URLs with ignored or normalized directives share one entry
 
+### Video Thumbnails
+A thumbnail needs a few seconds of footage near one keyframe, so the request
+path only ever range-probes — it never downloads a full video. Proving those
+bytes match the requested SHA-256, however, requires the whole blob, so that
+happens **off the request path**:
+
+1. First requests are served from a range probe: `max-age=3600`, no `ETag`, nothing cached.
+2. Once a video accumulates `VIDEO_VERIFY_AFTER_MISSES` misses, one bounded background job downloads it in full, checks the hash, extracts the frame, and writes the original cache entry.
+3. Later requests find that verified original and are served `immutable` with an `ETag`, at any preset.
+
+A video requested only once therefore never costs a full download, and a video
+above `MAX_VERIFY_VIDEO_BYTES` is never fully downloaded at all — it keeps
+being range-probed per request.
+
 ### General Cache Properties
 - **Atomic writes**: Create-new temporary files, `fsync`, then rename; zero-byte entries are misses
-- **Cleanup**: Runs every 60 seconds, applies `CACHE_TTL_SECS`, and evicts oldest entries above `MAX_CACHE_BYTES`
-- **Cache headers**: Hash-verified image derivatives are immutable; `/insecure` and range-probed video responses are short-lived
+- **Cleanup**: Runs every 60 seconds, applies the per-namespace TTL, and evicts oldest entries above `MAX_CACHE_BYTES`
+- **Cache headers**: Hash-verified derivatives are immutable; `/insecure` and not-yet-verified video responses are short-lived and carry no `ETag`
 - **Hit/Miss indicator**: `X-Cache: hit`, `miss`, or `coalesced`
 
 ## Dependencies

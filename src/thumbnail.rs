@@ -467,22 +467,18 @@ async fn preflight_candidate(
     Ok(response.url().as_str().to_owned())
 }
 
-/// Spawn one constrained FFmpeg process and have it read only from the local
-/// media gateway. Output is the thumbnail directly; there is no intermediate
-/// clip and no full source-video download.
-#[allow(clippy::too_many_arguments)]
-async fn extract_thumbnail_with_ffmpeg(
-    source_url: String,
+/// Spawn one constrained FFmpeg process reading only from `input`. Output is
+/// the thumbnail directly; there is no intermediate clip and no full
+/// source-video download to disk beyond `input` itself.
+async fn run_ffmpeg_extract(
+    input: &str,
+    protocol_whitelist: &str,
     demuxer: &str,
-    http: reqwest::Client,
-    deadline: Instant,
-    max_probe_bytes: u64,
     max_image_bytes: usize,
     timeout: Duration,
 ) -> Result<Vec<u8>, SvcError> {
     use tokio::process::Command;
 
-    let proxy = LocalMediaProxy::start(source_url, http, deadline, max_probe_bytes).await?;
     let temp_file = tempfile::NamedTempFile::new().map_err(SvcError::Io)?;
     let output_path = temp_file.path().to_path_buf();
 
@@ -492,15 +488,17 @@ async fn extract_thumbnail_with_ffmpeg(
             "-nostdin",
             "-loglevel",
             "error",
-            // FFmpeg may contact only our loopback media proxy. Explicit input
-            // demuxing below blocks playlist parsing from introducing nested
-            // remote URLs under this otherwise narrow whitelist. `tcp` must be
-            // listed explicitly: FFmpeg opens HTTP's transport through the
-            // `tcp` protocol, and without it every range fetch fails with
-            // "Protocol 'tcp' not on whitelist". `https`/`tls` stay excluded so
-            // the loopback proxy remains the only network path.
+            // Explicit input demuxing below blocks playlist parsing from
+            // introducing nested remote URLs under this otherwise narrow
+            // whitelist. For the loopback-proxy caller, `tcp` must be listed
+            // explicitly: FFmpeg opens HTTP's transport through the `tcp`
+            // protocol, and without it every range fetch fails with
+            // "Protocol 'tcp' not on whitelist". `https`/`tls` stay excluded
+            // so the loopback proxy remains the only network path; the
+            // verified-local-file caller passes `file` only, so FFmpeg has no
+            // network access at all.
             "-protocol_whitelist",
-            "file,http,tcp",
+            protocol_whitelist,
             "-analyzeduration",
             "5000000",
             "-probesize",
@@ -518,7 +516,7 @@ async fn extract_thumbnail_with_ffmpeg(
             "-f",
             demuxer,
             "-i",
-            &proxy.input_url,
+            input,
             "-t",
             "5",
             "-map",
@@ -573,6 +571,60 @@ async fn extract_thumbnail_with_ffmpeg(
     let thumbnail = tokio::fs::read(&output_path).await.map_err(SvcError::Io)?;
     metrics::record_ffmpeg_extraction(true);
     Ok(thumbnail)
+}
+
+/// Spawn one constrained FFmpeg process and have it read only from the local
+/// media gateway.
+#[allow(clippy::too_many_arguments)]
+async fn extract_thumbnail_with_ffmpeg(
+    source_url: String,
+    demuxer: &str,
+    http: reqwest::Client,
+    deadline: Instant,
+    max_probe_bytes: u64,
+    max_image_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, SvcError> {
+    let proxy = LocalMediaProxy::start(source_url, http, deadline, max_probe_bytes).await?;
+    run_ffmpeg_extract(
+        &proxy.input_url,
+        "file,http,tcp",
+        demuxer,
+        max_image_bytes,
+        timeout,
+    )
+    .await
+}
+
+/// Extract a thumbnail frame from a video blob whose bytes are already
+/// hash-verified and fully local (e.g. via
+/// [`crate::blossom::try_fetch_verified_blob`]). FFmpeg gets a
+/// `file`-only protocol whitelist — no network access at all — since the
+/// whole input already sits on disk; there is no candidate loop or byte
+/// budget to enforce here, both already happened before this bytes were
+/// obtained.
+pub async fn extract_thumbnail_from_verified_bytes(
+    bytes: &[u8],
+    blob_name: &str,
+    semaphore: &Arc<Semaphore>,
+    max_image_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, SvcError> {
+    let demuxer =
+        input_demuxer(blob_name).ok_or(SvcError::BadRequest("unsupported video format"))?;
+
+    let _permit = semaphore
+        .acquire()
+        .await
+        .map_err(|_| SvcError::InternalError("ffmpeg semaphore closed".into()))?;
+
+    let input_file = tempfile::NamedTempFile::new().map_err(SvcError::Io)?;
+    tokio::fs::write(input_file.path(), bytes)
+        .await
+        .map_err(SvcError::Io)?;
+    let input_path = input_file.path().to_string_lossy().into_owned();
+
+    run_ffmpeg_extract(&input_path, "file", demuxer, max_image_bytes, timeout).await
 }
 
 async fn read_capped<R>(mut reader: R, cap: usize) -> Vec<u8>

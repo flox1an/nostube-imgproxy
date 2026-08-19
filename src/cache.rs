@@ -22,6 +22,17 @@ use crate::{
     transform::{Directives, OutFmt},
 };
 
+/// Directory namespace, and `derivative_cache_key`/`cache_path_for` route
+/// literal, for hash-addressed derivatives (`/thumb`, `/v1/preset/...`).
+/// Bytes under this namespace are hash-verified before being written (see
+/// `server::produce_derivative`), so the janitor grants them the long
+/// `CACHE_TTL_IMMUTABLE_SECS` TTL instead of the short default.
+pub const THUMB_ROUTE: &str = "thumb";
+/// Directory namespace, and route literal, for URL-addressed derivatives
+/// (`/insecure`). The source can change behind the URL, so these keep the
+/// short `CACHE_TTL_SECS` TTL.
+pub const INSECURE_ROUTE: &str = "insecure";
+
 const IMMUTABLE_CACHE_CONTROL: HeaderValue =
     HeaderValue::from_static("public, max-age=31536000, immutable");
 /// For derivatives whose source is NOT hash-addressed (`/insecure`): the bytes
@@ -85,20 +96,24 @@ fn sharded_path(base: &Path, digest: &str) -> PathBuf {
     base.join(&digest[0..2]).join(&digest[2..4])
 }
 
-/// Generate cache file path for processed images.
+/// Generate cache file path for processed derivatives.
 ///
 /// `key` is the canonical string from [`derivative_cache_key`]; the digest of
 /// that key doubles as the file stem and therefore the ETag validator.
-pub fn cache_path_for(cfg: &AppCfg, key: &str, fmt: &OutFmt) -> PathBuf {
+/// `route` (`THUMB_ROUTE` or `INSECURE_ROUTE`) places the entry under a
+/// namespace directory so the janitor can apply a different TTL to each; it
+/// is always a hardcoded literal from the call site, never request input.
+pub fn cache_path_for(cfg: &AppCfg, route: &str, key: &str, fmt: &OutFmt) -> PathBuf {
     let hash = digest(key.as_bytes());
-    sharded_path(&cfg.cache_dir.join("processed"), &hash)
+    sharded_path(&cfg.cache_dir.join("processed").join(route), &hash)
         .join(format!("{hash}.{}", fmt.extension()))
 }
 
-/// Generate cache file path for original images
-pub fn original_cache_path_for(cfg: &AppCfg, source: &str) -> PathBuf {
+/// Generate cache file path for original (pre-derivative) bytes. `route` has
+/// the same namespacing role as in [`cache_path_for`].
+pub fn original_cache_path_for(cfg: &AppCfg, route: &str, source: &str) -> PathBuf {
     let hash = digest(source.as_bytes());
-    sharded_path(&cfg.cache_dir.join("original"), &hash).join(&hash)
+    sharded_path(&cfg.cache_dir.join("original").join(route), &hash).join(&hash)
 }
 
 /// Strong ETag for a cache entry.
@@ -320,6 +335,7 @@ pub async fn janitor_loop(cfg: AppCfg) {
 async fn run_cleanup(cfg: &AppCfg) -> Result<(), std::io::Error> {
     let cache_dir = cfg.cache_dir.clone();
     let cache_ttl = cfg.cache_ttl;
+    let cache_ttl_immutable = cfg.cache_ttl_immutable;
     let max_cache_bytes = cfg.max_cache_bytes;
 
     tokio::task::spawn_blocking(move || {
@@ -358,8 +374,9 @@ async fn run_cleanup(cfg: &AppCfg) -> Result<(), std::io::Error> {
 
                 // Leftover temp files are torn writes from a crash or kill.
                 // They are transient by nature, so only reap ones old enough
-                // that no writer can still be mid-write on them, and never
-                // count them against the byte budget.
+                // that no writer can still be mid-write on them (using the
+                // short TTL regardless of namespace), and never count them
+                // against the byte budget.
                 if is_tmp {
                     if age > cache_ttl {
                         let _ = std::fs::remove_file(entry.path());
@@ -367,7 +384,26 @@ async fn run_cleanup(cfg: &AppCfg) -> Result<(), std::io::Error> {
                     continue;
                 }
 
-                if age > cache_ttl {
+                // A file directly under `<original|processed>/thumb/...` is
+                // hash-verified at write time (see
+                // `server::produce_derivative`), so it gets the long
+                // immutable TTL; the byte budget below is what actually
+                // bounds it. Everything else — `insecure/...`, and any
+                // pre-migration entry left directly under the sub_dir from
+                // before this namespacing existed — keeps the short TTL.
+                let is_thumb_namespaced = entry
+                    .path()
+                    .strip_prefix(&dir)
+                    .ok()
+                    .and_then(|rel| rel.components().next())
+                    .is_some_and(|component| component.as_os_str() == THUMB_ROUTE);
+                let ttl = if is_thumb_namespaced {
+                    cache_ttl_immutable
+                } else {
+                    cache_ttl
+                };
+
+                if age > ttl {
                     let _ = std::fs::remove_file(entry.path());
                     continue;
                 }
@@ -412,6 +448,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".into(),
             cache_dir: dir.to_path_buf(),
             cache_ttl: ttl,
+            cache_ttl_immutable: Duration::from_secs(30 * 24 * 3600),
             fetch_timeout: Duration::from_secs(1),
             blossom_failover_timeout: Duration::from_secs(1),
             max_image_bytes: 1024,
@@ -431,6 +468,9 @@ mod tests {
             ffmpeg_timeout: Duration::from_secs(5),
             max_cache_bytes: 64 * 1024,
             max_video_probe_bytes: 64 * 1024 * 1024,
+            max_verify_video_bytes: 32 * 1024 * 1024,
+            video_verify_after_misses: 2,
+            max_concurrent_video_verifications: 2,
             max_blob_candidates: 8,
             max_server_hints: 4,
             cpu_queue_depth: 64,
@@ -468,9 +508,9 @@ mod tests {
     fn cache_path_for_is_deterministic_for_the_same_key() {
         let cfg = cfg_with_cache_dir(Path::new("/tmp/cache"), Duration::from_secs(60));
         let dirs = directives(OutFmt::Webp, 82, ResizeMode::Fit, 480, 480);
-        let key = derivative_cache_key("insecure", "https://e.com/a.png", &dirs);
-        let a = cache_path_for(&cfg, &key, &dirs.out_fmt);
-        let b = cache_path_for(&cfg, &key, &dirs.out_fmt);
+        let key = derivative_cache_key(INSECURE_ROUTE, "https://e.com/a.png", &dirs);
+        let a = cache_path_for(&cfg, INSECURE_ROUTE, &key, &dirs.out_fmt);
+        let b = cache_path_for(&cfg, INSECURE_ROUTE, &key, &dirs.out_fmt);
         assert_eq!(a, b);
     }
 
@@ -478,10 +518,10 @@ mod tests {
     fn cache_path_for_separates_distinct_requests() {
         let cfg = cfg_with_cache_dir(Path::new("/tmp/cache"), Duration::from_secs(60));
         let dirs = directives(OutFmt::Webp, 82, ResizeMode::Fit, 480, 480);
-        let key_a = derivative_cache_key("insecure", "https://e.com/a.png", &dirs);
-        let key_b = derivative_cache_key("insecure", "https://e.com/b.png", &dirs);
-        let a = cache_path_for(&cfg, &key_a, &dirs.out_fmt);
-        let b = cache_path_for(&cfg, &key_b, &dirs.out_fmt);
+        let key_a = derivative_cache_key(INSECURE_ROUTE, "https://e.com/a.png", &dirs);
+        let key_b = derivative_cache_key(INSECURE_ROUTE, "https://e.com/b.png", &dirs);
+        let a = cache_path_for(&cfg, INSECURE_ROUTE, &key_a, &dirs.out_fmt);
+        let b = cache_path_for(&cfg, INSECURE_ROUTE, &key_b, &dirs.out_fmt);
         assert_ne!(a, b, "different source URLs must not collide");
     }
 
@@ -490,10 +530,10 @@ mod tests {
         let cfg = cfg_with_cache_dir(Path::new("/tmp/cache"), Duration::from_secs(60));
         let webp_dirs = directives(OutFmt::Webp, 82, ResizeMode::Fit, 480, 480);
         let avif_dirs = directives(OutFmt::Avif, 82, ResizeMode::Fit, 480, 480);
-        let key_webp = derivative_cache_key("insecure", "https://e.com/a.png", &webp_dirs);
-        let key_avif = derivative_cache_key("insecure", "https://e.com/a.png", &avif_dirs);
-        let webp = cache_path_for(&cfg, &key_webp, &webp_dirs.out_fmt);
-        let avif = cache_path_for(&cfg, &key_avif, &avif_dirs.out_fmt);
+        let key_webp = derivative_cache_key(INSECURE_ROUTE, "https://e.com/a.png", &webp_dirs);
+        let key_avif = derivative_cache_key(INSECURE_ROUTE, "https://e.com/a.png", &avif_dirs);
+        let webp = cache_path_for(&cfg, INSECURE_ROUTE, &key_webp, &webp_dirs.out_fmt);
+        let avif = cache_path_for(&cfg, INSECURE_ROUTE, &key_avif, &avif_dirs.out_fmt);
         assert_ne!(webp, avif, "one request must not serve two formats");
         assert_eq!(webp.extension().unwrap(), "webp");
         assert_eq!(avif.extension().unwrap(), "avif");
@@ -503,11 +543,12 @@ mod tests {
     fn cache_path_for_lands_under_the_sharded_processed_directory() {
         let cfg = cfg_with_cache_dir(Path::new("/tmp/cache"), Duration::from_secs(60));
         let dirs = directives(OutFmt::Png, 82, ResizeMode::Fit, 480, 480);
-        let key = derivative_cache_key("insecure", "https://e.com/a.png", &dirs);
-        let path = cache_path_for(&cfg, &key, &dirs.out_fmt);
-        // processed/<h0h1>/<h2h3>/<digest>.png — two hex-char levels of sharding.
+        let key = derivative_cache_key(INSECURE_ROUTE, "https://e.com/a.png", &dirs);
+        let path = cache_path_for(&cfg, INSECURE_ROUTE, &key, &dirs.out_fmt);
+        // processed/insecure/<h0h1>/<h2h3>/<digest>.png — two hex-char levels
+        // of sharding under the route namespace.
         let levels: Vec<_> = path
-            .strip_prefix(Path::new("/tmp/cache/processed"))
+            .strip_prefix(Path::new("/tmp/cache/processed/insecure"))
             .unwrap()
             .components()
             .collect();
@@ -529,11 +570,23 @@ mod tests {
     }
 
     #[test]
+    fn cache_path_for_places_thumb_and_insecure_routes_under_distinct_namespaces() {
+        let cfg = cfg_with_cache_dir(Path::new("/tmp/cache"), Duration::from_secs(60));
+        let dirs = directives(OutFmt::Webp, 82, ResizeMode::Fit, 480, 480);
+        let key = derivative_cache_key(THUMB_ROUTE, "abc123.mp4", &dirs);
+        let path = cache_path_for(&cfg, THUMB_ROUTE, &key, &dirs.out_fmt);
+        assert!(
+            path.starts_with("/tmp/cache/processed/thumb"),
+            "thumb route must land under the thumb namespace, got {path:?}"
+        );
+    }
+
+    #[test]
     fn original_cache_path_for_lands_under_the_sharded_original_directory() {
         let cfg = cfg_with_cache_dir(Path::new("/tmp/cache"), Duration::from_secs(60));
-        let path = original_cache_path_for(&cfg, "https://e.com/a.png");
+        let path = original_cache_path_for(&cfg, INSECURE_ROUTE, "https://e.com/a.png");
         let levels: Vec<_> = path
-            .strip_prefix(Path::new("/tmp/cache/original"))
+            .strip_prefix(Path::new("/tmp/cache/original/insecure"))
             .unwrap()
             .components()
             .collect();
@@ -554,10 +607,10 @@ mod tests {
         let cfg = cfg_with_cache_dir(Path::new("/tmp/cache"), Duration::from_secs(60));
         let url = "https://e.com/a.png";
         let dirs = directives(OutFmt::Png, 82, ResizeMode::Fit, 480, 480);
-        let key = derivative_cache_key("insecure", url, &dirs);
+        let key = derivative_cache_key(INSECURE_ROUTE, url, &dirs);
         assert_ne!(
-            original_cache_path_for(&cfg, url),
-            cache_path_for(&cfg, &key, &dirs.out_fmt)
+            original_cache_path_for(&cfg, INSECURE_ROUTE, url),
+            cache_path_for(&cfg, INSECURE_ROUTE, &key, &dirs.out_fmt)
         );
     }
 
@@ -949,6 +1002,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_grants_the_thumb_namespace_the_immutable_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        // The short default TTL alone would expire both entries; only the
+        // `thumb/` one is old enough to still be inside the long TTL.
+        let mut cfg = cfg_with_cache_dir(dir.path(), Duration::from_secs(60));
+        cfg.cache_ttl_immutable = Duration::from_secs(30 * 24 * 3600);
+        let thumb = dir
+            .path()
+            .join("processed")
+            .join(THUMB_ROUTE)
+            .join("verified.webp");
+        let insecure = dir
+            .path()
+            .join("processed")
+            .join(INSECURE_ROUTE)
+            .join("url-addressed.webp");
+        write_cache_atomic(&thumb, b"verified").await.unwrap();
+        write_cache_atomic(&insecure, b"url-addressed")
+            .await
+            .unwrap();
+        let now = SystemTime::now();
+        set_mtime(&thumb, now - Duration::from_secs(3600));
+        set_mtime(&insecure, now - Duration::from_secs(3600));
+
+        run_cleanup(&cfg).await.unwrap();
+
+        assert!(
+            thumb.exists(),
+            "hash-verified thumb entries must survive past the short TTL"
+        );
+        assert!(
+            !insecure.exists(),
+            "URL-addressed insecure entries must still expire on the short TTL"
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_succeeds_when_cache_directories_do_not_exist() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg_with_cache_dir(&dir.path().join("absent"), Duration::from_secs(60));
@@ -1009,11 +1099,12 @@ mod tests {
     async fn write_cache_atomic_creates_the_sharded_parent_directories() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg_with_cache_dir(dir.path(), Duration::from_secs(60));
-        let path = original_cache_path_for(&cfg, "https://e.com/blob");
-        // Two hex-char levels under `original/`, neither of which exists yet.
+        let path = original_cache_path_for(&cfg, INSECURE_ROUTE, "https://e.com/blob");
+        // Two hex-char levels under `original/insecure/`, neither of which
+        // exists yet.
         assert_eq!(
             path.parent().unwrap().parent().unwrap().parent().unwrap(),
-            dir.path().join("original")
+            dir.path().join("original").join("insecure")
         );
 
         write_cache_atomic(&path, b"bytes").await.unwrap();

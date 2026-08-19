@@ -2189,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "rust-imgproxy"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "axum",
  "axum-extra",

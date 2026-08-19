@@ -723,6 +723,75 @@ pub async fn fetch_blob(
     max_blob_candidates: usize,
     fetch_timeout: Duration,
 ) -> Result<bytes::Bytes, crate::error::SvcError> {
+    fetch_blob_inner(
+        http,
+        candidate_failure_cache,
+        servers,
+        discovered_urls,
+        hash,
+        ext,
+        deadline,
+        max_bytes,
+        max_blob_candidates,
+        fetch_timeout,
+        true,
+    )
+    .await
+}
+
+/// Attempt a bounded, fully hash-verified download of a blob that may simply
+/// be too large to verify economically (the video-thumbnail path's use case:
+/// a candidate over `max_bytes` fails fast on `Content-Length` before any
+/// body is read). Consults the negative candidate cache to skip known-dead
+/// candidates, but — unlike [`fetch_blob`] — never *writes* to it: "too large
+/// to verify" or "didn't finish within budget" says nothing about candidate
+/// health, and recording it here would poison the very next call for the
+/// same request — the range-probed fallback, designed for exactly this case
+/// — into skipping the same candidate and failing outright.
+#[allow(clippy::too_many_arguments)]
+pub async fn try_fetch_verified_blob(
+    http: &reqwest::Client,
+    candidate_failure_cache: &CandidateFailureCache,
+    servers: &[String],
+    discovered_urls: &[String],
+    hash: &str,
+    ext: Option<&str>,
+    deadline: Instant,
+    max_bytes: usize,
+    max_blob_candidates: usize,
+    fetch_timeout: Duration,
+) -> Option<bytes::Bytes> {
+    fetch_blob_inner(
+        http,
+        candidate_failure_cache,
+        servers,
+        discovered_urls,
+        hash,
+        ext,
+        deadline,
+        max_bytes,
+        max_blob_candidates,
+        fetch_timeout,
+        false,
+    )
+    .await
+    .ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_blob_inner(
+    http: &reqwest::Client,
+    candidate_failure_cache: &CandidateFailureCache,
+    servers: &[String],
+    discovered_urls: &[String],
+    hash: &str,
+    ext: Option<&str>,
+    deadline: Instant,
+    max_bytes: usize,
+    max_blob_candidates: usize,
+    fetch_timeout: Duration,
+    record_failures: bool,
+) -> Result<bytes::Bytes, crate::error::SvcError> {
     let mut candidates = Vec::with_capacity(servers.len() + discovered_urls.len());
     let mut seen = HashSet::new();
 
@@ -769,19 +838,24 @@ pub async fn fetch_blob(
                     ?class,
                     candidate = %truncate_for_log(&url),
                     ?error,
+                    record_failures,
                     "blob candidate failed"
                 );
-                candidate_failure_cache.remember(hash, &url, class).await;
+                if record_failures {
+                    candidate_failure_cache.remember(hash, &url, class).await;
+                }
                 failures.record(class);
                 last_error = error;
             }
         }
     }
 
-    warn!(
-        attempted,
-        skipped, "all blob candidates failed for {}", hash
-    );
+    if record_failures {
+        warn!(
+            attempted,
+            skipped, "all blob candidates failed for {}", hash
+        );
+    }
     Err(if attempted == 0 {
         failures.into_error()
     } else {
@@ -1102,5 +1176,85 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(SvcError::UpstreamError(504))));
+    }
+
+    #[tokio::test]
+    async fn try_fetch_verified_blob_returns_hash_verified_bytes() {
+        let expected_bytes = b"verified video blob".to_vec();
+        let hash = hex::encode(Sha256::digest(&expected_bytes));
+        let server = spawn_blob_server(expected_bytes.clone()).await;
+        crate::init_crypto_provider();
+        let http = reqwest::Client::builder()
+            .resolve("video.example", server)
+            .build()
+            .unwrap();
+        let servers = vec![format!("http://video.example:{}", server.port())];
+        let failure_cache = CandidateFailureCache::new(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+
+        let bytes = try_fetch_verified_blob(
+            &http,
+            &failure_cache,
+            &servers,
+            &[],
+            &hash,
+            Some("mp4"),
+            Instant::now() + Duration::from_secs(1),
+            1024 * 1024,
+            8,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(bytes.map(|b| b.to_vec()), Some(expected_bytes));
+    }
+
+    #[tokio::test]
+    async fn try_fetch_verified_blob_does_not_poison_the_negative_cache_on_failure() {
+        // A candidate whose body exceeds `max_bytes` fails fast on
+        // `Content-Length`. Unlike `fetch_blob`, that failure must never be
+        // written to the shared negative cache — the range-probe fallback
+        // that runs next for the same request is designed for exactly this
+        // "too large" case, and would otherwise find the same candidate
+        // pre-poisoned and skip it, breaking every request for that video.
+        let expected_bytes = vec![b'x'; 4096];
+        let hash = hex::encode(Sha256::digest(&expected_bytes));
+        let server = spawn_blob_server(expected_bytes.clone()).await;
+        crate::init_crypto_provider();
+        let http = reqwest::Client::builder()
+            .resolve("big.example", server)
+            .build()
+            .unwrap();
+        let candidate = format!("http://big.example:{}", server.port());
+        let servers = vec![candidate.clone()];
+        let failure_cache = CandidateFailureCache::new(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+
+        let bytes = try_fetch_verified_blob(
+            &http,
+            &failure_cache,
+            &servers,
+            &[],
+            &hash,
+            Some("mp4"),
+            Instant::now() + Duration::from_secs(1),
+            1024, // smaller than the 4096-byte body: fails fast on Content-Length
+            8,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(bytes.is_none(), "oversized candidate must not verify");
+        assert_eq!(
+            failure_cache.lookup(&hash, &candidate).await,
+            None,
+            "a size-bounded verify failure must not poison the negative cache"
+        );
     }
 }
