@@ -19,6 +19,17 @@ pub struct AppCfg {
     pub cache_ttl_immutable: Duration,
     pub fetch_timeout: Duration,
     pub blossom_failover_timeout: Duration,
+    /// Wall-clock budget for one video-thumbnail request end to end: preflight,
+    /// every range-probe round trip, and FFmpeg's own decode. Separate from
+    /// `fetch_timeout`/`blossom_failover_timeout` because a video is
+    /// structurally more expensive to seek than a single-request image fetch
+    /// — Matroska/WebM in particular needs several round trips (SeekHead,
+    /// then Cues, then the target cluster) where an MP4 usually needs one.
+    /// Reusing the image deadline let that extra cost silently eat into (and
+    /// occasionally exceed) a budget sized for a single request. Kept above
+    /// `ffmpeg_timeout` by default so the FFmpeg process budget is never the
+    /// dead letter.
+    pub video_deadline: Duration,
     pub max_image_bytes: usize,
     pub blossom_fallback_servers: Vec<String>,
     pub blossom_negative_not_found_ttl: Duration,
@@ -153,6 +164,7 @@ impl AppCfg {
             cache_ttl_immutable: env_secs("CACHE_TTL_IMMUTABLE_SECS", 30 * 24 * 3600),
             fetch_timeout: env_secs("FETCH_TIMEOUT_SECS", 10),
             blossom_failover_timeout: env_secs("BLOSSOM_FAILOVER_TIMEOUT_SECS", 15),
+            video_deadline: env_secs("VIDEO_DEADLINE_SECS", 25),
             max_image_bytes: env_parsed("MAX_IMAGE_BYTES", 16 * 1024 * 1024),
             blossom_fallback_servers,
             blossom_negative_not_found_ttl: env_secs(
@@ -265,6 +277,7 @@ mod tests {
         "CACHE_TTL_IMMUTABLE_SECS",
         "FETCH_TIMEOUT_SECS",
         "BLOSSOM_FAILOVER_TIMEOUT_SECS",
+        "VIDEO_DEADLINE_SECS",
         "MAX_IMAGE_BYTES",
         "BLOSSOM_FALLBACK_SERVERS",
         "BLOSSOM_NEGATIVE_CACHE_NOT_FOUND_TTL_SECS",
@@ -336,6 +349,7 @@ mod tests {
         assert_eq!(cfg.cache_ttl_immutable, Duration::from_secs(30 * 24 * 3600));
         assert_eq!(cfg.fetch_timeout, Duration::from_secs(10));
         assert_eq!(cfg.blossom_failover_timeout, Duration::from_secs(15));
+        assert_eq!(cfg.video_deadline, Duration::from_secs(25));
         assert_eq!(cfg.max_image_bytes, 16 * 1024 * 1024);
         assert_eq!(cfg.blossom_negative_not_found_ttl, Duration::from_secs(900));
         assert_eq!(
@@ -386,6 +400,7 @@ mod tests {
                 ("CACHE_TTL_IMMUTABLE_SECS", "240"),
                 ("FETCH_TIMEOUT_SECS", "7"),
                 ("BLOSSOM_FAILOVER_TIMEOUT_SECS", "21"),
+                ("VIDEO_DEADLINE_SECS", "33"),
                 ("MAX_IMAGE_BYTES", "2048"),
                 ("BLOSSOM_NEGATIVE_CACHE_NOT_FOUND_TTL_SECS", "11"),
                 ("BLOSSOM_NEGATIVE_CACHE_PERMANENT_TTL_SECS", "22"),
@@ -425,6 +440,7 @@ mod tests {
         assert_eq!(cfg.cache_ttl_immutable, Duration::from_secs(240));
         assert_eq!(cfg.fetch_timeout, Duration::from_secs(7));
         assert_eq!(cfg.blossom_failover_timeout, Duration::from_secs(21));
+        assert_eq!(cfg.video_deadline, Duration::from_secs(33));
         assert_eq!(cfg.max_image_bytes, 2048);
         assert_eq!(cfg.blossom_negative_not_found_ttl, Duration::from_secs(11));
         assert_eq!(cfg.blossom_negative_permanent_ttl, Duration::from_secs(22));

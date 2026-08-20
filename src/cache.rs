@@ -451,6 +451,7 @@ mod tests {
             cache_ttl_immutable: Duration::from_secs(30 * 24 * 3600),
             fetch_timeout: Duration::from_secs(1),
             blossom_failover_timeout: Duration::from_secs(1),
+            video_deadline: Duration::from_secs(1),
             max_image_bytes: 1024,
             blossom_fallback_servers: Vec::new(),
             blossom_negative_not_found_ttl: Duration::from_secs(1),

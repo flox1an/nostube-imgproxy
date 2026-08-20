@@ -215,7 +215,8 @@ Configure via environment variables:
 | `CACHE_DIR` | `./cache` | Cache directory path |
 | `CACHE_TTL_SECS` | `86400` (24h) | TTL for URL-addressed (`/insecure`) cache entries |
 | `CACHE_TTL_IMMUTABLE_SECS` | `2592000` (30d) | TTL for hash-verified (`thumb`) cache entries; these cannot go stale behind their key, so `MAX_CACHE_BYTES` is the real bound |
-| `FETCH_TIMEOUT_SECS` | `10` | HTTP fetch timeout |
+| `FETCH_TIMEOUT_SECS` | `10` | HTTP fetch timeout for a single image request |
+| `VIDEO_DEADLINE_SECS` | `25` | Wall-clock budget for one video-thumbnail request end to end (preflight, every range-probe round trip, FFmpeg's own decode). Separate from `FETCH_TIMEOUT_SECS`/`BLOSSOM_FAILOVER_TIMEOUT_SECS`: WebM/Matroska in particular needs several round trips (SeekHead, then Cues, then the target cluster) where MP4 usually needs one |
 | `BLOSSOM_NEGATIVE_CACHE_NOT_FOUND_TTL_SECS` | `900` (15m) | Cache 404/410 Blossom candidates; `0` disables this class |
 | `BLOSSOM_NEGATIVE_CACHE_PERMANENT_TTL_SECS` | `3600` (1h) | Cache 3xx and non-transient 4xx Blossom candidates; `0` disables this class |
 | `BLOSSOM_NEGATIVE_CACHE_TRANSIENT_TTL_SECS` | `60` | Cache timeouts, transport failures, 429, and 5xx Blossom candidates; `0` disables this class |

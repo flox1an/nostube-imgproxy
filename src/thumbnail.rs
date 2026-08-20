@@ -20,7 +20,7 @@ use tokio::{
     io::AsyncReadExt,
     sync::{oneshot, Semaphore},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     blossom::{
@@ -417,11 +417,22 @@ pub async fn extract_video_thumbnail(
         }
     }
 
-    if negative_cache.is_some() && expected_hash.is_some() && attempted == 0 {
-        Err(failures.into_error())
-    } else {
-        Err(last_error)
+    if attempted == 0 && negative_cache.is_some() && expected_hash.is_some() {
+        return Err(failures.into_error());
     }
+    // Every candidate was tried and none produced a thumbnail. This is the
+    // one place that can tell an operator *why* a specific video never gets
+    // a thumbnail — per-candidate failures above are recorded silently into
+    // the negative-candidate cache, and callers only see a generic HTTP
+    // status. Warn (not debug) so it shows under the default `RUST_LOG=info`.
+    warn!(
+        source = %log_value(video_url),
+        candidates = candidates.len(),
+        attempted,
+        error = ?last_error,
+        "video thumbnail extraction exhausted every candidate"
+    );
+    Err(last_error)
 }
 
 async fn remember_failure(
@@ -551,6 +562,11 @@ async fn run_ffmpeg_extract(
         Ok(result) => result.map_err(SvcError::Io)?,
         Err(_) => {
             metrics::record_ffmpeg_extraction(false);
+            warn!(
+                demuxer,
+                timeout_secs = timeout.as_secs(),
+                "ffmpeg did not finish within its timeout budget"
+            );
             return Err(SvcError::UpstreamError(504));
         }
     };

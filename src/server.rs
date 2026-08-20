@@ -704,7 +704,15 @@ async fn handle_image_request(
             })
         })?;
     let original_cache_path = original_cache_path_for(&state.app.cfg, INSECURE_ROUTE, &src_url);
-    let deadline = Instant::now() + state.app.cfg.fetch_timeout;
+    // A video needs several range-probe round trips where an image needs
+    // one; reusing `fetch_timeout` for both let video silently inherit a
+    // budget sized for the cheaper case.
+    let deadline = Instant::now()
+        + if is_video {
+            state.app.cfg.video_deadline
+        } else {
+            state.app.cfg.fetch_timeout
+        };
     let source = Source::Direct {
         is_video,
         url: src_url,
@@ -892,7 +900,14 @@ async fn handle_thumb_request(
             Vec::new()
         }
     };
-    let deadline = Instant::now() + state.app.cfg.blossom_failover_timeout;
+    // Same asymmetry as `/insecure`: video needs multiple round trips, so it
+    // gets its own, longer deadline instead of inheriting the image budget.
+    let deadline = Instant::now()
+        + if is_video {
+            state.app.cfg.video_deadline
+        } else {
+            state.app.cfg.blossom_failover_timeout
+        };
 
     tracing::debug!(
         "Resolved {} server and {} discovered candidates for {}",
