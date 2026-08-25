@@ -1,0 +1,7 @@
+# cargo-audit configuration
+# https://github.com/rustsec/rustsec/tree/main/cargo-audit#configuration-file-audittoml
+
+[advisories]
+# RUSTSEC-2024-0436: paste is no longer maintained by upstream author.
+# It is pulled transitively by rav1e (via ravif for AVIF encoding) and contains no known vulnerability.
+ignore = ["RUSTSEC-2024-0436"]

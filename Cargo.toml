@@ -1,6 +1,6 @@
 [package]
 name = "rust-imgproxy"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 
 [dependencies]
@@ -41,7 +41,7 @@ ravif = "0.13"
 rgb = "0.8"
 sha2 = "0.11"
 hmac = "0.13"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 percent-encoding = "2"
 thiserror = "2"
@@ -51,7 +51,7 @@ mime = "0.3"
 walkdir = "2"
 fs2 = "0.4"
 tempfile = "3"
-nostr-sdk = "0.45.1"
+nostr-sdk = "0.45"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 prometheus = "0.14"
