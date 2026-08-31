@@ -100,8 +100,9 @@ pub struct AppCfg {
     /// secret to misconfigure, output shape is fixed to a small published
     /// preset set — so it is enabled by default.
     pub preset_thumbnails_enabled: bool,
-    /// General per-IP request budget across every image/thumb route, hit or
-    /// miss. Generous: a cache hit is cheap to serve.
+    /// General per-IP request budget for cache-miss traffic across every
+    /// image/thumb route. Cache hits never consume this budget — they are
+    /// served without any rate-limit check.
     pub rate_ip_requests_per_min: u32,
     /// Per-IP budget for cache-miss image decode/resize/encode work.
     pub rate_ip_image_generations_per_min: u32,

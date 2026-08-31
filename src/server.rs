@@ -672,11 +672,6 @@ async fn handle_image_request(
     dirs.resize.validate(state.app.cfg.max_image_dimension)?;
     validate_untrusted_url(&src_url)?;
 
-    state
-        .media_rate_limits
-        .admit_request(peer_ip)
-        .inspect_err(|_| metrics::record_rate_limit_rejection("request"))?;
-
     // Signed and legacy direct media deliberately share this namespace: access
     // control changes who may request a derivative, not its output bytes.
     let is_video = is_video_url(&src_url);
@@ -692,6 +687,11 @@ async fn handle_image_request(
             return Ok(resp);
         }
     }
+    state
+        .media_rate_limits
+        .admit_request(peer_ip)
+        .inspect_err(|_| metrics::record_rate_limit_rejection("request"))?;
+
     metrics::record_cache_miss("processed");
     state
         .media_rate_limits
@@ -828,11 +828,6 @@ async fn handle_thumb_request(
         .as_deref()
         .is_some_and(|extension| is_video_url(&format!("{hash}.{extension}")));
 
-    state
-        .media_rate_limits
-        .admit_request(peer_ip)
-        .inspect_err(|_| metrics::record_rate_limit_rejection("request"))?;
-
     // Build cache key from the canonical blob name and request parameters.
     let cache_key = derivative_cache_key(THUMB_ROUTE, &blob_name, &dirs);
     let cache_path = cache_path_for(&state.app.cfg, THUMB_ROUTE, &cache_key, &dirs.out_fmt);
@@ -848,6 +843,11 @@ async fn handle_thumb_request(
     if let Some(resp) = serve_cached(&cache_path, mime, &request_headers, hit_policy).await? {
         return Ok(resp);
     }
+    state
+        .media_rate_limits
+        .admit_request(peer_ip)
+        .inspect_err(|_| metrics::record_rate_limit_rejection("request"))?;
+
     metrics::record_cache_miss("processed");
     state
         .media_rate_limits
