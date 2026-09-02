@@ -824,9 +824,6 @@ async fn handle_thumb_request(
         Some(ext) => format!("{hash}.{ext}"),
         None => hash.clone(),
     };
-    let is_video = ext
-        .as_deref()
-        .is_some_and(|extension| is_video_url(&format!("{hash}.{extension}")));
 
     // Build cache key from the canonical blob name and request parameters.
     let cache_key = derivative_cache_key(THUMB_ROUTE, &blob_name, &dirs);
@@ -849,16 +846,6 @@ async fn handle_thumb_request(
         .inspect_err(|_| metrics::record_rate_limit_rejection("request"))?;
 
     metrics::record_cache_miss("processed");
-    state
-        .media_rate_limits
-        .admit_generation(peer_ip, is_video)
-        .inspect_err(|_| {
-            metrics::record_rate_limit_rejection(if is_video {
-                "video_generation"
-            } else {
-                "image_generation"
-            })
-        })?;
 
     // Get author servers if pubkey provided
     let author_servers = if let Some(pubkey) = hints.author_pubkey {
@@ -900,6 +887,27 @@ async fn handle_thumb_request(
             Vec::new()
         }
     };
+
+    // A caller that requests a bare hash (no extension) gives us no way to
+    // tell video from image up front. NIP-94 discovery often turns up an
+    // extensioned URL for the same hash even then, so fall back to sniffing
+    // those before defaulting to "image" and silently failing every video.
+    let is_video = match ext.as_deref() {
+        Some(extension) => is_video_url(&format!("{hash}.{extension}")),
+        None => discovered.iter().any(|url| is_video_url(url)),
+    };
+
+    state
+        .media_rate_limits
+        .admit_generation(peer_ip, is_video)
+        .inspect_err(|_| {
+            metrics::record_rate_limit_rejection(if is_video {
+                "video_generation"
+            } else {
+                "image_generation"
+            })
+        })?;
+
     // Same asymmetry as `/insecure`: video needs multiple round trips, so it
     // gets its own, longer deadline instead of inheriting the image budget.
     let deadline = Instant::now()
