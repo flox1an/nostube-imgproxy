@@ -36,15 +36,15 @@ use crate::{
     cpu::CpuPool,
     error::SvcError,
     fetch::read_body_capped,
-    metrics,
+    hls, metrics,
     network_policy::validate_untrusted_url,
     preset::Preset,
     ratelimit::MediaRateLimiters,
     signing::signature_error,
     singleflight::SingleFlight,
     thumbnail::{
-        extract_thumbnail_from_verified_bytes, extract_video_thumbnail, is_video_url,
-        ThumbnailState,
+        extract_thumbnail_from_verified_bytes, extract_thumbnail_from_verified_playlist,
+        extract_video_thumbnail, is_video_url, ThumbnailState,
     },
     transform::{
         parse_resize_directive, parse_rest, process_image, Directives, OutFmt, Resize, ResizeMode,
@@ -465,6 +465,33 @@ async fn load_original(
             )
             .await?;
             metrics::record_bytes_downloaded("blossom", bytes.len());
+            // HLS playlists are published under arbitrary names (real-world
+            // Blossom blobs use `.txt`), so the extension cannot be trusted:
+            // sniff the verified bytes. The playlist itself is hash-verified,
+            // but its segment bytes are not, so the thumbnail counts as
+            // unverified — same rule as a range-probed video, never
+            // hash-keyed cached — and background verification is pointless.
+            if hls::is_hls_playlist(&bytes) {
+                tracing::info!(hash = %hash, "HLS playlist detected via content sniff");
+                let primary = servers
+                    .first()
+                    .map(|server| blossom_blob_url(server, hash, ext.as_deref()))
+                    .ok_or(SvcError::BadRequest(
+                        "no servers available for video thumbnail",
+                    ))?;
+                let thumbnail = extract_thumbnail_from_verified_playlist(
+                    &bytes,
+                    &primary,
+                    &state.thumbnail.ffmpeg_semaphore,
+                    &state.app.http,
+                    cfg.max_video_probe_bytes,
+                    cfg.max_image_bytes,
+                    Instant::now() + cfg.video_deadline,
+                    cfg.ffmpeg_timeout,
+                )
+                .await?;
+                return Ok((thumbnail, false));
+            }
             (bytes.to_vec(), true)
         }
     };
@@ -600,13 +627,11 @@ async fn produce_derivative(
         metrics::record_image_processed(out_fmt_str);
     }
 
-    // Persist once decode/resize/encode has proven the bytes are a real
-    // image: statically for URL- and hash-addressed images
-    // (`source.cacheable()`), or dynamically for a Blossom video whose full
-    // body was hash-verified above (`verified`). A range-probed video that
-    // could not be fully verified must never enter the hash-keyed disk
-    // cache.
-    if source.cacheable() || verified {
+    // Persist only what `load_original` could prove: hash-verified image
+    // bytes, or a verified Blossom blob. Range-probed video and HLS
+    // thumbnails (verified playlist, unverified segments) return
+    // `verified: false` and must never enter the hash-keyed disk cache.
+    if verified {
         write_cache_atomic(&cache_path, &encoded).await?;
         write_cache_atomic(&original_cache_path, &original).await?;
     }

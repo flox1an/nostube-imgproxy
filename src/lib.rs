@@ -9,6 +9,7 @@ pub mod config;
 pub mod cpu;
 pub mod error;
 pub mod fetch;
+pub mod hls;
 pub mod metrics;
 pub mod network_policy;
 pub mod preset;

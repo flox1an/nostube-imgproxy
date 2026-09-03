@@ -8,14 +8,12 @@ use std::{
 };
 
 use axum::{
-    body::Body,
     extract::{Path as AxPath, State},
     http::{header, HeaderMap, StatusCode},
     response::Response,
     routing::get,
     Router,
 };
-use futures_util::StreamExt;
 use tokio::{
     io::AsyncReadExt,
     sync::{oneshot, Semaphore},
@@ -27,11 +25,13 @@ use crate::{
         extract_blossom_hash, CandidateFailureCache, CandidateFailureClass, CandidateFailureSummary,
     },
     error::SvcError,
+    hls::{budget_counting_body, fetch_playlist, HLS_DEMUXER, HLS_PROTOCOL_WHITELIST},
     metrics,
     network_policy::validate_untrusted_url,
 };
 
 const MAX_FFMPEG_STDERR_BYTES: usize = 8 * 1024;
+#[cfg(target_os = "linux")]
 const FFMPEG_ADDRESS_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 const FFMPEG_FILE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -50,8 +50,11 @@ impl ThumbnailState {
 
 /// Return the explicit FFmpeg demuxer for a supported video URL.
 ///
-/// Playlist formats intentionally have no entry. A playlist can introduce
-/// nested segment URLs which would evade the one-source media gateway below.
+/// Direct container extensions map to their demuxers. HLS playlists (`.m3u8`)
+/// map to the `hls` demuxer and are only safe because the gateway rewrites
+/// their segment URIs onto the loopback proxy (see [`crate::hls`]); the same
+/// rewriting is what makes a playlist published under a foreign extension
+/// (`#EXTM3U` sniffing) usable.
 fn input_demuxer(url: &str) -> Option<&'static str> {
     let lower = url.to_ascii_lowercase();
     let path = lower.split('?').next().unwrap_or(&lower);
@@ -73,6 +76,8 @@ fn input_demuxer(url: &str) -> Option<&'static str> {
         Some("mpeg")
     } else if path.ends_with(".ogv") {
         Some("ogg")
+    } else if path.ends_with(".m3u8") || path.ends_with(".m3u") {
+        Some(HLS_DEMUXER)
     } else {
         None
     }
@@ -236,21 +241,10 @@ async fn serve_media_range(
             .map(|value| (name, value))
     })
     .collect();
-    let mut response = Response::new(Body::from_stream(upstream.bytes_stream().map({
-        let remaining_bytes = Arc::clone(&state.remaining_bytes);
-        move |chunk| match chunk {
-            Ok(chunk) => {
-                let len = chunk.len() as u64;
-                remaining_bytes
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                        left.checked_sub(len)
-                    })
-                    .map_err(|_| std::io::Error::other("video probe byte budget exhausted"))?;
-                Ok::<_, std::io::Error>(chunk)
-            }
-            Err(error) => Err(std::io::Error::other(error)),
-        }
-    })));
+    let mut response = Response::new(budget_counting_body(
+        upstream.bytes_stream(),
+        Arc::clone(&state.remaining_bytes),
+    ));
     *response.status_mut() = StatusCode::PARTIAL_CONTENT;
 
     for (name, value) in response_headers {
@@ -278,7 +272,7 @@ fn clamp_open_range(range: &str, budget: u64) -> String {
     range.to_string()
 }
 
-fn proxy_token() -> String {
+pub(crate) fn proxy_token() -> String {
     use std::hash::{BuildHasher, Hasher};
 
     static RANDOM: std::sync::LazyLock<std::collections::hash_map::RandomState> =
@@ -494,6 +488,16 @@ async fn run_ffmpeg_extract(
     let output_path = temp_file.path().to_path_buf();
 
     let mut command = Command::new("ffmpeg");
+    // Input seek (`-ss` before `-i`) is the cheap path for direct containers:
+    // FFmpeg seeks by byte offset without decoding. FFmpeg's HLS demuxer,
+    // however, silently produces zero frames and a zero exit for an input
+    // seek, so playlists take the output-seek order instead: decode-and-
+    // discard from the head, then take the first frame at/after 0.5s.
+    let seek_and_input: &[&str] = if demuxer == HLS_DEMUXER {
+        &["-f", demuxer, "-i", input, "-ss", "0.5"]
+    } else {
+        &["-ss", "0.5", "-f", demuxer, "-i", input]
+    };
     command
         .args([
             "-nostdin",
@@ -522,12 +526,9 @@ async fn run_ffmpeg_extract(
             // the frame-threaded code path entirely.
             "-threads",
             "1",
-            "-ss",
-            "0.5",
-            "-f",
-            demuxer,
-            "-i",
-            input,
+        ])
+        .args(seek_and_input)
+        .args([
             "-t",
             "5",
             "-map",
@@ -573,7 +574,13 @@ async fn run_ffmpeg_extract(
     let stderr = stderr_task.await.unwrap_or_else(|_| Vec::new());
     if !status.success() {
         metrics::record_ffmpeg_extraction(false);
-        tracing::debug!(stderr = %String::from_utf8_lossy(&stderr), "ffmpeg thumbnail extraction failed");
+        let stderr = String::from_utf8_lossy(&stderr);
+        tracing::debug!(stderr = %stderr, "ffmpeg thumbnail extraction failed");
+        // Audio-only HLS inputs exit 0 having matched no video stream at all;
+        // that is a property of the source, not an upstream fault.
+        if stderr.contains("matches no streams") {
+            return Err(SvcError::BadRequest("source has no video stream"));
+        }
         return Err(SvcError::UpstreamError(502));
     }
 
@@ -582,6 +589,12 @@ async fn run_ffmpeg_extract(
         .map_err(SvcError::Io)?;
     if metadata.len() == 0 || metadata.len() > max_image_bytes as u64 {
         metrics::record_ffmpeg_extraction(false);
+        tracing::debug!(
+            output_bytes = metadata.len(),
+            max_image_bytes,
+            demuxer,
+            "ffmpeg produced no usable image"
+        );
         return Err(SvcError::UpstreamError(502));
     }
     let thumbnail = tokio::fs::read(&output_path).await.map_err(SvcError::Io)?;
@@ -589,8 +602,6 @@ async fn run_ffmpeg_extract(
     Ok(thumbnail)
 }
 
-/// Spawn one constrained FFmpeg process and have it read only from the local
-/// media gateway.
 #[allow(clippy::too_many_arguments)]
 async fn extract_thumbnail_with_ffmpeg(
     source_url: String,
@@ -601,15 +612,32 @@ async fn extract_thumbnail_with_ffmpeg(
     max_image_bytes: usize,
     timeout: Duration,
 ) -> Result<Vec<u8>, SvcError> {
-    let proxy = LocalMediaProxy::start(source_url, http, deadline, max_probe_bytes).await?;
-    run_ffmpeg_extract(
-        &proxy.input_url,
-        "file,http,tcp",
-        demuxer,
-        max_image_bytes,
-        timeout,
-    )
-    .await
+    // A playlist input needs the HLS gateway: the playlist is fetched and
+    // rewritten once, and FFmpeg's segment requests loop back through it.
+    if demuxer == HLS_DEMUXER {
+        let budget = Arc::new(AtomicU64::new(max_probe_bytes));
+        let playlist = fetch_playlist(&http, &source_url, deadline, &budget).await?;
+        let proxy =
+            crate::hls::HlsMediaProxy::start(playlist, &source_url, http, deadline, budget).await?;
+        run_ffmpeg_extract(
+            &proxy.input_url,
+            HLS_PROTOCOL_WHITELIST,
+            demuxer,
+            max_image_bytes,
+            timeout,
+        )
+        .await
+    } else {
+        let proxy = LocalMediaProxy::start(source_url, http, deadline, max_probe_bytes).await?;
+        run_ffmpeg_extract(
+            &proxy.input_url,
+            "file,http,tcp",
+            demuxer,
+            max_image_bytes,
+            timeout,
+        )
+        .await
+    }
 }
 
 /// Extract a thumbnail frame from a video blob whose bytes are already
@@ -643,6 +671,50 @@ pub async fn extract_thumbnail_from_verified_bytes(
     run_ffmpeg_extract(&input_path, "file", demuxer, max_image_bytes, timeout).await
 }
 
+/// Extract a thumbnail from an HLS playlist whose bytes are already
+/// hash-verified and fully local (e.g. via
+/// [`crate::blossom::try_fetch_verified_blob`] or the image-path
+/// `#EXTM3U` sniff). The playlist is served from memory through the
+/// [`crate::hls::HlsMediaProxy`]; only its *segments* are still remote, so
+/// unlike [`extract_thumbnail_from_verified_bytes`] this needs network
+/// access (`http` in the whitelist, loopback gateway only) and a probe
+/// budget. The resulting thumbnail is derived from unverified segment bytes
+/// and must be treated as such by callers (never hash-keyed cached).
+#[allow(clippy::too_many_arguments)]
+pub async fn extract_thumbnail_from_verified_playlist(
+    playlist: &[u8],
+    base_url: &str,
+    semaphore: &Arc<Semaphore>,
+    http: &reqwest::Client,
+    max_probe_bytes: u64,
+    max_image_bytes: usize,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<Vec<u8>, SvcError> {
+    let _permit = semaphore
+        .acquire()
+        .await
+        .map_err(|_| SvcError::InternalError("ffmpeg semaphore closed".into()))?;
+
+    let budget = Arc::new(AtomicU64::new(max_probe_bytes));
+    let proxy = crate::hls::HlsMediaProxy::start(
+        playlist.to_vec(),
+        base_url,
+        http.clone(),
+        deadline,
+        budget,
+    )
+    .await?;
+    run_ffmpeg_extract(
+        &proxy.input_url,
+        HLS_PROTOCOL_WHITELIST,
+        HLS_DEMUXER,
+        max_image_bytes,
+        timeout,
+    )
+    .await
+}
+
 async fn read_capped<R>(mut reader: R, cap: usize) -> Vec<u8>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -670,11 +742,21 @@ fn apply_ffmpeg_limits(
     let cpu_seconds = timeout.as_secs().saturating_add(1).max(1);
     unsafe {
         command.as_std_mut().pre_exec(move || {
-            for (resource, limit) in [
+            // Darwin has no address-space rlimit: `setrlimit(RLIMIT_AS, …)`
+            // fails with EINVAL, which aborts the whole spawn. Linux enforces
+            // it (production); macOS ignores the concept entirely.
+            #[cfg(target_os = "linux")]
+            let limits = [
                 (libc::RLIMIT_AS, FFMPEG_ADDRESS_LIMIT_BYTES),
                 (libc::RLIMIT_CPU, cpu_seconds),
                 (libc::RLIMIT_FSIZE, FFMPEG_FILE_LIMIT_BYTES),
-            ] {
+            ];
+            #[cfg(not(target_os = "linux"))]
+            let limits = [
+                (libc::RLIMIT_CPU, cpu_seconds),
+                (libc::RLIMIT_FSIZE, FFMPEG_FILE_LIMIT_BYTES),
+            ];
+            for (resource, limit) in limits {
                 let value = libc::rlimit {
                     rlim_cur: limit as libc::rlim_t,
                     rlim_max: limit as libc::rlim_t,
@@ -703,10 +785,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_video_url_accepts_direct_containers_and_rejects_playlists() {
+    fn is_video_url_accepts_containers_and_m3u8_but_rejects_other_manifests() {
         assert!(is_video_url("https://cdn.example/video.mp4"));
         assert!(is_video_url("https://cdn.example/video.webm?download=1"));
-        assert!(!is_video_url("https://cdn.example/video.m3u8"));
+        // HLS playlists route through the rewriting gateway, DASH still has
+        // no entry.
+        assert!(is_video_url("https://cdn.example/video.m3u8"));
         assert!(!is_video_url("https://cdn.example/video.mpd"));
     }
 

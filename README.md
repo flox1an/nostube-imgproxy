@@ -146,7 +146,7 @@ curl "http://127.0.0.1:8080/insecure/f:webp/rs:fill:200:200/plain/https%3A%2F%2F
 curl "http://127.0.0.1:8080/insecure/f:jpeg/rs:fit:800:600/plain/https%3A%2F%2Fexample.com%2Fvideo.mp4" -o thumb_large.jpg
 ```
 
-**Supported video formats:** `.mp4`, `.mov`, `.avi`, `.webm`, `.mkv`, `.flv`, `.wmv`, `.m4v`, `.mpg`, `.mpeg`, `.3gp`, `.ogv`
+**Supported video formats:** `.mp4`, `.mov`, `.avi`, `.webm`, `.mkv`, `.flv`, `.wmv`, `.m4v`, `.mpg`, `.mpeg`, `.3gp`, `.ogv`, plus HLS playlists (`.m3u8`, and content-sniffed playlists published under other extensions)
 
 ### URL Structure
 
@@ -199,11 +199,11 @@ No other directive may be supplied on this route: `f`, `rs`, `q`, `width`, and `
     - `auto` - Automatically choose fill or fit based on orientation
 
 **Video Handling:**
-- Detected by direct-container extension; HLS/DASH playlists are intentionally unsupported
-- FFmpeg extracts one frame at 0.5 seconds through a loopback-only, range-aware media gateway
-- The gateway preserves range seeking for large videos while enforcing source URL policy, timeout, and transfer budget
-- Video thumbnails are not disk-cached under a Blossom hash unless the complete source can be hash-verified
-- The thumbnail is processed like a regular image (resize and encode)
+- Direct containers are detected by extension; HLS playlists (`.m3u8`) and content-sniffed `#EXTM3U` blobs are supported through a rewriting loopback gateway
+- FFmpeg extracts one frame at 0.5 seconds. Every playlist-referenced segment, key, and variant is re-resolved through the guarded client — FFmpeg only ever talks to loopback — under the same source-URL policy, timeout, and transfer budget as range-probed videos
+- HLS thumbnails derive from a hash-verified playlist but unverified segment bytes, so they are never disk-cached under a Blossom hash
+- Audio-only playlists cannot yield a frame and answer `400 source has no video stream`
+- The extracted frame is processed like a regular image (resize and encode)
 
 ## Configuration
 
@@ -280,6 +280,7 @@ src/
 ├── config.rs     # Configuration and app state
 ├── error.rs      # Error types and IntoResponse impl
 ├── server.rs     # HTTP server and route handlers (unified image/video handling)
+├── hls.rs        # HLS playlist rewriting and segment gateway
 ├── transform.rs  # Image transformation logic (resize, encode, parse)
 ├── thumbnail.rs  # Video thumbnail extraction (FFmpeg integration)
 ├── verify.rs     # Background hash-verification gating for video blobs

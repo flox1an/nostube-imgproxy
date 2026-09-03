@@ -56,20 +56,28 @@ pub fn validate_untrusted_target(url: &Url) -> Result<(), SvcError> {
     }
 
     match url.host() {
-        Some(Host::Domain(host))
-            if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") =>
-        {
-            Err(SvcError::BadRequest("private upstream is not allowed"))
+        Some(Host::Domain(host)) => {
+            if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+                return Err(SvcError::BadRequest("private upstream is not allowed"));
+            }
+            // Relay-supplied events occasionally carry junk "hostnames" (an
+            // npub, a bare word). Real public servers have a dot somewhere;
+            // single-label names can only ever resolve through a search-domain
+            // suffix, which the public-DNS resolver must not be doing.
+            if !host.contains('.') {
+                return Err(SvcError::BadRequest("upstream host is not a public server"));
+            }
         }
         Some(Host::Ipv4(ip)) if !is_public_ip(IpAddr::V4(ip)) => {
-            Err(SvcError::BadRequest("private upstream is not allowed"))
+            return Err(SvcError::BadRequest("private upstream is not allowed"));
         }
         Some(Host::Ipv6(ip)) if !is_public_ip(IpAddr::V6(ip)) => {
-            Err(SvcError::BadRequest("private upstream is not allowed"))
+            return Err(SvcError::BadRequest("private upstream is not allowed"));
         }
-        Some(_) => Ok(()),
-        None => Err(SvcError::BadRequest("upstream host is required")),
+        Some(_) => {}
+        None => return Err(SvcError::BadRequest("upstream host is required")),
     }
+    Ok(())
 }
 
 /// Redirect policy for untrusted fetches: follow the chain, but re-validate
