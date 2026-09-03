@@ -60,6 +60,8 @@ fn input_demuxer(url: &str) -> Option<&'static str> {
     let path = lower.split('?').next().unwrap_or(&lower);
     if path.ends_with(".mp4")
         || path.ends_with(".mov")
+        || path.ends_with(".quicktime")
+        || path.ends_with(".qt")
         || path.ends_with(".m4v")
         || path.ends_with(".3gp")
     {
@@ -821,6 +823,8 @@ mod tests {
     fn is_video_url_accepts_containers_and_m3u8_but_rejects_other_manifests() {
         assert!(is_video_url("https://cdn.example/video.mp4"));
         assert!(is_video_url("https://cdn.example/video.webm?download=1"));
+        assert!(is_video_url("https://cdn.example/video.quicktime"));
+        assert!(is_video_url("https://cdn.example/video.qt"));
         // HLS playlists route through the rewriting gateway, DASH still has
         // no entry.
         assert!(is_video_url("https://cdn.example/video.m3u8"));
