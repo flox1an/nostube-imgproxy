@@ -23,6 +23,7 @@ use tower_http::{
 };
 
 use crate::{
+    audio,
     blossom::{
         combine_server_lists, fetch_blob, parse_blossom_filename, try_fetch_verified_blob,
         BlossomState,
@@ -616,7 +617,19 @@ async fn produce_derivative(
     let (encoded, original) = state
         .cpu
         .run(move || {
-            let encoded = process_image(&original, &dirs, limits)?;
+            // An audio blob carries no pixels; substitute its embedded cover
+            // art and let the normal decode → resize → encode path take over.
+            // The *audio* bytes stay `original` so the original-bytes cache
+            // keeps holding what was verified, and later requests re-extract
+            // from them instead of re-downloading.
+            let cover;
+            let image_bytes: &[u8] = if audio::is_audio(&original) {
+                cover = audio::extract_cover_art(&original)?;
+                &cover
+            } else {
+                &original
+            };
+            let encoded = process_image(image_bytes, &dirs, limits)?;
             Ok::<_, SvcError>((encoded, original))
         })
         .await??;

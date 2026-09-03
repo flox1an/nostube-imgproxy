@@ -7,6 +7,7 @@ A minimal, fast image resizing service written in Rust, inspired by imgproxy. Su
 - **Versioned signed URL API** with expiring HMAC capability URLs and a temporary imgproxy-compatible legacy API
 - **Output formats**: JPEG, PNG, WebP, AVIF; input decoders are limited to JPEG, PNG, and WebP
 - **Video thumbnails**: Extract thumbnails from videos using FFmpeg
+- **Audio cover art**: MP3 (ID3v2 `APIC`), FLAC (`PICTURE`), and M4A (`covr`) album art is extracted and resized like any image
 - **Resize operations**: Fit, Fill, Fill-Down, Force, Auto (Lanczos3)
 - **Quality control**: Configurable quality for lossy formats
 - **Dual-cache architecture**: Original images + processed results

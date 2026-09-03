@@ -3,6 +3,7 @@
 //! The binary in `main.rs` is a thin wrapper over this library so that
 //! integration tests under `tests/` can exercise the same code paths.
 
+pub mod audio;
 pub mod blossom;
 pub mod cache;
 pub mod config;
