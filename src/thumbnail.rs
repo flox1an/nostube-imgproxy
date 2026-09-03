@@ -484,8 +484,8 @@ async fn run_ffmpeg_extract(
 ) -> Result<Vec<u8>, SvcError> {
     use tokio::process::Command;
 
-    let temp_file = tempfile::NamedTempFile::new().map_err(SvcError::Io)?;
-    let output_path = temp_file.path().to_path_buf();
+    let frames_dir = tempfile::tempdir().map_err(SvcError::Io)?;
+    let output_pattern = frames_dir.path().join("f%03d.webp");
 
     let mut command = Command::new("ffmpeg");
     // Input seek (`-ss` before `-i`) is the cheap path for direct containers:
@@ -529,14 +529,19 @@ async fn run_ffmpeg_extract(
         ])
         .args(seek_and_input)
         .args([
+            // Sample ~1 frame/second across the first 8 seconds and let the
+            // scorer pick the first contentful one: single-frame extraction
+            // at 0.5s turns black lead-ins (fade-ins, muxer padding) into
+            // pitch-black thumbnails. The luma thresholds and the 8-frame
+            // ceiling live in `transform::first_contentful_frame`'s docs.
             "-t",
-            "5",
+            "8",
             "-map",
             "0:v:0",
             "-frames:v",
-            "1",
+            "8",
             "-vf",
-            "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
+            "fps=1,scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
             "-q:v",
             "80",
             "-c:v",
@@ -545,7 +550,7 @@ async fn run_ffmpeg_extract(
             "image2",
             "-y",
         ])
-        .arg(&output_path)
+        .arg(&output_pattern)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -584,22 +589,50 @@ async fn run_ffmpeg_extract(
         return Err(SvcError::UpstreamError(502));
     }
 
-    let metadata = tokio::fs::metadata(&output_path)
+    let mut frame_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut entries = tokio::fs::read_dir(frames_dir.path())
         .await
         .map_err(SvcError::Io)?;
-    if metadata.len() == 0 || metadata.len() > max_image_bytes as u64 {
+    while let Some(entry) = entries.next_entry().await.map_err(SvcError::Io)? {
+        if entry.path().extension().is_some_and(|ext| ext == "webp") {
+            frame_paths.push(entry.path());
+        }
+    }
+    frame_paths.sort();
+    if frame_paths.is_empty() {
         metrics::record_ffmpeg_extraction(false);
-        tracing::debug!(
-            output_bytes = metadata.len(),
-            max_image_bytes,
-            demuxer,
-            "ffmpeg produced no usable image"
-        );
+        tracing::debug!(demuxer, "ffmpeg produced no usable image");
         return Err(SvcError::UpstreamError(502));
     }
-    let thumbnail = tokio::fs::read(&output_path).await.map_err(SvcError::Io)?;
+
+    let mut frame_bytes: Vec<Vec<u8>> = Vec::with_capacity(frame_paths.len());
+    for path in frame_paths {
+        let metadata = tokio::fs::metadata(&path).await.map_err(SvcError::Io)?;
+        if metadata.len() == 0 || metadata.len() > max_image_bytes as u64 {
+            continue;
+        }
+        frame_bytes.push(tokio::fs::read(&path).await.map_err(SvcError::Io)?);
+    }
+    if frame_bytes.is_empty() {
+        metrics::record_ffmpeg_extraction(false);
+        tracing::debug!(max_image_bytes, demuxer, "ffmpeg produced no usable image");
+        return Err(SvcError::UpstreamError(502));
+    }
+
+    // WebP decode of up to 8 frames is real CPU work; keep it off the async
+    // workers like every other decode in the service.
+    let (chosen, frame_bytes) = tokio::task::spawn_blocking(move || {
+        let chosen = crate::transform::first_contentful_frame(&frame_bytes).unwrap_or(0);
+        (chosen, frame_bytes)
+    })
+    .await
+    .map_err(|_| SvcError::InternalError("frame scorer crashed".into()))?;
+    tracing::debug!(chosen, "selected thumbnail frame");
     metrics::record_ffmpeg_extraction(true);
-    Ok(thumbnail)
+    Ok(frame_bytes
+        .into_iter()
+        .nth(chosen)
+        .expect("index from scorer"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -962,5 +995,70 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.bytes().await.unwrap().len(), 16);
+    }
+
+    /// A 1s black lead-in followed by test content: the thumbnail must come
+    /// from the content, not the lead-in. Skips itself when no `ffmpeg`
+    /// binary is installed.
+    #[tokio::test]
+    async fn extraction_picks_non_black_frame_after_black_lead_in() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_or(true, |status| !status.success())
+        {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        }
+        crate::init_crypto_provider();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:s=128x96:r=10:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=128x96:rate=10:duration=1",
+                "-filter_complex",
+                "[0:v][1:v]concat=n=2:v=1:a=0,format=yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+            ])
+            .arg(dir.path().join("lead.mp4"))
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success(), "fixture generation failed");
+        let bytes = tokio::fs::read(dir.path().join("lead.mp4"))
+            .await
+            .expect("read fixture");
+
+        let semaphore = Arc::new(Semaphore::new(1));
+        let thumbnail = extract_thumbnail_from_verified_bytes(
+            &bytes,
+            "lead.mp4",
+            &semaphore,
+            1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("extraction succeeds");
+
+        // The scorer itself must classify the result as content — the old
+        // single-frame-at-0.5s behaviour produced a frame it would reject.
+        assert!(
+            crate::transform::first_contentful_frame(std::slice::from_ref(&thumbnail)).is_some(),
+            "thumbnail must not be a black lead-in frame"
+        );
     }
 }

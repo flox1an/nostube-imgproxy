@@ -200,7 +200,8 @@ No other directive may be supplied on this route: `f`, `rs`, `q`, `width`, and `
 
 **Video Handling:**
 - Direct containers are detected by extension; HLS playlists (`.m3u8`) and content-sniffed `#EXTM3U` blobs are supported through a rewriting loopback gateway
-- FFmpeg extracts one frame at 0.5 seconds. Every playlist-referenced segment, key, and variant is re-resolved through the guarded client — FFmpeg only ever talks to loopback — under the same source-URL policy, timeout, and transfer budget as range-probed videos
+- Videos routinely open with black lead-in frames, so FFmpeg samples ~1 frame/second over the first 8 seconds and the first frame with visible luma content becomes the thumbnail (pure-black thumbnails are gone; genuinely dark night scenes still work — if every sample is dark, the first frame is used)
+- Every playlist-referenced segment, key, and variant is re-resolved through the guarded client — FFmpeg only ever talks to loopback — under the same source-URL policy, timeout, and transfer budget as range-probed videos
 - HLS thumbnails derive from a hash-verified playlist but unverified segment bytes, so they are never disk-cached under a Blossom hash
 - Audio-only playlists cannot yield a frame and answer `400 source has no video stream`
 - The extracted frame is processed like a regular image (resize and encode)

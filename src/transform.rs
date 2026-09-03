@@ -502,6 +502,105 @@ pub fn process_image(bytes: &[u8], dirs: &Directives, limits: Limits) -> Result<
     encode_image(&img, &dirs.out_fmt, dirs.quality)
 }
 
+/// Mean luma below which a sampled frame counts as black lead-in. Real
+/// content is rarely this dark on average; pure lead-in frames sit at 0–16.
+const FRAME_BLACK_MEAN_LUMA: f32 = 18.0;
+/// Luma standard deviation below which a frame counts as a solid colour
+/// card rather than a picture.
+const FRAME_FLAT_STDDEV_LUMA: f32 = 6.0;
+
+/// Pick the index of the first sampled frame that carries visible content.
+///
+/// Videos routinely open with black lead-in frames (fade-ins, muxer
+/// padding), which otherwise become pitch-black thumbnails. A frame counts
+/// as content when its mean luma clears [`FRAME_BLACK_MEAN_LUMA`] *and* its
+/// luma spread shows an actual picture rather than a solid colour card.
+/// Undecodable frames are skipped. `None` means every frame is dark — the
+/// caller falls back to its previous single-frame behaviour instead of
+/// rejecting the video.
+pub fn first_contentful_frame(frames: &[Vec<u8>]) -> Option<usize> {
+    frames.iter().position(|frame| {
+        let Ok(img) = image::load_from_memory(frame) else {
+            return false;
+        };
+        let pixels = img.into_luma8().into_raw();
+        let count = pixels.len() as f32;
+        if count == 0.0 {
+            return false;
+        }
+        let mean = pixels.iter().map(|p| f32::from(*p)).sum::<f32>() / count;
+        if mean < FRAME_BLACK_MEAN_LUMA {
+            return false;
+        }
+        let variance = pixels
+            .iter()
+            .map(|p| {
+                let delta = f32::from(*p) - mean;
+                delta * delta
+            })
+            .sum::<f32>()
+            / count;
+        variance.sqrt() >= FRAME_FLAT_STDDEV_LUMA
+    })
+}
+
+#[cfg(test)]
+mod frame_scoring_tests {
+    use super::*;
+
+    fn encoded(gray_levels: &[u8]) -> Vec<u8> {
+        // One 64-wide frame where each row uses a single gray level.
+        let buffer = image::GrayImage::from_fn(64, gray_levels.len() as u32, |_, y| {
+            image::Luma([gray_levels[y as usize]])
+        });
+        let img = DynamicImage::ImageLuma8(buffer);
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, ImageFormat::WebP)
+            .expect("encode webp");
+        out.into_inner()
+    }
+
+    const BLACK: &[u8] = &[0];
+    /// A flat dark grey: above the black threshold but zero spread.
+    const FLAT_DARK: &[u8] = &[30];
+    /// A black-to-white ramp: mean ~127, large spread.
+    const RAMP: (u8, u8) = (0, 255);
+
+    fn ramp() -> Vec<u8> {
+        (0..36).map(|y| RAMP.0 + (y as u16 * 7) as u8).collect()
+    }
+
+    #[test]
+    fn first_contentful_frame_skips_black_lead_in() {
+        let frames = vec![encoded(BLACK), encoded(&ramp())];
+        assert_eq!(first_contentful_frame(&frames), Some(1));
+    }
+
+    #[test]
+    fn first_contentful_frame_accepts_first_frame_when_contentful() {
+        let frames = vec![encoded(&ramp())];
+        assert_eq!(first_contentful_frame(&frames), Some(0));
+    }
+
+    #[test]
+    fn first_contentful_frame_all_dark_returns_none() {
+        let frames = vec![encoded(BLACK), encoded(BLACK)];
+        assert_eq!(first_contentful_frame(&frames), None);
+    }
+
+    #[test]
+    fn first_contentful_frame_rejects_flat_frames_as_non_content() {
+        let frames = vec![encoded(FLAT_DARK), encoded(&ramp())];
+        assert_eq!(first_contentful_frame(&frames), Some(1));
+    }
+
+    #[test]
+    fn first_contentful_frame_tolerates_undecodable_frames() {
+        let frames = vec![b"not an image".to_vec(), encoded(&ramp())];
+        assert_eq!(first_contentful_frame(&frames), Some(1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
