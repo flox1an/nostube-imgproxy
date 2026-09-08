@@ -2,6 +2,8 @@ version: '3.8'
 
 services:
   rust-imgproxy:
+    image: ghcr.io/flox1an/nostube-imgproxy:main
+    pull_policy: always
     build:
       context: .
       dockerfile: Dockerfile
@@ -23,6 +25,8 @@ services:
       - MAX_IMAGE_BYTES=16777216
       - MAX_FFMPEG_CONCURRENT=8
       - RUST_LOG=info
+      # Name only — value lives in Coolify (007). Unset keeps /metrics a 404.
+      - METRICS_BEARER_TOKEN=${METRICS_BEARER_TOKEN:-}
     # Optional: Resource limits
     deploy:
       resources:

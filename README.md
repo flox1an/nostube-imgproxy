@@ -233,6 +233,7 @@ Configure via environment variables:
 | `MAX_BLOB_CANDIDATES` | `8` | Maximum Blossom source candidates tried per request |
 | `MAX_SERVER_HINTS` | `4` | Maximum `xs=` hints honoured per request |
 | `METRICS_BIND_ADDR` | unset | Optional separate bind address for the operator-only `/metrics` listener |
+| `METRICS_BEARER_TOKEN` | unset | Bearer token gating `/metrics` on the public router; unset keeps that route answering 404, a wrong token is a 401 |
 | `URL_SIGNING_KEYS` | unset | Comma-separated `key-id:base64url-secret` HMAC keys; secrets must decode to at least 32 bytes |
 | `ALLOW_UNSIGNED_URLS` | `true` | Temporary migration switch for legacy `/insecure` and `/thumb` routes |
 | `REQUIRE_SIGNED_URL_EXPIRY` | `true` | Require one signed `exp` Unix-seconds query parameter |
@@ -250,6 +251,12 @@ Example:
 ```bash
 BIND_ADDR=0.0.0.0:3000 CACHE_TTL_SECS=3600 MAX_FFMPEG_CONCURRENT=20 cargo run --release
 ```
+
+### Metrics
+
+- `METRICS_BIND_ADDR=127.0.0.1:9101` starts the token-free operator `/metrics` listener on a management-network interface
+- `METRICS_BEARER_TOKEN=<secret>` instead exposes `/metrics` on the public router (404 when unset, 401 with a wrong token)
+- `grafana-dashboard.json` imports into an existing Grafana (Dashboards → Import) and covers every exported metric family; point your Prometheus scrape at whichever endpoint you enabled
 
 ### FFmpeg Concurrency Control
 
