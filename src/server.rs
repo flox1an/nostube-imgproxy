@@ -145,6 +145,7 @@ pub fn create_router(
     Router::new()
         .merge(images)
         .route("/health", get(health_check))
+        .route("/metrics", get(handle_public_metrics))
         .with_state(combined)
         // Outer → inner: Trace, metrics, panic-to-500, timeout, load-shed,
         // global concurrency, handlers. Timeout includes permit waiting; shed
@@ -246,6 +247,38 @@ async fn handle_preset_thumb(
 /// Simple health check endpoint
 async fn health_check() -> &'static str {
     "OK"
+}
+
+/// Public `/metrics` on the main router, almond-style: disabled (404) unless
+/// `METRICS_BEARER_TOKEN` is configured; a missing or wrong bearer is a 401.
+/// The token-free scrape path remains the `METRICS_BIND_ADDR` listener, which
+/// is a management-network interface by construction.
+async fn handle_public_metrics(
+    State(state): State<CombinedState>,
+    request_headers: HeaderMap,
+) -> Response {
+    let Some(token) = state.app.cfg.metrics_bearer_token.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let authorized = request_headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|provided| provided == token);
+    if !authorized {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match metrics::encode_metrics() {
+        Ok(body) => (
+            [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            body,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to encode metrics");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Prometheus metrics endpoint

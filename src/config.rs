@@ -84,6 +84,11 @@ pub struct AppCfg {
     /// Separate listener for `/metrics`. `None` keeps it off the public router
     /// entirely; operators opt in with a management-network address.
     pub metrics_bind_addr: Option<String>,
+    /// Bearer token gating the main-router `/metrics` route, almond-style.
+    /// `None` (unset) keeps that route answering 404; operators opt in by
+    /// setting `METRICS_BEARER_TOKEN`. The `metrics_bind_addr` listener stays
+    /// token-free: it is a management-network interface by construction.
+    pub metrics_bearer_token: Option<String>,
     /// Simultaneous FFmpeg processes allowed for video thumbnail extraction.
     pub max_ffmpeg_concurrent: usize,
     /// Versioned HMAC keys accepted by `/v1/{key_id}/{signature}/...`.
@@ -199,6 +204,10 @@ impl AppCfg {
             max_server_hints: env_parsed("MAX_SERVER_HINTS", 4usize),
             cpu_queue_depth: env_parsed("MAX_CPU_QUEUE", 64usize).max(1),
             metrics_bind_addr: std::env::var("METRICS_BIND_ADDR").ok(),
+            metrics_bearer_token: std::env::var("METRICS_BEARER_TOKEN")
+                .ok()
+                .map(|token| token.trim().to_owned())
+                .filter(|token| !token.is_empty()),
             max_ffmpeg_concurrent: env_parsed("MAX_FFMPEG_CONCURRENT", 8usize).max(1),
             url_signing_keys,
             allow_unsigned_urls,
@@ -299,6 +308,7 @@ mod tests {
         "MAX_SERVER_HINTS",
         "MAX_CPU_QUEUE",
         "METRICS_BIND_ADDR",
+        "METRICS_BEARER_TOKEN",
         "MAX_FFMPEG_CONCURRENT",
         "URL_SIGNING_KEYS",
         "ALLOW_UNSIGNED_URLS",
@@ -370,6 +380,7 @@ mod tests {
         assert_eq!(cfg.max_concurrent_video_verifications, 2);
         assert_eq!(cfg.max_blob_candidates, 8);
         assert_eq!(cfg.max_server_hints, 4);
+        assert!(cfg.metrics_bearer_token.is_none());
         assert_eq!(cfg.cpu_queue_depth, 64);
         assert_eq!(cfg.metrics_bind_addr, None);
         assert_eq!(cfg.max_ffmpeg_concurrent, 8);
@@ -475,6 +486,18 @@ mod tests {
         with_env(&[("ALLOW_UNSIGNED_URLS", "false")], || {
             assert!(std::panic::catch_unwind(AppCfg::from_env).is_err());
         });
+    }
+
+    #[test]
+    fn from_env_parses_the_metrics_bearer_token() {
+        let cfg = with_env(&[], AppCfg::from_env);
+        assert!(cfg.metrics_bearer_token.is_none());
+
+        let cfg = with_env(&[("METRICS_BEARER_TOKEN", "   ")], AppCfg::from_env);
+        assert!(cfg.metrics_bearer_token.is_none(), "blank token stays disabled");
+
+        let cfg = with_env(&[("METRICS_BEARER_TOKEN", " secret ")], AppCfg::from_env);
+        assert_eq!(cfg.metrics_bearer_token.as_deref(), Some("secret"));
     }
 
     #[test]

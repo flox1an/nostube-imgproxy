@@ -459,6 +459,7 @@ mod tests {
             blossom_negative_transient_ttl: Duration::from_secs(1),
             max_image_dimension: 4096,
             max_decode_alloc_bytes: 64 * 1024 * 1024,
+            metrics_bearer_token: None,
             url_signing_keys: crate::signing::UrlSigningKeys::default(),
             allow_unsigned_urls: true,
             require_signed_url_expiry: true,
