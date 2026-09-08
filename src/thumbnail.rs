@@ -582,7 +582,7 @@ async fn run_ffmpeg_extract(
     if !status.success() {
         metrics::record_ffmpeg_extraction(false);
         let stderr = String::from_utf8_lossy(&stderr);
-        tracing::debug!(stderr = %stderr, "ffmpeg thumbnail extraction failed");
+        tracing::warn!(stderr = %log_value(&stderr), "ffmpeg thumbnail extraction failed");
         // Audio-only HLS inputs exit 0 having matched no video stream at all;
         // that is a property of the source, not an upstream fault.
         if stderr.contains("matches no streams") {
