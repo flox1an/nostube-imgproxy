@@ -494,7 +494,10 @@ mod tests {
         assert!(cfg.metrics_bearer_token.is_none());
 
         let cfg = with_env(&[("METRICS_BEARER_TOKEN", "   ")], AppCfg::from_env);
-        assert!(cfg.metrics_bearer_token.is_none(), "blank token stays disabled");
+        assert!(
+            cfg.metrics_bearer_token.is_none(),
+            "blank token stays disabled"
+        );
 
         let cfg = with_env(&[("METRICS_BEARER_TOKEN", " secret ")], AppCfg::from_env);
         assert_eq!(cfg.metrics_bearer_token.as_deref(), Some("secret"));

@@ -270,7 +270,10 @@ async fn handle_public_metrics(
     }
     match metrics::encode_metrics() {
         Ok(body) => (
-            [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
             body,
         )
             .into_response(),
