@@ -269,11 +269,16 @@ async fn handle_public_metrics(
     let Some(token) = state.app.cfg.metrics_bearer_token.as_deref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Compare digests, not the secret itself: `==` on the raw token exits at
+    // the first differing byte and would leak a matching prefix by timing.
     let authorized = request_headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|provided| provided == token);
+        .is_some_and(|provided| {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(provided.as_bytes()) == Sha256::digest(token.as_bytes())
+        });
     if !authorized {
         return StatusCode::UNAUTHORIZED.into_response();
     }
