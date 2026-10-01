@@ -839,7 +839,10 @@ mod tests {
             )
             .await
             .expect_err("a playlist must never reach FFmpeg with a file whitelist");
-            assert!(matches!(error, SvcError::BadRequest(_)), "{name}: {error:?}");
+            assert!(
+                matches!(error, SvcError::BadRequest(_)),
+                "{name}: {error:?}"
+            );
         }
     }
 

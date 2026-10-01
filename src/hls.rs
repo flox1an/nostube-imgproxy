@@ -610,12 +610,18 @@ mod tests {
     #[test]
     fn map_tag_uris_catches_uris_in_every_ffmpeg_value_form() {
         for (tag, ffmpeg_uri) in [
-            ("EXT-X-MAP:URI=http://10.0.0.1/i.mp4", "http://10.0.0.1/i.mp4"),
+            (
+                "EXT-X-MAP:URI=http://10.0.0.1/i.mp4",
+                "http://10.0.0.1/i.mp4",
+            ),
             (
                 "EXT-X-KEY:METHOD=AES-128,URI=http://127.0.0.1/k,IV=0x1",
                 "http://127.0.0.1/k",
             ),
-            ("EXT-X-MAP:URI=\"http://10.0.0.1/i.mp4", "http://10.0.0.1/i.mp4"),
+            (
+                "EXT-X-MAP:URI=\"http://10.0.0.1/i.mp4",
+                "http://10.0.0.1/i.mp4",
+            ),
             (
                 "EXT-X-KEY:X=\"\\\"\",URI=http://10.0.0.1/k",
                 "http://10.0.0.1/k",
@@ -628,7 +634,10 @@ mod tests {
                 Some("s0.mp4".to_owned())
             });
             assert_eq!(seen, vec![ffmpeg_uri.to_owned()], "{tag}");
-            assert!(!out.contains("10.0.0.1") && !out.contains("127.0.0.1"), "{out}");
+            assert!(
+                !out.contains("10.0.0.1") && !out.contains("127.0.0.1"),
+                "{out}"
+            );
         }
     }
 
@@ -662,12 +671,10 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     Some((vec![b'#'; 64 * 1024], ()))
                 });
-                Body::from_stream(
-                    futures_util::StreamExt::map(
-                        futures_util::StreamExt::chain(head, filler),
-                        Ok::<_, std::io::Error>,
-                    ),
-                )
+                Body::from_stream(futures_util::StreamExt::map(
+                    futures_util::StreamExt::chain(head, filler),
+                    Ok::<_, std::io::Error>,
+                ))
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
