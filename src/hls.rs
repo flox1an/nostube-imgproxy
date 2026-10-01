@@ -72,26 +72,73 @@ fn resolve_target(base: &Url, uri: &str) -> Option<String> {
     Some(url.to_string())
 }
 
-/// Replace every `URI="…"` attribute value on a tag line via `map`.
-fn map_tag_uris(line: &str, map: &mut impl FnMut(&str) -> Option<String>) -> String {
-    let mut output = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(position) = rest.find("URI=\"") {
-        let (head, tail) = rest.split_at(position + "URI=\"".len());
-        output.push_str(head);
-        let Some(close) = tail.find('"') else {
-            output.push_str(tail);
-            return output;
-        };
-        let (uri, remainder) = tail.split_at(close);
-        // A dropped registration (unresolvable, or over the target cap)
-        // becomes an empty URI: FFmpeg fails to open it cleanly instead of
-        // fetching the original remote location outside the gateway.
-        if let Some(replacement) = map(uri) {
-            output.push_str(&replacement);
+/// FFmpeg's `av_isspace` (unlike `char::is_ascii_whitespace`, includes `\v`).
+fn is_ff_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
+/// One attribute value as FFmpeg's `ff_parse_key_value` reads it: `"…"` with
+/// backslash escapes (an unterminated quote runs to the end), or a bare run up
+/// to `,`/whitespace. Returns the value FFmpeg would see and the bytes of
+/// `input` it consumes.
+fn parse_attribute_value(input: &str) -> (String, usize) {
+    let Some(quoted) = input.strip_prefix('"') else {
+        let end = input
+            .find(|c: char| c == ',' || is_ff_space(c))
+            .unwrap_or(input.len());
+        return (input[..end].to_owned(), end);
+    };
+    let mut value = String::new();
+    let mut chars = quoted.char_indices();
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '"' => return (value, index + 2),
+            '\\' => match chars.next() {
+                Some((_, escaped)) => value.push(escaped),
+                None => break,
+            },
+            c => value.push(c),
         }
-        output.push('"');
-        rest = &remainder[1..];
+    }
+    (value, input.len())
+}
+
+/// Replace every `URI` attribute value on a tag line via `map`.
+///
+/// Attributes are parsed exactly like FFmpeg's HLS demuxer parses them
+/// (quoted with escapes, or bare), so no URI FFmpeg would open escapes the
+/// rewrite. The replacement is always emitted quoted; other attributes stay
+/// verbatim.
+fn map_tag_uris(tag: &str, map: &mut impl FnMut(&str) -> Option<String>) -> String {
+    let Some((name, attributes)) = tag.split_once(':') else {
+        return tag.to_owned();
+    };
+    let mut output = String::with_capacity(tag.len());
+    output.push_str(name);
+    output.push(':');
+    let mut rest = attributes;
+    loop {
+        let start = rest.trim_start_matches(|c: char| c == ',' || is_ff_space(c));
+        output.push_str(&rest[..rest.len() - start.len()]);
+        rest = start;
+        let Some(equals) = rest.find('=') else {
+            break;
+        };
+        let (value, consumed) = parse_attribute_value(&rest[equals + 1..]);
+        let end = equals + 1 + consumed;
+        if &rest[..equals] == "URI" {
+            // A dropped registration (unresolvable, disallowed, or over the
+            // target cap) becomes an empty URI: FFmpeg fails to open it
+            // cleanly instead of fetching the original location itself.
+            output.push_str("URI=\"");
+            if let Some(replacement) = map(&value) {
+                output.push_str(&replacement);
+            }
+            output.push('"');
+        } else {
+            output.push_str(&rest[..end]);
+        }
+        rest = &rest[end..];
     }
     output.push_str(rest);
     output
@@ -157,6 +204,11 @@ pub fn rewrite_playlist(bytes: &[u8], base: &str) -> Option<RewrittenPlaylist> {
     let mut body = String::with_capacity(text.len());
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
+        // FFmpeg also ends a line at a lone CR or NUL: what we read as one tag
+        // line could hide a segment URL it reads separately. Refuse outright.
+        if line.contains(['\r', '\0']) {
+            return None;
+        }
         if line.is_empty() {
             body.push('\n');
             continue;
@@ -538,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn map_tag_uris_rewrites_only_quoted_uri_attributes() {
+    fn map_tag_uris_rewrites_only_uri_attributes() {
         let mut count = 0;
         let out = map_tag_uris(
             "EXT-X-KEY:METHOD=AES-128,URI=\"k.key\",IV=0x1,UNRELATED=\"URI=nope\"",
@@ -552,6 +604,41 @@ mod tests {
             "EXT-X-KEY:METHOD=AES-128,URI=\"s1.key\",IV=0x1,UNRELATED=\"URI=nope\""
         );
         assert_eq!(count, 1);
+    }
+
+    /// Every URI FFmpeg's `ff_parse_key_value` would extract — bare, quoted
+    /// with escapes, unterminated — must reach `map`, never pass through.
+    #[test]
+    fn map_tag_uris_catches_uris_in_every_ffmpeg_value_form() {
+        for (tag, ffmpeg_uri) in [
+            ("EXT-X-MAP:URI=http://10.0.0.1/i.mp4", "http://10.0.0.1/i.mp4"),
+            (
+                "EXT-X-KEY:METHOD=AES-128,URI=http://127.0.0.1/k,IV=0x1",
+                "http://127.0.0.1/k",
+            ),
+            ("EXT-X-MAP:URI=\"http://10.0.0.1/i.mp4", "http://10.0.0.1/i.mp4"),
+            (
+                "EXT-X-KEY:X=\"\\\"\",URI=http://10.0.0.1/k",
+                "http://10.0.0.1/k",
+            ),
+            ("EXT-X-MAP:URI=\"a\\\"b\"", "a\"b"),
+        ] {
+            let mut seen = Vec::new();
+            let out = map_tag_uris(tag, &mut |uri| {
+                seen.push(uri.to_owned());
+                Some("s0.mp4".to_owned())
+            });
+            assert_eq!(seen, vec![ffmpeg_uri.to_owned()], "{tag}");
+            assert!(!out.contains("10.0.0.1") && !out.contains("127.0.0.1"), "{out}");
+        }
+    }
+
+    #[test]
+    fn rewrite_refuses_lone_cr_or_nul_line_breaks() {
+        let base = "https://server.example/p.m3u8";
+        assert!(rewrite_playlist(b"#EXTM3U\n#EXTINF:4,\rhttp://10.0.0.1/x.ts\n", base).is_none());
+        assert!(rewrite_playlist(b"#EXTM3U\n#EXTINF:4,\0http://10.0.0.1/x.ts\n", base).is_none());
+        assert!(rewrite_playlist(b"#EXTM3U\r\n#EXTINF:4,\r\nseg.ts\r\n", base).is_some());
     }
 
     #[test]
