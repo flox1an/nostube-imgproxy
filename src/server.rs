@@ -305,8 +305,9 @@ pub fn create_metrics_router() -> Router {
     Router::new().route("/metrics", get(handle_metrics))
 }
 
-/// Record the response that actually leaves the service. `MatchedPath` keeps
-/// labels bounded even when attackers send arbitrary paths or query strings.
+/// Record the response that actually leaves the service. `MatchedPath` and
+/// [`method_label`] keep labels bounded even when attackers send arbitrary
+/// paths, query strings or extension methods.
 async fn record_response_metrics(request: Request, next: Next) -> Response {
     let started = Instant::now();
     let endpoint = request
@@ -314,11 +315,24 @@ async fn record_response_metrics(request: Request, next: Next) -> Response {
         .get::<MatchedPath>()
         .map_or("<unmatched>", MatchedPath::as_str)
         .to_owned();
-    let method = request.method().as_str().to_owned();
+    let method = method_label(request.method());
     let response = next.run(request).await;
-    metrics::observe_http_duration(&endpoint, &method, started.elapsed().as_secs_f64());
-    metrics::record_http_request(&endpoint, &method, response.status().as_u16());
+    metrics::observe_http_duration(&endpoint, method, started.elapsed().as_secs_f64());
+    metrics::record_http_request(&endpoint, method, response.status().as_u16());
     response
+}
+
+/// Fixed label set: hyper accepts any extension-method token, and each new
+/// label value is a Prometheus series that is never freed.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::POST => "POST",
+        _ => "OTHER",
+    }
 }
 
 /// Where the *original* bytes for a derivative come from.
@@ -1175,6 +1189,15 @@ async fn fetch_source(state: &AppState, src_url: &str) -> Result<Bytes, SvcError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_label_folds_extension_methods_into_one_value() {
+        for raw in ["FOO123", "PROPFIND", "PUT"] {
+            let method = axum::http::Method::from_bytes(raw.as_bytes()).unwrap();
+            assert_eq!(method_label(&method), "OTHER", "{raw}");
+        }
+        assert_eq!(method_label(&axum::http::Method::GET), "GET");
+    }
 
     #[test]
     fn range_probed_video_source_is_never_cacheable() {
