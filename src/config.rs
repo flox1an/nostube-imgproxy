@@ -125,6 +125,21 @@ fn env_parsed<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Read a security-relevant on/off switch. Unlike [`env_parsed`], an
+/// unrecognised value aborts startup: `ALLOW_UNSIGNED_URLS=0` silently
+/// falling back to `true` would leave the open proxy routes on.
+fn env_flag(key: &str, default: bool) -> bool {
+    let Ok(raw) = std::env::var(key) else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => default,
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" => false,
+        _ => panic!("{key} must be true/false (or 1/0, yes/no, on/off), got {raw:?}"),
+    }
+}
+
 fn env_secs(key: &str, default: u64) -> Duration {
     Duration::from_secs(env_parsed(key, default))
 }
@@ -157,8 +172,8 @@ impl AppCfg {
                     .unwrap_or_else(|error| panic!("invalid URL_SIGNING_KEYS: {error}"))
             })
             .unwrap_or_default();
-        let allow_unsigned_urls = env_parsed("ALLOW_UNSIGNED_URLS", true);
-        let require_signed_url_expiry = env_parsed("REQUIRE_SIGNED_URL_EXPIRY", true);
+        let allow_unsigned_urls = env_flag("ALLOW_UNSIGNED_URLS", true);
+        let require_signed_url_expiry = env_flag("REQUIRE_SIGNED_URL_EXPIRY", true);
         if url_signing_keys.is_empty() && !allow_unsigned_urls {
             panic!("URL_SIGNING_KEYS must be configured when ALLOW_UNSIGNED_URLS=false");
         }
@@ -212,7 +227,7 @@ impl AppCfg {
             url_signing_keys,
             allow_unsigned_urls,
             require_signed_url_expiry,
-            preset_thumbnails_enabled: env_parsed("PRESET_THUMBNAILS_ENABLED", true),
+            preset_thumbnails_enabled: env_flag("PRESET_THUMBNAILS_ENABLED", true),
             rate_ip_requests_per_min: env_parsed("RATE_IP_REQUESTS_PER_MIN", 600u32).max(1),
             rate_ip_image_generations_per_min: env_parsed(
                 "RATE_IP_IMAGE_GENERATIONS_PER_MIN",
@@ -484,6 +499,32 @@ mod tests {
     #[test]
     fn from_env_rejects_disabling_legacy_routes_without_a_signing_key() {
         with_env(&[("ALLOW_UNSIGNED_URLS", "false")], || {
+            assert!(std::panic::catch_unwind(AppCfg::from_env).is_err());
+        });
+    }
+
+    #[test]
+    fn from_env_reads_numeric_and_word_flags_as_off() {
+        for off in ["0", "off", "False", "NO"] {
+            let cfg = with_env(
+                &[
+                    (
+                        "URL_SIGNING_KEYS",
+                        "nostube-2026-08:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                    ),
+                    ("ALLOW_UNSIGNED_URLS", off),
+                    ("PRESET_THUMBNAILS_ENABLED", off),
+                ],
+                AppCfg::from_env,
+            );
+            assert!(!cfg.allow_unsigned_urls, "{off}");
+            assert!(!cfg.preset_thumbnails_enabled, "{off}");
+        }
+    }
+
+    #[test]
+    fn from_env_refuses_to_start_on_an_unrecognised_flag_value() {
+        with_env(&[("ALLOW_UNSIGNED_URLS", "disabled")], || {
             assert!(std::panic::catch_unwind(AppCfg::from_env).is_err());
         });
     }

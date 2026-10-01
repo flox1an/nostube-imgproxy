@@ -243,6 +243,8 @@ Configure via environment variables:
 | `RATE_IP_VIDEO_GENERATIONS_PER_MIN` | `5` | Per-IP budget for cache-miss FFmpeg video-thumbnail work |
 | `RUST_LOG` | `info` | Log level |
 
+Boolean switches (`ALLOW_UNSIGNED_URLS`, `REQUIRE_SIGNED_URL_EXPIRY`, `PRESET_THUMBNAILS_ENABLED`) accept `true/false`, `1/0`, `yes/no` or `on/off` (case-insensitive); any other value aborts startup.
+
 Blossom candidate failures are retained only in memory, per candidate URL, up to 10,000 entries.
 Repeated requests skip an unexpired failed URL but still try newly supplied or discovered candidates.
 
