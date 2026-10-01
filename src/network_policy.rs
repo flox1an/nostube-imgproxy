@@ -16,24 +16,39 @@ use crate::error::SvcError;
 /// bounded so an upstream cannot hold a connection open by redirecting forever.
 const MAX_REDIRECT_HOPS: usize = 5;
 
+/// Whether `address` is a globally routable unicast address we may connect to.
+///
+/// IPv6 forms that embed or translate to an IPv4 address (mapped `::ffff:0:0/96`,
+/// deprecated compatible `::/96`, NAT64, 6to4, Teredo) are folded or refused:
+/// on a dual-stack socket `::ffff:127.0.0.1` reaches the IPv4 loopback.
 fn is_public_ip(address: IpAddr) -> bool {
-    match address {
+    match address.to_canonical() {
         IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
             !(ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
-                || ip.is_broadcast()
                 || ip.is_documentation()
-                || ip.is_unspecified()
                 || ip.is_multicast()
-                || ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+                || a == 0 // 0.0.0.0/8 "this network"
+                || a >= 240 // 240.0.0.0/4 reserved + broadcast
+                || (a == 100 && (64..=127).contains(&b)) // CGNAT
+                || (a == 198 && (b == 18 || b == 19)) // benchmarking
+                || (a == 192 && b == 0 && c == 0)) // IETF protocol assignments
         }
         IpAddr::V6(ip) => {
+            let s = ip.segments();
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || ip.is_unicast_link_local()
-                || ip.is_unique_local())
+                || ip.is_unique_local()
+                || s[..6] == [0; 6] // IPv4-compatible ::/96
+                || (s[0] == 0x64 && s[1] == 0xff9b) // NAT64 64:ff9b::/96 and 64:ff9b:1::/48
+                || s[0] == 0x2002 // 6to4
+                || (s[0] == 0x2001 && s[1] == 0) // Teredo 2001::/32
+                || (s[0] == 0x2001 && s[1] == 0xdb8) // documentation
+                || (s[0] & 0xffc0) == 0xfec0) // deprecated site-local
         }
     }
 }
@@ -175,6 +190,16 @@ mod tests {
             "http://192.168.1.2/video.mp4",
             "http://[::1]/video.mp4",
             "http://[fd00::1]/video.mp4",
+            "http://[::ffff:127.0.0.1]/video.mp4",
+            "http://[::ffff:a9fe:a9fe]/latest/meta-data/",
+            "http://[::7f00:1]/video.mp4",
+            "http://[64:ff9b::a00:1]/video.mp4",
+            "http://[2002:7f00:1::]/video.mp4",
+            "http://[fec0::1]/video.mp4",
+            "http://0.0.0.1/video.mp4",
+            "http://240.0.0.1/video.mp4",
+            "http://198.18.0.1/video.mp4",
+            "http://169.254.169.254/latest/meta-data/",
         ] {
             assert!(validate_untrusted_url(url).is_err(), "{url}");
         }
