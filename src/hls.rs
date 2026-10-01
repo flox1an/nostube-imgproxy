@@ -349,16 +349,14 @@ pub async fn fetch_playlist(
     if !response.status().is_success() {
         return Err(SvcError::UpstreamError(response.status().as_u16()));
     }
-    if response.content_length().unwrap_or(0) > MAX_PLAYLIST_BYTES as u64 {
-        return Err(SvcError::UpstreamError(413));
-    }
-    let body = tokio::time::timeout(remaining, response.bytes())
-        .await
-        .map_err(|_| SvcError::UpstreamError(504))?
-        .map_err(SvcError::Fetch)?;
-    if body.len() > MAX_PLAYLIST_BYTES {
-        return Err(SvcError::UpstreamError(413));
-    }
+    // Capped while streaming: a chunked or compressed body has no usable
+    // Content-Length, so a post-hoc size check would come after the OOM.
+    let body = tokio::time::timeout(
+        remaining,
+        crate::fetch::read_body_capped(response, MAX_PLAYLIST_BYTES),
+    )
+    .await
+    .map_err(|_| SvcError::UpstreamError(504))??;
     if !spend_budget(remaining_bytes, body.len() as u64) {
         return Err(SvcError::UpstreamError(413));
     }
@@ -423,14 +421,15 @@ async fn serve_target(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_owned();
-    if upstream.content_length().unwrap_or(0) > budget {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-    let body = tokio::time::timeout(remaining, upstream.bytes())
+    let cap = usize::try_from(budget).unwrap_or(usize::MAX);
+    let body = tokio::time::timeout(remaining, crate::fetch::read_body_capped(upstream, cap))
         .await
         .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    if body.len() as u64 > budget || !spend_budget(&state.remaining_bytes, body.len() as u64) {
+        .map_err(|error| match error {
+            SvcError::UpstreamError(413) => StatusCode::PAYLOAD_TOO_LARGE,
+            _ => StatusCode::BAD_GATEWAY,
+        })?;
+    if !spend_budget(&state.remaining_bytes, body.len() as u64) {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -648,6 +647,45 @@ mod tests {
         // No BOM tolerance: FFmpeg would reject it too, so refusing early is
         // the honest answer.
         assert!(!is_hls_playlist(b"\xef\xbb\xbf#EXTM3U"));
+    }
+
+    /// An endless chunked playlist (no Content-Length) must be cut off at the
+    /// cap while streaming; buffering it whole would only end at the deadline.
+    #[tokio::test]
+    async fn fetch_playlist_aborts_an_endless_chunked_body_at_the_cap() {
+        crate::init_crypto_provider();
+        let app = Router::new().route(
+            "/p.m3u8",
+            get(|| async {
+                let head = futures_util::stream::once(async { b"#EXTM3U\n".to_vec() });
+                let filler = futures_util::stream::unfold((), |()| async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    Some((vec![b'#'; 64 * 1024], ()))
+                });
+                Body::from_stream(
+                    futures_util::StreamExt::map(
+                        futures_util::StreamExt::chain(head, filler),
+                        Ok::<_, std::io::Error>,
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/p.m3u8", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let budget = Arc::new(AtomicU64::new(u64::MAX));
+        let error = fetch_playlist(
+            &reqwest::Client::new(),
+            &url,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            &budget,
+        )
+        .await
+        .expect_err("an endless playlist exceeds the 4 MiB cap");
+        assert!(matches!(error, SvcError::UpstreamError(413)), "{error:?}");
     }
 
     #[test]
