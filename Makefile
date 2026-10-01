@@ -1,4 +1,6 @@
-.PHONY: build run test docker-build docker-run docker-compose-up docker-compose-down clean
+.PHONY: build run test docker-build docker-run docker-compose-up docker-compose-down clean cve-check
+
+IMAGE ?= rust-imgproxy:latest
 
 # Build release binary
 build:
@@ -15,6 +17,10 @@ check:
 # Build Docker image
 docker-build:
 	docker build -t rust-imgproxy:latest .
+
+# Fail on HIGH/CRITICAL OS CVEs that have a fixed package available (needs trivy)
+cve-check:
+	trivy image --scanners vuln --pkg-types os --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 $(IMAGE)
 
 # Run Docker container
 docker-run:

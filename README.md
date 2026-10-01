@@ -103,6 +103,7 @@ Convenience commands for development:
 make build              # Build release binary
 make run                # Run locally
 make docker-build       # Build Docker image
+make cve-check          # Scan image for fixable HIGH/CRITICAL OS CVEs (trivy; IMAGE=...)
 make docker-compose-up  # Start with docker-compose
 make test-image         # Test with sample image
 make test-health        # Check health endpoint

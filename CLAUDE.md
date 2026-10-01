@@ -168,6 +168,9 @@ docker run -p 8080:8080 -v $(pwd)/cache:/cache rust-imgproxy
 # Or use docker-compose
 docker-compose up -d
 docker-compose logs -f
+
+# Scan image for fixable HIGH/CRITICAL OS CVEs (needs trivy)
+make cve-check
 ```
 
 ## Common Tasks
