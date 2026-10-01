@@ -958,11 +958,9 @@ async fn handle_thumb_request(
         match state.blossom.get_author_servers(pubkey).await {
             Ok(s) => Some(s),
             Err(e) => {
-                tracing::warn!(
-                    "Failed to fetch author servers for pubkey {}: {}",
-                    pubkey,
-                    e
-                );
+                // `as=` is attacker-controlled: never log it raw. The error
+                // carries a length-capped copy; Debug escapes line breaks.
+                tracing::warn!(error = ?e, "failed to fetch author servers");
                 None
             }
         }
