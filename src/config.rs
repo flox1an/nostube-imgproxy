@@ -268,10 +268,13 @@ impl AppState {
         // installed before any client is constructed or `build()` panics.
         crate::init_crypto_provider();
 
+        // `no_proxy`: an env/system proxy would resolve hostnames itself and
+        // bypass `public_dns_resolver`, reopening DNS-rebinding SSRF.
         let http = Client::builder()
             .timeout(cfg.fetch_timeout)
             .redirect(guarded_redirect_policy())
             .dns_resolver(public_dns_resolver())
+            .no_proxy()
             .user_agent("rust-imgproxy/0.1")
             .build()
             .expect("reqwest client");
