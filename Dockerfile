@@ -20,15 +20,16 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy dependency files
-COPY Cargo.toml ./
+# Copy dependency files. The lockfile pins the reviewed/audited dependency
+# set; without it every image build re-resolves the newest semver matches.
+COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 
 # Create dummy main.rs for dependency caching
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 
 # Build dependencies only (this layer will be cached)
-RUN cargo build --release && rm -rf src
+RUN cargo build --release --locked && rm -rf src
 
 # Now copy actual source code
 COPY src ./src
@@ -37,7 +38,7 @@ COPY src ./src
 ENV SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always
 
 # Build release binary with actual code (force rebuild by touching main.rs)
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 # Stage 2: Runtime
 FROM debian:trixie-slim

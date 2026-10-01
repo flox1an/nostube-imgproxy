@@ -41,12 +41,19 @@ jobs:
           toolchain: stable
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Run tests
-        run: cargo test --release
+        run: cargo test --release --locked
+
+      - name: Audit dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
 
   docker-build:
+    # Never publish an image whose code failed tests or the dependency audit.
+    needs: rust-build
     # Only run Docker build on main branch (pushes, tags, and scheduled runs)
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule'
 
