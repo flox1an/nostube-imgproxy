@@ -691,6 +691,12 @@ pub async fn extract_thumbnail_from_verified_bytes(
 ) -> Result<Vec<u8>, SvcError> {
     let demuxer =
         input_demuxer(blob_name).ok_or(SvcError::BadRequest("unsupported video format"))?;
+    // A playlist read from a local tempfile with a `file` whitelist can only
+    // succeed by referencing local paths: an attacker-hashed `.m3u8` would
+    // turn background verification into a local media-file read.
+    if demuxer == crate::hls::HLS_DEMUXER || crate::hls::is_hls_playlist(bytes) {
+        return Err(SvcError::BadRequest("playlist is not a verifiable video"));
+    }
 
     let _permit = semaphore
         .acquire()
@@ -818,6 +824,24 @@ fn log_value(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn verified_bytes_extraction_refuses_playlists() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let playlist = b"#EXTM3U\n#EXTINF:1,\n/etc/secret.mp4\n#EXT-X-ENDLIST\n";
+        for name in ["x.m3u8", "x.mp4"] {
+            let error = extract_thumbnail_from_verified_bytes(
+                playlist,
+                name,
+                &semaphore,
+                1024,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a playlist must never reach FFmpeg with a file whitelist");
+            assert!(matches!(error, SvcError::BadRequest(_)), "{name}: {error:?}");
+        }
+    }
 
     #[test]
     fn is_video_url_accepts_containers_and_m3u8_but_rejects_other_manifests() {
