@@ -83,6 +83,12 @@ impl VideoVerifier {
         // Opportunistic sweep while the lock is already held.
         tallies.retain(|_, tally| tally.expires_at > now);
 
+        // Full table: leave unseen blobs untracked (never verified) rather than
+        // growing it. Every first miss inserts, so the cap must hold here.
+        if tallies.len() >= MAX_TRACKED_BLOBS && !tallies.contains_key(&key) {
+            return None;
+        }
+
         let expires_at = now.checked_add(MISS_WINDOW)?;
         let tally = tallies.entry(key).or_insert_with(|| BlobTally {
             misses: 0,
@@ -103,16 +109,6 @@ impl VideoVerifier {
         // Claim before releasing the lock so two concurrent misses cannot both
         // pass the threshold check and spawn duplicate downloads.
         tally.settled = true;
-
-        if tallies.len() > MAX_TRACKED_BLOBS {
-            if let Some(oldest) = tallies
-                .iter()
-                .min_by_key(|(_, tally)| tally.expires_at)
-                .map(|(key, _)| key.clone())
-            {
-                tallies.remove(&oldest);
-            }
-        }
         drop(tallies);
 
         // A busy slot means the node is already saturated with verifications;
@@ -228,6 +224,25 @@ mod tests {
         assert!(
             verifier.claim(&hash).await.is_some(),
             "an explicitly re-armed blob must be claimable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_stops_tracking_new_blobs_once_the_table_is_full() {
+        let verifier = VideoVerifier::new(4, 2);
+        for index in 0..MAX_TRACKED_BLOBS {
+            assert!(verifier.claim(&format!("{index:064x}")).await.is_none());
+        }
+        let late = "f".repeat(64);
+        assert!(verifier.claim(&late).await.is_none());
+        assert!(
+            verifier.claim(&late).await.is_none(),
+            "an untracked blob never reaches the miss threshold"
+        );
+        assert_eq!(verifier.tallies.lock().await.len(), MAX_TRACKED_BLOBS);
+        assert!(
+            verifier.claim(&format!("{:064x}", 0)).await.is_some(),
+            "already tracked blobs keep counting"
         );
     }
 }
