@@ -59,12 +59,17 @@ pub fn is_hls_playlist(bytes: &[u8]) -> bool {
 /// Resolve one URI reference against a playlist's own URL. Absolute URLs pass
 /// through; relative names (the Blossom HLS layout: bare `<hash>.mp4`) join
 /// the playlist's address so segments resolve against the same server.
+///
+/// Every target goes through the untrusted-URL policy: the gateway fetches it
+/// with the shared client, whose DNS filter never sees IP-literal hosts.
 fn resolve_target(base: &Url, uri: &str) -> Option<String> {
     let trimmed = uri.trim();
     if trimmed.is_empty() {
         return None;
     }
-    base.join(trimmed).ok().map(|url| url.to_string())
+    let url = base.join(trimmed).ok()?;
+    crate::network_policy::validate_untrusted_target(&url).ok()?;
+    Some(url.to_string())
 }
 
 /// Replace every `URI="…"` attribute value on a tag line via `map`.
@@ -506,6 +511,27 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_drops_private_and_non_http_targets() {
+        let (body, targets) = rewrite(
+            "#EXTM3U\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:2375/containers/json\"\n\
+             http://169.254.169.254/latest/meta-data/\n\
+             http://[::ffff:10.0.0.1]/x.ts\n\
+             file:///etc/passwd\n\
+             seg.mp4\n",
+            "https://server.example/blob/playlist.txt",
+        );
+        assert_eq!(
+            targets,
+            vec!["https://server.example/blob/seg.mp4".to_string()]
+        );
+        assert!(body.contains("URI=\"\""));
+        for leaked in ["127.0.0.1", "169.254", "10.0.0.1", "file:"] {
+            assert!(!body.contains(leaked), "{leaked} survived the rewrite");
+        }
+    }
+
+    #[test]
     fn rewrite_rejects_non_playlist_or_non_url_input() {
         assert!(rewrite_playlist(b"not a playlist", "https://s.example/p.m3u8").is_none());
         assert!(rewrite_playlist(b"#EXTM3U", "not a url").is_none());
@@ -627,10 +653,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
-        let base = format!(
-            "http://127.0.0.1:{}/live.m3u8",
-            listener.local_addr().unwrap().port()
-        );
+        let address = listener.local_addr().unwrap();
+        // A public-looking name pinned to loopback: playlist targets pass the
+        // untrusted-URL policy, which refuses loopback IP literals.
+        let base = format!("http://hls.example:{}/live.m3u8", address.port());
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -641,11 +667,15 @@ mod tests {
         assert!(is_hls_playlist(&playlist), "fixture must be an m3u8");
 
         let semaphore = Arc::new(Semaphore::new(1));
+        let http = reqwest::Client::builder()
+            .resolve("hls.example", address)
+            .build()
+            .expect("client");
         let thumbnail = crate::thumbnail::extract_thumbnail_from_verified_playlist(
             &playlist,
             &base,
             &semaphore,
-            &reqwest::Client::new(),
+            &http,
             16 * 1024 * 1024,
             1024 * 1024,
             std::time::Instant::now() + std::time::Duration::from_secs(60),
