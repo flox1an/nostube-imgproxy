@@ -14,7 +14,6 @@ use std::{
     },
 };
 
-use bytes::Bytes;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use http::StatusCode;
 use parking_lot::Mutex;
@@ -30,27 +29,27 @@ impl From<SharedError> for SvcError {
     }
 }
 
-type Flight = Shared<BoxFuture<'static, Result<Bytes, SharedError>>>;
+type Flight<T> = Shared<BoxFuture<'static, Result<T, SharedError>>>;
 
 #[derive(Clone)]
-struct FlightEntry {
+struct FlightEntry<T> {
     generation: u64,
-    flight: Flight,
+    flight: Flight<T>,
 }
 
 #[derive(Debug)]
-pub struct Outcome {
-    pub bytes: Bytes,
+pub struct Outcome<T> {
+    pub value: T,
     pub coalesced: bool,
 }
 
-pub struct SingleFlight {
-    inflight: Mutex<HashMap<String, FlightEntry>>,
+pub struct SingleFlight<T> {
+    inflight: Mutex<HashMap<String, FlightEntry<T>>>,
     next_generation: AtomicU64,
     max_entries: usize,
 }
 
-impl SingleFlight {
+impl<T: Clone + Send + Sync + 'static> SingleFlight<T> {
     /// `max_entries` caps unique cache misses in flight. A caller that cannot
     /// join an existing flight is shed rather than creating retained work.
     pub fn new(max_entries: usize) -> Self {
@@ -61,10 +60,10 @@ impl SingleFlight {
         }
     }
 
-    pub async fn run<F, Fut>(self: &Arc<Self>, key: &str, work: F) -> Result<Outcome, SvcError>
+    pub async fn run<F, Fut>(self: &Arc<Self>, key: &str, work: F) -> Result<Outcome<T>, SvcError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Bytes, SvcError>> + Send + 'static,
+        Fut: Future<Output = Result<T, SvcError>> + Send + 'static,
     {
         let (flight, coalesced) = {
             let mut inflight = self.inflight.lock();
@@ -78,7 +77,7 @@ impl SingleFlight {
                 let owner = Arc::clone(self);
                 let owned_key = key.to_owned();
                 let future = work();
-                let flight: Flight = async move {
+                let flight: Flight<T> = async move {
                     let result = AssertUnwindSafe(future).catch_unwind().await;
                     let result = match result {
                         Ok(result) => result,
@@ -117,8 +116,8 @@ impl SingleFlight {
             }
         };
 
-        let bytes = flight.await?;
-        Ok(Outcome { bytes, coalesced })
+        let value = flight.await?;
+        Ok(Outcome { value, coalesced })
     }
 
     #[cfg(test)]
@@ -135,6 +134,7 @@ fn shared_error(error: SvcError) -> SharedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
@@ -207,7 +207,7 @@ mod tests {
                 .run("k", || async { Ok(Bytes::from_static(b"recovered")) })
                 .await
                 .unwrap()
-                .bytes[..],
+                .value[..],
             b"recovered"
         );
     }

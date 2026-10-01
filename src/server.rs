@@ -62,7 +62,7 @@ pub struct CombinedState {
     /// Bounded off-runtime executor for decode/resize/encode.
     pub cpu: CpuPool,
     /// Collapses concurrent misses for the same derivative into one job.
-    pub inflight: Arc<SingleFlight>,
+    pub inflight: Arc<SingleFlight<Derivative>>,
     /// Three-tier per-IP flood guard: general requests, image-generation
     /// cache misses, and video-generation cache misses.
     pub media_rate_limits: Arc<MediaRateLimiters>,
@@ -70,6 +70,15 @@ pub struct CombinedState {
     /// what eventually makes a video thumbnail cacheable without ever putting
     /// a full download on the request path.
     pub video_verifier: Arc<VideoVerifier>,
+}
+
+/// A freshly produced derivative. `persisted` is true only when its source
+/// bytes were verified and it was written to the cache, which is the only
+/// case that may be pinned `immutable` with a stable ETag.
+#[derive(Clone)]
+pub struct Derivative {
+    pub bytes: Bytes,
+    pub persisted: bool,
 }
 
 impl CombinedState {
@@ -653,7 +662,7 @@ async fn produce_derivative(
     cache_path: std::path::PathBuf,
     original_cache_path: std::path::PathBuf,
     deadline: Instant,
-) -> Result<Bytes, SvcError> {
+) -> Result<Derivative, SvcError> {
     let (original, verified) =
         load_original(&state, &source, &original_cache_path, deadline).await?;
 
@@ -698,7 +707,10 @@ async fn produce_derivative(
         write_cache_atomic(&cache_path, &encoded).await?;
         write_cache_atomic(&original_cache_path, &original).await?;
     }
-    Ok(Bytes::from(encoded))
+    Ok(Derivative {
+        bytes: Bytes::from(encoded),
+        persisted: verified,
+    })
 }
 
 /// Build the response for a derivative that was produced rather than cached.
@@ -825,7 +837,13 @@ async fn handle_image_request(
             .await?
     };
 
-    let mut resp = fresh_response(outcome.bytes, mime, &cache_path, outcome.coalesced, policy);
+    let mut resp = fresh_response(
+        outcome.value.bytes,
+        mime,
+        &cache_path,
+        outcome.coalesced,
+        policy,
+    );
     if is_video {
         resp.headers_mut().remove(header::ETAG);
     }
@@ -1012,21 +1030,13 @@ async fn handle_thumb_request(
         blob_name
     );
 
-    // Whether this miss will end up persisted, decided from the same fact
-    // `load_original` will act on: an image is always cacheable, a video only
-    // once a background verification has left a hash-verified original behind.
-    // Reading it *before* production is what keeps the answer honest — probing
-    // `cache_path` afterwards could observe a concurrent, verified request's
-    // write and pin this request's unverified bytes with that entry's ETag.
-    // Drift between this check and the write is one-directional and safe: an
-    // original appearing in between only costs one under-claimed response.
-    let derivative_will_be_cached = if is_video {
-        tokio::fs::try_exists(&original_cache_path)
-            .await
-            .unwrap_or(false)
-    } else {
-        true
-    };
+    // Server hints decide where unverified bytes (range-probed video, HLS
+    // segments) come from, so they must split flights: otherwise a request
+    // with `xs=attacker` leads the flight and every concurrent viewer of the
+    // same hash receives the attacker's thumbnail. Debug formatting keeps the
+    // list unambiguous. The disk cache key stays hint-free: only verified
+    // output is ever written under it.
+    let flight_key = format!("{cache_key}|{servers:?}");
 
     let source = Source::Blossom {
         hash,
@@ -1042,7 +1052,7 @@ async fn handle_thumb_request(
         let cache_path = cache_path.clone();
         let original_cache_path = original_cache_path.clone();
         inflight
-            .run(&cache_key, move || {
+            .run(&flight_key, move || {
                 produce_derivative(
                     state,
                     source,
@@ -1055,23 +1065,26 @@ async fn handle_thumb_request(
             .await?
     };
 
-    let fresh_policy =
-        signed_expiry
-            .map(ClientCachePolicy::ExpiresAt)
-            .unwrap_or(if derivative_will_be_cached {
-                ClientCachePolicy::Immutable
-            } else {
-                ClientCachePolicy::ShortLived
-            });
+    // Decided from what this flight actually did, not predicted up front: an
+    // HLS playlist is only recognised by sniffing after the fetch, and its
+    // unverified segment bytes must not be pinned for a year.
+    let persisted = outcome.value.persisted;
+    let fresh_policy = signed_expiry
+        .map(ClientCachePolicy::ExpiresAt)
+        .unwrap_or(if persisted {
+            ClientCachePolicy::Immutable
+        } else {
+            ClientCachePolicy::ShortLived
+        });
 
     let mut resp = fresh_response(
-        outcome.bytes,
+        outcome.value.bytes,
         mime,
         &cache_path,
         outcome.coalesced,
         fresh_policy,
     );
-    if !derivative_will_be_cached {
+    if !persisted {
         // Unverified bytes: a stable ETag here would let a client's
         // `If-None-Match` short-circuit to 304 for content that was never
         // pinned server-side and may differ on the next request.
