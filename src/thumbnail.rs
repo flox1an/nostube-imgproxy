@@ -298,6 +298,10 @@ pub(crate) fn proxy_token() -> String {
 /// remote host itself. `max_probe_bytes` caps total source bytes across all
 /// Range responses for a candidate; it is deliberately not a full video-size
 /// cap, so large seekable videos remain supported.
+///
+/// Returns the frame together with the candidate URL that produced it: the
+/// bytes are not hash-verified, so callers may only trust (and cache) them as
+/// "what that origin served".
 #[allow(clippy::too_many_arguments)]
 pub async fn extract_video_thumbnail(
     video_url: &str,
@@ -312,7 +316,7 @@ pub async fn extract_video_thumbnail(
     max_image_bytes: usize,
     deadline: Instant,
     ffmpeg_timeout: Duration,
-) -> Result<Vec<u8>, SvcError> {
+) -> Result<(Vec<u8>, String), SvcError> {
     info!(source = %log_value(video_url), "extracting video thumbnail");
 
     let _permit = semaphore
@@ -402,7 +406,7 @@ pub async fn extract_video_thumbnail(
                     bytes = bytes.len(),
                     "video thumbnail extracted"
                 );
-                return Ok(bytes);
+                return Ok((bytes, url.clone()));
             }
             Err(error) => {
                 let class = CandidateFailureClass::from_error(&error);
@@ -675,52 +679,13 @@ async fn extract_thumbnail_with_ffmpeg(
     }
 }
 
-/// Extract a thumbnail frame from a video blob whose bytes are already
-/// hash-verified and fully local (e.g. via
-/// [`crate::blossom::try_fetch_verified_blob`]). FFmpeg gets a
-/// `file`-only protocol whitelist — no network access at all — since the
-/// whole input already sits on disk; there is no candidate loop or byte
-/// budget to enforce here, both already happened before this bytes were
-/// obtained.
-pub async fn extract_thumbnail_from_verified_bytes(
-    bytes: &[u8],
-    blob_name: &str,
-    semaphore: &Arc<Semaphore>,
-    max_image_bytes: usize,
-    timeout: Duration,
-) -> Result<Vec<u8>, SvcError> {
-    let demuxer =
-        input_demuxer(blob_name).ok_or(SvcError::BadRequest("unsupported video format"))?;
-    // A playlist read from a local tempfile with a `file` whitelist can only
-    // succeed by referencing local paths: an attacker-hashed `.m3u8` would
-    // turn background verification into a local media-file read.
-    if demuxer == crate::hls::HLS_DEMUXER || crate::hls::is_hls_playlist(bytes) {
-        return Err(SvcError::BadRequest("playlist is not a verifiable video"));
-    }
-
-    let _permit = semaphore
-        .acquire()
-        .await
-        .map_err(|_| SvcError::InternalError("ffmpeg semaphore closed".into()))?;
-
-    let input_file = tempfile::NamedTempFile::new().map_err(SvcError::Io)?;
-    tokio::fs::write(input_file.path(), bytes)
-        .await
-        .map_err(SvcError::Io)?;
-    let input_path = input_file.path().to_string_lossy().into_owned();
-
-    run_ffmpeg_extract(&input_path, "file", demuxer, max_image_bytes, timeout).await
-}
-
 /// Extract a thumbnail from an HLS playlist whose bytes are already
-/// hash-verified and fully local (e.g. via
-/// [`crate::blossom::try_fetch_verified_blob`] or the image-path
-/// `#EXTM3U` sniff). The playlist is served from memory through the
-/// [`crate::hls::HlsMediaProxy`]; only its *segments* are still remote, so
-/// unlike [`extract_thumbnail_from_verified_bytes`] this needs network
-/// access (`http` in the whitelist, loopback gateway only) and a probe
-/// budget. The resulting thumbnail is derived from unverified segment bytes
-/// and must be treated as such by callers (never hash-keyed cached).
+/// hash-verified and fully local (the image-path `#EXTM3U` sniff). The
+/// playlist is served from memory through the [`crate::hls::HlsMediaProxy`];
+/// only its *segments* are still remote, so this needs network access
+/// (`http` in the whitelist, loopback gateway only) and a probe budget. The
+/// resulting thumbnail is derived from unverified segment bytes and must be
+/// treated as such by callers (never hash-keyed cached).
 #[allow(clippy::too_many_arguments)]
 pub async fn extract_thumbnail_from_verified_playlist(
     playlist: &[u8],
@@ -824,27 +789,6 @@ fn log_value(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn verified_bytes_extraction_refuses_playlists() {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let playlist = b"#EXTM3U\n#EXTINF:1,\n/etc/secret.mp4\n#EXT-X-ENDLIST\n";
-        for name in ["x.m3u8", "x.mp4"] {
-            let error = extract_thumbnail_from_verified_bytes(
-                playlist,
-                name,
-                &semaphore,
-                1024,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect_err("a playlist must never reach FFmpeg with a file whitelist");
-            assert!(
-                matches!(error, SvcError::BadRequest(_)),
-                "{name}: {error:?}"
-            );
-        }
-    }
 
     #[test]
     fn is_video_url_accepts_containers_and_m3u8_but_rejects_other_manifests() {
@@ -1070,15 +1014,11 @@ mod tests {
             .status()
             .expect("spawn ffmpeg");
         assert!(status.success(), "fixture generation failed");
-        let bytes = tokio::fs::read(dir.path().join("lead.mp4"))
-            .await
-            .expect("read fixture");
-
-        let semaphore = Arc::new(Semaphore::new(1));
-        let thumbnail = extract_thumbnail_from_verified_bytes(
-            &bytes,
-            "lead.mp4",
-            &semaphore,
+        let input = dir.path().join("lead.mp4");
+        let thumbnail = run_ffmpeg_extract(
+            &input.to_string_lossy(),
+            "file",
+            input_demuxer("lead.mp4").expect("mp4 demuxer"),
             1024 * 1024,
             Duration::from_secs(30),
         )

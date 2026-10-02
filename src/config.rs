@@ -59,18 +59,6 @@ pub struct AppCfg {
     /// full-video-size cap, so seekable multi-gigabyte sources remain usable.
     /// This is the only video budget on the request path.
     pub max_video_probe_bytes: u64,
-    /// Ceiling on a background video verification's full download. A full
-    /// transfer is a different cost class from a bounded range probe, so it
-    /// gets its own, smaller budget: a blob above this is simply never
-    /// cacheable, and keeps being range-probed per request.
-    pub max_verify_video_bytes: u64,
-    /// Range-probed misses one video blob must accumulate before a single
-    /// background hash-verification downloads it in full. Above 1, a blob
-    /// thumbnailed exactly once never costs a full download.
-    pub video_verify_after_misses: u32,
-    /// Simultaneous background video verifications. Small on purpose: this is
-    /// pure optimisation and must never compete with request traffic.
-    pub max_concurrent_video_verifications: usize,
     /// Total Blossom candidates tried for one blob, across request hints,
     /// author servers, fallbacks and NIP-94 discovery. Bounds the fan-out a
     /// single request can aim at third-party hosts.
@@ -227,13 +215,6 @@ impl AppCfg {
             ffmpeg_timeout: env_secs("FFMPEG_TIMEOUT_SECS", 20),
             max_cache_bytes: env_parsed("MAX_CACHE_BYTES", 8 * 1024 * 1024 * 1024),
             max_video_probe_bytes: env_parsed("MAX_VIDEO_PROBE_BYTES", 64 * 1024 * 1024),
-            max_verify_video_bytes: env_parsed("MAX_VERIFY_VIDEO_BYTES", 32 * 1024 * 1024),
-            video_verify_after_misses: env_parsed("VIDEO_VERIFY_AFTER_MISSES", 2u32).max(1),
-            max_concurrent_video_verifications: env_parsed(
-                "MAX_CONCURRENT_VIDEO_VERIFICATIONS",
-                2usize,
-            )
-            .max(1),
             max_blob_candidates: env_parsed("MAX_BLOB_CANDIDATES", 8usize).max(1),
             max_server_hints: env_parsed("MAX_SERVER_HINTS", 4usize),
             cpu_queue_depth: env_parsed("MAX_CPU_QUEUE", 64usize).max(1),
@@ -341,9 +322,6 @@ mod tests {
         "FFMPEG_TIMEOUT_SECS",
         "MAX_CACHE_BYTES",
         "MAX_VIDEO_PROBE_BYTES",
-        "MAX_VERIFY_VIDEO_BYTES",
-        "VIDEO_VERIFY_AFTER_MISSES",
-        "MAX_CONCURRENT_VIDEO_VERIFICATIONS",
         "MAX_BLOB_CANDIDATES",
         "MAX_SERVER_HINTS",
         "MAX_CPU_QUEUE",
@@ -416,9 +394,6 @@ mod tests {
         assert_eq!(cfg.ffmpeg_timeout, Duration::from_secs(20));
         assert_eq!(cfg.max_cache_bytes, 8 * 1024 * 1024 * 1024);
         assert_eq!(cfg.max_video_probe_bytes, 64 * 1024 * 1024);
-        assert_eq!(cfg.max_verify_video_bytes, 32 * 1024 * 1024);
-        assert_eq!(cfg.video_verify_after_misses, 2);
-        assert_eq!(cfg.max_concurrent_video_verifications, 2);
         assert_eq!(cfg.max_blob_candidates, 8);
         assert_eq!(cfg.max_server_hints, 4);
         assert!(cfg.metrics_bearer_token.is_none());
@@ -466,9 +441,6 @@ mod tests {
                 ("FFMPEG_TIMEOUT_SECS", "9"),
                 ("MAX_CACHE_BYTES", "4096"),
                 ("MAX_VIDEO_PROBE_BYTES", "8192"),
-                ("MAX_VERIFY_VIDEO_BYTES", "4096"),
-                ("VIDEO_VERIFY_AFTER_MISSES", "5"),
-                ("MAX_CONCURRENT_VIDEO_VERIFICATIONS", "3"),
                 ("MAX_BLOB_CANDIDATES", "3"),
                 ("MAX_SERVER_HINTS", "1"),
                 ("MAX_CPU_QUEUE", "5"),
@@ -506,9 +478,6 @@ mod tests {
         assert_eq!(cfg.ffmpeg_timeout, Duration::from_secs(9));
         assert_eq!(cfg.max_cache_bytes, 4096);
         assert_eq!(cfg.max_video_probe_bytes, 8192);
-        assert_eq!(cfg.max_verify_video_bytes, 4096);
-        assert_eq!(cfg.video_verify_after_misses, 5);
-        assert_eq!(cfg.max_concurrent_video_verifications, 3);
         assert_eq!(cfg.max_blob_candidates, 3);
         assert_eq!(cfg.max_server_hints, 1);
         assert_eq!(cfg.cpu_queue_depth, 5);

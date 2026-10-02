@@ -26,10 +26,7 @@ use tower_http::{
 
 use crate::{
     audio,
-    blossom::{
-        combine_server_lists, fetch_blob, parse_blossom_filename, try_fetch_verified_blob,
-        BlossomState,
-    },
+    blossom::{combine_server_lists, fetch_blob, parse_blossom_filename, BlossomState},
     cache::{
         cache_path_for, derivative_cache_key, fresh_response_headers, original_cache_path_for,
         try_read_original_cache, try_serve_cache, write_cache_atomic, ClientCachePolicy,
@@ -46,13 +43,12 @@ use crate::{
     signing::signature_error,
     singleflight::SingleFlight,
     thumbnail::{
-        extract_thumbnail_from_verified_bytes, extract_thumbnail_from_verified_playlist,
-        extract_video_thumbnail, is_video_url, ThumbnailState,
+        extract_thumbnail_from_verified_playlist, extract_video_thumbnail, is_video_url,
+        ThumbnailState,
     },
     transform::{
         parse_resize_directive, parse_rest, process_image, Directives, OutFmt, Resize, ResizeMode,
     },
-    verify::{VideoVerifier, BACKGROUND_VERIFY_TIMEOUT},
 };
 
 /// Combined state for image and video processing
@@ -68,19 +64,15 @@ pub struct CombinedState {
     /// Three-tier per-IP flood guard: general requests, image-generation
     /// cache misses, and video-generation cache misses.
     pub media_rate_limits: Arc<MediaRateLimiters>,
-    /// Gates and bounds background hash-verification of video blobs, which is
-    /// what eventually makes a video thumbnail cacheable without ever putting
-    /// a full download on the request path.
-    pub video_verifier: Arc<VideoVerifier>,
 }
 
-/// A freshly produced derivative. `persisted` is true only when its source
-/// bytes were verified and it was written to the cache, which is the only
-/// case that may be pinned `immutable` with a stable ETag.
+/// A freshly produced derivative. `cache_path` is set only when it was
+/// written to the disk cache, which is the only case that may carry a stable
+/// ETag and (on `/thumb`) be pinned `immutable`.
 #[derive(Clone)]
 pub struct Derivative {
     pub bytes: Bytes,
-    pub persisted: bool,
+    pub cache_path: Option<std::path::PathBuf>,
 }
 
 impl CombinedState {
@@ -92,10 +84,6 @@ impl CombinedState {
             app.cfg.rate_ip_image_generations_per_min,
             app.cfg.rate_ip_video_generations_per_min,
         ));
-        let video_verifier = Arc::new(VideoVerifier::new(
-            app.cfg.max_concurrent_video_verifications,
-            app.cfg.video_verify_after_misses,
-        ));
         Self {
             app,
             thumbnail,
@@ -103,7 +91,6 @@ impl CombinedState {
             cpu,
             inflight: Arc::new(SingleFlight::new(max_inflight)),
             media_rate_limits,
-            video_verifier,
         }
     }
 }
@@ -399,23 +386,61 @@ impl Source {
         }
     }
 
-    /// Range-probed video sources cannot be proven to match their advertised
-    /// SHA-256 without a full download. Never let their thumbnails enter a
-    /// hash-keyed disk cache or receive a reusable entity validator by
-    /// default; a Blossom video overrides this dynamically in
-    /// `produce_derivative` once `load_original` has actually verified it.
-    fn cacheable(&self) -> bool {
-        !self.is_video()
+    /// Cache identities whose entries this source may reuse, in preference
+    /// order: the URL for `/insecure`, the blob name for a hash-verified
+    /// Blossom blob, one `blob@origin` per candidate server for a
+    /// range-probed Blossom video (see [`video_identities`]).
+    fn cache_identities(&self) -> Vec<String> {
+        match self {
+            Source::Direct { url, .. } => vec![url.clone()],
+            Source::Blossom {
+                hash,
+                ext,
+                servers,
+                is_video,
+                ..
+            } => {
+                let name = blob_name(hash, ext.as_deref());
+                if *is_video {
+                    video_identities(&name, servers)
+                } else {
+                    vec![name]
+                }
+            }
+        }
     }
+}
 
-    /// Whether `load_original` should even try the original-bytes cache
-    /// before fetching. Statically cacheable sources always might have one;
-    /// a Blossom video might too, if an earlier request already verified and
-    /// wrote it. A `/insecure` video never can — nothing about it is ever
-    /// hash-verified, so nothing is ever written for it to find.
-    fn may_have_cached_original(&self) -> bool {
-        self.cacheable() || matches!(self, Source::Blossom { is_video: true, .. })
+fn blob_name(hash: &str, ext: Option<&str>) -> String {
+    match ext {
+        Some(ext) => format!("{hash}.{ext}"),
+        None => hash.to_owned(),
     }
+}
+
+/// `scheme://host[:port]` of a server base URL or candidate URL.
+fn url_origin(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+}
+
+/// Cache identities of a range-probed Blossom video, one per distinct origin
+/// in `servers` (request order).
+///
+/// The frame comes from a range probe, never from a hash check of the whole
+/// blob (that would mean downloading every video in full), so it is only
+/// trusted as "what this origin served for this blob". Keying by origin keeps
+/// a hostile `xs=` origin from poisoning anyone else: its entry is only ever
+/// looked up by requests that would ask that origin themselves.
+fn video_identities(blob_name: &str, servers: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    servers
+        .iter()
+        .filter_map(|server| url_origin(server))
+        .filter(|origin| seen.insert(origin.clone()))
+        .map(|origin| format!("{blob_name}@{origin}"))
+        .collect()
 }
 
 /// Serve a cached derivative if one exists, recording the cache hit.
@@ -433,34 +458,39 @@ async fn serve_cached(
 }
 
 /// Obtain the original bytes for `source`, using the original-bytes cache
-/// first. Returns whether those bytes are proven to match the address the
-/// client used to request them (a Blossom SHA-256, or — for `/insecure` —
-/// the URL itself) and are therefore safe to persist under that address as a
-/// cache key. Images always are (Blossom via the full-body hash check in
-/// `fetch_blob`; `/insecure` via the URL itself). A Blossom video is only
-/// when the full blob was hash-verified below; a range-probed video, and any
-/// `/insecure` video, never is.
+/// first. Also returns the cache identity those bytes may be persisted
+/// under, or `None` when they must not be cached:
+///
+/// - `/insecure`: the URL itself, image or video.
+/// - Blossom image: the blob name, after the full-body hash check in
+///   `fetch_blob`.
+/// - Blossom video: `blob@origin` of the candidate that served the probe, if
+///   that origin is one of the request's servers. A NIP-94-discovered origin
+///   (anyone may publish those) is used but never persisted.
+/// - HLS sniffed behind a non-video name: never (unverified segments behind a
+///   lookup that only knows the hint-free blob name).
 async fn load_original(
     state: &CombinedState,
     source: &Source,
-    original_cache_path: &Path,
+    route: &'static str,
     deadline: Instant,
-) -> Result<(Vec<u8>, bool), SvcError> {
-    if source.may_have_cached_original() {
-        if let Some(cached) = try_read_original_cache(original_cache_path).await? {
-            metrics::record_cache_hit("original");
-            return Ok((cached, true));
-        }
-        metrics::record_cache_miss("original");
-    }
-
+) -> Result<(Vec<u8>, Option<String>), SvcError> {
     let cfg = &state.app.cfg;
-    let (bytes, verified) = match source {
+    for identity in source.cache_identities() {
+        let path = original_cache_path_for(cfg, route, &identity);
+        if let Some(cached) = try_read_original_cache(&path).await? {
+            metrics::record_cache_hit("original");
+            return Ok((cached, Some(identity)));
+        }
+    }
+    metrics::record_cache_miss("original");
+
+    let loaded = match source {
         Source::Direct {
             url,
             is_video: true,
         } => {
-            let thumbnail = extract_video_thumbnail(
+            let (thumbnail, _) = extract_video_thumbnail(
                 url,
                 &state.thumbnail.ffmpeg_semaphore,
                 &state.app.http,
@@ -475,12 +505,12 @@ async fn load_original(
                 cfg.ffmpeg_timeout,
             )
             .await?;
-            (thumbnail, false)
+            (thumbnail, Some(url.clone()))
         }
         Source::Direct { url, .. } => {
             let bytes = fetch_source(&state.app, url).await?;
             metrics::record_bytes_downloaded("image", bytes.len());
-            (bytes.to_vec(), true)
+            (bytes.to_vec(), Some(url.clone()))
         }
         Source::Blossom {
             hash,
@@ -489,12 +519,8 @@ async fn load_original(
             discovered,
             is_video: true,
         } => {
-            // Range-probe only. A thumbnail needs a few seconds of video near
-            // one keyframe, never the whole file, so the request path must
-            // never pay for a full download. That leaves these bytes
-            // unverified against `hash` and therefore uncacheable — the
-            // background verifier (see `verify::VideoVerifier`) is what
-            // eventually earns this blob a cache entry, off the request path.
+            // Range-probe only: a thumbnail needs the container index and a
+            // few seconds near one keyframe, never the whole file.
             let primary = servers
                 .first()
                 .map(|server| blossom_blob_url(server, hash, ext.as_deref()))
@@ -502,7 +528,7 @@ async fn load_original(
                 .ok_or(SvcError::BadRequest(
                     "no servers available for video thumbnail",
                 ))?;
-            let thumbnail = extract_video_thumbnail(
+            let (thumbnail, served_by) = extract_video_thumbnail(
                 &primary,
                 &state.thumbnail.ffmpeg_semaphore,
                 &state.app.http,
@@ -517,22 +543,11 @@ async fn load_original(
                 cfg.ffmpeg_timeout,
             )
             .await?;
-            // The response is already satisfied by the cheap probe above.
-            // Hand this blob to the background verifier so a *later* request
-            // can be served from cache: it downloads the full blob once, and
-            // only after this blob has proven popular enough to be worth it.
-            spawn_background_verification(
-                state,
-                VerifyJob {
-                    hash: hash.clone(),
-                    ext: ext.clone(),
-                    servers: servers.clone(),
-                    discovered: discovered.clone(),
-                    original_cache_path: original_cache_path.to_path_buf(),
-                },
-            )
-            .await;
-            (thumbnail, false)
+            let name = blob_name(hash, ext.as_deref());
+            let identity = url_origin(&served_by)
+                .map(|origin| format!("{name}@{origin}"))
+                .filter(|identity| source.cache_identities().contains(identity));
+            (thumbnail, identity)
         }
         Source::Blossom {
             hash,
@@ -558,9 +573,7 @@ async fn load_original(
             // HLS playlists are published under arbitrary names (real-world
             // Blossom blobs use `.txt`), so the extension cannot be trusted:
             // sniff the verified bytes. The playlist itself is hash-verified,
-            // but its segment bytes are not, so the thumbnail counts as
-            // unverified — same rule as a range-probed video, never
-            // hash-keyed cached — and background verification is pointless.
+            // but its segment bytes are not, so the thumbnail is not cached.
             if hls::is_hls_playlist(&bytes) {
                 tracing::info!(hash = %hash, "HLS playlist detected via content sniff");
                 let primary = servers
@@ -580,123 +593,37 @@ async fn load_original(
                     cfg.ffmpeg_timeout,
                 )
                 .await?;
-                return Ok((thumbnail, false));
+                return Ok((thumbnail, None));
             }
-            (bytes.to_vec(), true)
+            (bytes.to_vec(), Some(blob_name(hash, ext.as_deref())))
         }
     };
 
-    Ok((bytes, verified))
+    Ok(loaded)
 }
 
-/// Everything one background verification needs, owned so the task can
-/// outlive the request that scheduled it.
-struct VerifyJob {
-    hash: String,
-    ext: Option<String>,
-    servers: Vec<String>,
-    discovered: Vec<String>,
-    original_cache_path: std::path::PathBuf,
-}
-
-/// Schedule at most one full-blob hash verification for a video, off the
-/// request path.
-///
-/// Returns immediately. The verifier decides whether this blob has earned a
-/// download at all (see [`VideoVerifier::claim`]); most calls do nothing.
-/// When one does run, it downloads the blob once, checks it against `hash`,
-/// extracts the thumbnail frame from the now-trusted bytes, and writes the
-/// *original*-bytes cache entry. That single entry is preset-agnostic: every
-/// later request for this blob, at any size or format, then finds a verified
-/// original and becomes fully cacheable.
-///
-/// Failure is silent by design. Nothing downstream depends on this
-/// succeeding — the request path keeps range-probing exactly as before.
-async fn spawn_background_verification(state: &CombinedState, job: VerifyJob) {
-    let Some(permit) = state.video_verifier.claim(&job.hash).await else {
-        return;
-    };
-
-    let state = state.clone();
-    tokio::spawn(async move {
-        // Held for the whole task; dropping it frees the slot.
-        let _permit = permit;
-        let cfg = &state.app.cfg;
-        let blob_name = match &job.ext {
-            Some(extension) => format!("{}.{extension}", job.hash),
-            None => job.hash.clone(),
-        };
-        let deadline = Instant::now() + BACKGROUND_VERIFY_TIMEOUT;
-
-        let Some(verified_bytes) = try_fetch_verified_blob(
-            &state.app.http,
-            state.blossom.candidate_failure_cache(),
-            &job.servers,
-            &job.discovered,
-            &job.hash,
-            job.ext.as_deref(),
-            deadline,
-            cfg.max_verify_video_bytes as usize,
-            cfg.max_blob_candidates,
-            cfg.fetch_timeout,
-        )
-        .await
-        else {
-            // Too large for the verify budget, or unreachable. Leave the blob
-            // claimed: retrying every couple of requests would turn a
-            // permanently-too-large video into a recurring full-download
-            // attempt, which is exactly the load this design avoids.
-            tracing::debug!(
-                blob = %blob_name,
-                "background video verification did not obtain verified bytes"
-            );
-            return;
-        };
-
-        metrics::record_bytes_downloaded("video_verify", verified_bytes.len());
-        match extract_thumbnail_from_verified_bytes(
-            &verified_bytes,
-            &blob_name,
-            &state.thumbnail.ffmpeg_semaphore,
-            cfg.max_image_bytes,
-            cfg.ffmpeg_timeout,
-        )
-        .await
-        {
-            Ok(thumbnail) => {
-                if let Err(error) = write_cache_atomic(&job.original_cache_path, &thumbnail).await {
-                    tracing::warn!(?error, blob = %blob_name, "failed to persist verified thumbnail");
-                    return;
-                }
-                tracing::info!(
-                    blob = %blob_name,
-                    bytes = verified_bytes.len(),
-                    "verified video blob; its thumbnails are now cacheable"
-                );
-            }
-            Err(error) => {
-                tracing::debug!(?error, blob = %blob_name, "verified blob failed thumbnail extraction");
-            }
-        }
-    });
-}
-
-/// Produce one derivative from scratch and persist it.
+/// Produce one derivative from scratch and persist it when its source allows.
 ///
 /// Runs as the body of a single-flight leader, so exactly one of these executes
-/// per cache key no matter how many requests arrive at once.
+/// per flight key no matter how many requests arrive at once.
 async fn produce_derivative(
     state: CombinedState,
     source: Source,
     dirs: Directives,
-    cache_path: std::path::PathBuf,
-    original_cache_path: std::path::PathBuf,
+    route: &'static str,
     deadline: Instant,
 ) -> Result<Derivative, SvcError> {
-    let (original, verified) =
-        load_original(&state, &source, &original_cache_path, deadline).await?;
+    let (original, identity) = load_original(&state, &source, route, deadline).await?;
+    let cfg = &state.app.cfg;
+    let paths = identity.map(|identity| {
+        let key = derivative_cache_key(route, &identity, &dirs);
+        (
+            cache_path_for(cfg, route, &key, &dirs.out_fmt),
+            original_cache_path_for(cfg, route, &identity),
+        )
+    });
 
-    let limits = state.app.cfg.decode_limits();
+    let limits = cfg.decode_limits();
     let out_fmt_str = dirs.out_fmt.label();
     // Decode/resize/encode is the only CPU-heavy step; it must never run on an
     // async worker or a few concurrent encodes stall the whole reactor. The
@@ -709,7 +636,7 @@ async fn produce_derivative(
             // An audio blob carries no pixels; substitute its embedded cover
             // art and let the normal decode → resize → encode path take over.
             // The *audio* bytes stay `original` so the original-bytes cache
-            // keeps holding what was verified, and later requests re-extract
+            // keeps holding what was fetched, and later requests re-extract
             // from them instead of re-downloading.
             let cover;
             let image_bytes: &[u8] = if audio::is_audio(&original) {
@@ -729,17 +656,17 @@ async fn produce_derivative(
         metrics::record_image_processed(out_fmt_str);
     }
 
-    // Persist only what `load_original` could prove: hash-verified image
-    // bytes, or a verified Blossom blob. Range-probed video and HLS
-    // thumbnails (verified playlist, unverified segments) return
-    // `verified: false` and must never enter the hash-keyed disk cache.
-    if verified {
-        write_cache_atomic(&cache_path, &encoded).await?;
-        write_cache_atomic(&original_cache_path, &original).await?;
-    }
+    let cache_path = match paths {
+        Some((cache_path, original_cache_path)) => {
+            write_cache_atomic(&cache_path, &encoded).await?;
+            write_cache_atomic(&original_cache_path, &original).await?;
+            Some(cache_path)
+        }
+        None => None,
+    };
     Ok(Derivative {
         bytes: Bytes::from(encoded),
-        persisted: verified,
+        cache_path,
     })
 }
 
@@ -812,10 +739,8 @@ async fn handle_image_request(
         .map(ClientCachePolicy::ExpiresAt)
         .unwrap_or(ClientCachePolicy::ShortLived);
 
-    if !is_video {
-        if let Some(resp) = serve_cached(&cache_path, mime, &request_headers, policy).await? {
-            return Ok(resp);
-        }
+    if let Some(resp) = serve_cached(&cache_path, mime, &request_headers, policy).await? {
+        return Ok(resp);
     }
     state
         .media_rate_limits
@@ -833,7 +758,6 @@ async fn handle_image_request(
                 "image_generation"
             })
         })?;
-    let original_cache_path = original_cache_path_for(&state.app.cfg, INSECURE_ROUTE, &src_url);
     // A video needs several range-probe round trips where an image needs
     // one; reusing `fetch_timeout` for both let video silently inherit a
     // budget sized for the cheaper case.
@@ -851,30 +775,22 @@ async fn handle_image_request(
     let inflight = Arc::clone(&state.inflight);
     let outcome = {
         let state = state.clone();
-        let cache_path = cache_path.clone();
-        let original_cache_path = original_cache_path.clone();
         inflight
             .run(&cache_key, move || {
-                produce_derivative(
-                    state,
-                    source,
-                    dirs,
-                    cache_path,
-                    original_cache_path,
-                    deadline,
-                )
+                produce_derivative(state, source, dirs, INSECURE_ROUTE, deadline)
             })
             .await?
     };
 
+    let persisted_path = outcome.value.cache_path.clone();
     let mut resp = fresh_response(
         outcome.value.bytes,
         mime,
-        &cache_path,
+        persisted_path.as_deref().unwrap_or(&cache_path),
         outcome.coalesced,
         policy,
     );
-    if is_video {
+    if persisted_path.is_none() {
         resp.headers_mut().remove(header::ETAG);
     }
     Ok(resp)
@@ -956,32 +872,31 @@ async fn handle_thumb_request(
         parse_blossom_filename(&filename).ok_or(SvcError::BadRequest("invalid SHA256 filename"))?;
     let hash = hash.to_ascii_lowercase();
     let ext = ext.map(str::to_ascii_lowercase);
-    let blob_name = match &ext {
-        Some(ext) => format!("{hash}.{ext}"),
-        None => hash.clone(),
-    };
+    let blob_name = blob_name(&hash, ext.as_deref());
+    let ext_is_video = ext
+        .as_deref()
+        .is_some_and(|extension| is_video_url(&format!("{hash}.{extension}")));
 
-    // Build cache key from the canonical blob name and request parameters.
+    // Images (hash-verified) live under the hint-free blob name. Videos live
+    // per origin and need the request's server list first, see below.
     let cache_key = derivative_cache_key(THUMB_ROUTE, &blob_name, &dirs);
     let cache_path = cache_path_for(&state.app.cfg, THUMB_ROUTE, &cache_key, &dirs.out_fmt);
-    let original_cache_path = original_cache_path_for(&state.app.cfg, THUMB_ROUTE, &blob_name);
     let mime = dirs.out_fmt.mime_type();
-    // An entry only ever exists under `thumb/` once its bytes were hash-
-    // verified against `blob_name`, so a hit is always safe to pin
-    // `immutable` — video included.
+    // Entries under `thumb/` are hash-verified images or a video frame bound
+    // to the origin that served it; both are stable for their key.
     let hit_policy = signed_expiry
         .map(ClientCachePolicy::ExpiresAt)
         .unwrap_or(ClientCachePolicy::Immutable);
 
-    if let Some(resp) = serve_cached(&cache_path, mime, &request_headers, hit_policy).await? {
-        return Ok(resp);
+    if !ext_is_video {
+        if let Some(resp) = serve_cached(&cache_path, mime, &request_headers, hit_policy).await? {
+            return Ok(resp);
+        }
     }
     state
         .media_rate_limits
         .admit_request(peer_ip)
         .inspect_err(|_| metrics::record_rate_limit_rejection("request"))?;
-
-    metrics::record_cache_miss("processed");
 
     // Get author servers if pubkey provided
     let author_servers = if let Some(pubkey) = hints.author_pubkey {
@@ -1010,6 +925,21 @@ async fn handle_thumb_request(
         state.app.cfg.max_server_hints,
     );
 
+    if ext_is_video {
+        if let Some(resp) = serve_cached_video(
+            &state,
+            &blob_name,
+            &dirs,
+            &servers,
+            &request_headers,
+            hit_policy,
+        )
+        .await?
+        {
+            return Ok(resp);
+        }
+    }
+
     let discovered = match state.blossom.discover_blob_urls(&hash).await {
         Ok(urls) => urls,
         Err(error) => {
@@ -1026,10 +956,23 @@ async fn handle_thumb_request(
     // tell video from image up front. NIP-94 discovery often turns up an
     // extensioned URL for the same hash even then, so fall back to sniffing
     // those before defaulting to "image" and silently failing every video.
-    let is_video = match ext.as_deref() {
-        Some(extension) => is_video_url(&format!("{hash}.{extension}")),
-        None => discovered.iter().any(|url| is_video_url(url)),
-    };
+    let is_video =
+        ext_is_video || (ext.is_none() && discovered.iter().any(|url| is_video_url(url)));
+    if is_video && !ext_is_video {
+        if let Some(resp) = serve_cached_video(
+            &state,
+            &blob_name,
+            &dirs,
+            &servers,
+            &request_headers,
+            hit_policy,
+        )
+        .await?
+        {
+            return Ok(resp);
+        }
+    }
+    metrics::record_cache_miss("processed");
 
     state
         .media_rate_limits
@@ -1058,12 +1001,10 @@ async fn handle_thumb_request(
         blob_name
     );
 
-    // Server hints decide where unverified bytes (range-probed video, HLS
-    // segments) come from, so they must split flights: otherwise a request
-    // with `xs=attacker` leads the flight and every concurrent viewer of the
-    // same hash receives the attacker's thumbnail. Debug formatting keeps the
-    // list unambiguous. The disk cache key stays hint-free: only verified
-    // output is ever written under it.
+    // Server hints decide where video and HLS segment bytes come from, so
+    // they must split flights: otherwise a request with `xs=attacker` leads
+    // the flight and every concurrent viewer of the same hash receives the
+    // attacker's thumbnail. Debug formatting keeps the list unambiguous.
     let flight_key = format!("{cache_key}|{servers:?}");
 
     let source = Source::Blossom {
@@ -1077,48 +1018,62 @@ async fn handle_thumb_request(
     let inflight = Arc::clone(&state.inflight);
     let outcome = {
         let state = state.clone();
-        let cache_path = cache_path.clone();
-        let original_cache_path = original_cache_path.clone();
         inflight
             .run(&flight_key, move || {
-                produce_derivative(
-                    state,
-                    source,
-                    dirs,
-                    cache_path,
-                    original_cache_path,
-                    deadline,
-                )
+                produce_derivative(state, source, dirs, THUMB_ROUTE, deadline)
             })
             .await?
     };
 
-    // Decided from what this flight actually did, not predicted up front: an
-    // HLS playlist is only recognised by sniffing after the fetch, and its
-    // unverified segment bytes must not be pinned for a year.
-    let persisted = outcome.value.persisted;
-    let fresh_policy = signed_expiry
-        .map(ClientCachePolicy::ExpiresAt)
-        .unwrap_or(if persisted {
-            ClientCachePolicy::Immutable
-        } else {
-            ClientCachePolicy::ShortLived
-        });
+    // Decided from what this flight actually did: an HLS playlist is only
+    // recognised by sniffing after the fetch, and a frame from a discovered
+    // origin is served but never persisted — neither may be pinned.
+    let persisted_path = outcome.value.cache_path.clone();
+    let fresh_policy =
+        signed_expiry
+            .map(ClientCachePolicy::ExpiresAt)
+            .unwrap_or(if persisted_path.is_some() {
+                ClientCachePolicy::Immutable
+            } else {
+                ClientCachePolicy::ShortLived
+            });
 
     let mut resp = fresh_response(
         outcome.value.bytes,
         mime,
-        &cache_path,
+        persisted_path.as_deref().unwrap_or(&cache_path),
         outcome.coalesced,
         fresh_policy,
     );
-    if !persisted {
-        // Unverified bytes: a stable ETag here would let a client's
-        // `If-None-Match` short-circuit to 304 for content that was never
-        // pinned server-side and may differ on the next request.
+    if persisted_path.is_none() {
+        // A stable ETag here would let a client's `If-None-Match`
+        // short-circuit to 304 for content that was never pinned server-side
+        // and may differ on the next request.
         resp.headers_mut().remove(header::ETAG);
     }
     Ok(resp)
+}
+
+/// Serve a cached video thumbnail from the first of the request's own
+/// servers that has one (see [`video_identities`]).
+async fn serve_cached_video(
+    state: &CombinedState,
+    blob_name: &str,
+    dirs: &Directives,
+    servers: &[String],
+    request_headers: &HeaderMap,
+    policy: ClientCachePolicy,
+) -> Result<Option<Response>, SvcError> {
+    let cfg = &state.app.cfg;
+    for identity in video_identities(blob_name, servers) {
+        let key = derivative_cache_key(THUMB_ROUTE, &identity, dirs);
+        let path = cache_path_for(cfg, THUMB_ROUTE, &key, &dirs.out_fmt);
+        let mime = dirs.out_fmt.mime_type();
+        if let Some(resp) = serve_cached(&path, mime, request_headers, policy).await? {
+            return Ok(Some(resp));
+        }
+    }
+    Ok(None)
 }
 
 fn verify_signed_request(
@@ -1241,46 +1196,24 @@ mod tests {
     }
 
     #[test]
-    fn range_probed_video_source_is_never_cacheable() {
-        let video = Source::Direct {
-            url: "https://cdn.example/video.mp4".into(),
-            is_video: true,
-        };
-        let image = Source::Direct {
-            url: "https://cdn.example/image.png".into(),
-            is_video: false,
-        };
-
-        assert!(!video.cacheable());
-        assert!(image.cacheable());
-    }
-
-    #[test]
-    fn only_blossom_video_may_have_a_cached_original() {
-        let insecure_video = Source::Direct {
-            url: "https://cdn.example/video.mp4".into(),
-            is_video: true,
-        };
-        let blossom_video = Source::Blossom {
-            hash: "a".repeat(64),
-            ext: Some("mp4".into()),
-            servers: Vec::new(),
-            discovered: Vec::new(),
-            is_video: true,
-        };
-        let image = Source::Direct {
-            url: "https://cdn.example/image.png".into(),
-            is_video: false,
-        };
-
-        assert!(
-            !insecure_video.may_have_cached_original(),
-            "an /insecure video is never hash-verified, so nothing is ever written for it"
+    fn video_identities_follow_request_server_order_per_origin() {
+        let servers = vec![
+            "https://evil.example/".to_owned(),
+            "https://cdn.example/".to_owned(),
+            "https://CDN.example:443/blobs/".to_owned(),
+            "not a url".to_owned(),
+        ];
+        assert_eq!(
+            video_identities("h.mp4", &servers),
+            vec![
+                "h.mp4@https://evil.example".to_owned(),
+                "h.mp4@https://cdn.example".to_owned(),
+            ]
         );
-        assert!(
-            blossom_video.may_have_cached_original(),
-            "a prior request may have already verified and cached this Blossom video"
+        // A request that never names evil.example never looks up its entry.
+        assert_eq!(
+            video_identities("h.mp4", &servers[1..]),
+            vec!["h.mp4@https://cdn.example".to_owned()]
         );
-        assert!(image.may_have_cached_original());
     }
 }

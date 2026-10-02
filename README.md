@@ -223,10 +223,7 @@ Configure via environment variables:
 | `BLOSSOM_NEGATIVE_CACHE_PERMANENT_TTL_SECS` | `3600` (1h) | Cache 3xx and non-transient 4xx Blossom candidates; `0` disables this class |
 | `BLOSSOM_NEGATIVE_CACHE_TRANSIENT_TTL_SECS` | `60` | Cache timeouts, transport failures, 429, and 5xx Blossom candidates; `0` disables this class |
 | `MAX_IMAGE_BYTES` | `16777216` (16 MiB) | Max compressed image or generated thumbnail size |
-| `MAX_VIDEO_PROBE_BYTES` | `67108864` (64 MiB) | Total remote bytes the local media gateway may relay for one thumbnail; not a full-video size cap. The only video budget on the request path |
-| `MAX_VERIFY_VIDEO_BYTES` | `33554432` (32 MiB) | Ceiling on a background verification's full blob download; larger videos stay uncacheable and keep being range-probed |
-| `VIDEO_VERIFY_AFTER_MISSES` | `2` | Range-probed misses one video must accumulate before a single background hash-verification runs. Above `1`, a video thumbnailed once never costs a full download |
-| `MAX_CONCURRENT_VIDEO_VERIFICATIONS` | `2` | Simultaneous background video verifications |
+| `MAX_VIDEO_PROBE_BYTES` | `67108864` (64 MiB) | Total remote bytes the local media gateway may relay for one thumbnail; not a full-video size cap. The only video transfer budget — videos are never downloaded in full |
 | `MAX_FFMPEG_CONCURRENT` | `8` | Max concurrent FFmpeg processes; excess requests are shed with `503 Retry-After` |
 | `MAX_CPU_QUEUE` | `64` | Additional image decode/resize/encode jobs admitted to wait for CPU |
 | `MAX_CACHE_BYTES` | `8589934592` (8 GiB) | Disk budget shared by original and processed caches |
@@ -295,7 +292,6 @@ src/
 ├── hls.rs        # HLS playlist rewriting and segment gateway
 ├── transform.rs  # Image transformation logic (resize, encode, parse)
 ├── thumbnail.rs  # Video thumbnail extraction (FFmpeg integration)
-├── verify.rs     # Background hash-verification gating for video blobs
 └── cache.rs      # Cache operations (read, write, cleanup)
 ```
 
@@ -308,21 +304,21 @@ The service uses a **dual-cache architecture** for optimal performance:
 ```
 cache/
 ├── original/
-│   ├── thumb/     # Hash-verified Blossom sources      → CACHE_TTL_IMMUTABLE_SECS
-│   └── insecure/  # URL-addressed sources              → CACHE_TTL_SECS
+│   ├── thumb/     # Blossom: hash-verified images, video frames per origin → CACHE_TTL_IMMUTABLE_SECS
+│   └── insecure/  # URL-addressed sources (image or video frame)           → CACHE_TTL_SECS
 └── processed/
-    ├── thumb/     # Hash-verified derivatives          → CACHE_TTL_IMMUTABLE_SECS
-    └── insecure/  # URL-addressed derivatives          → CACHE_TTL_SECS
+    ├── thumb/     # Derivatives of the above                               → CACHE_TTL_IMMUTABLE_SECS
+    └── insecure/  # URL-addressed derivatives                              → CACHE_TTL_SECS
 ```
 
-The `thumb` namespace only ever receives bytes that were hash-verified
-against the requested SHA-256, so those entries cannot go stale behind their
-key and earn a much longer TTL. The `insecure` namespace is URL-addressed —
-the bytes behind a URL can change — so it keeps the short TTL.
+Entries in the `thumb` namespace cannot go stale behind their key — a
+hash-verified image, or the frame one origin served for one content hash — and
+earn a much longer TTL. The `insecure` namespace is URL-addressed — the bytes
+behind a URL can change — so it keeps the short TTL.
 
 ### Original Cache
 - **Purpose**: Prevents redundant downloads and processing of validated sources
-- **Key**: SHA-256 hash of the source URL or canonical Blossom blob name
+- **Key**: SHA-256 hash of the source URL, the canonical Blossom blob name, or `blob@origin` for a Blossom video
 - **Content**: Downloaded original image, or the extracted frame for a video
 - **Preset-agnostic**: One entry serves every size, format, and quality of that source
 
@@ -333,23 +329,26 @@ the bytes behind a URL can change — so it keeps the short TTL.
 - **Benefit**: Equivalent URLs with ignored or normalized directives share one entry
 
 ### Video Thumbnails
-A thumbnail needs a few seconds of footage near one keyframe, so the request
-path only ever range-probes — it never downloads a full video. Proving those
-bytes match the requested SHA-256, however, requires the whole blob, so that
-happens **off the request path**:
+A thumbnail needs the container index and a few seconds near one keyframe, so
+FFmpeg reads the video through HTTP range requests and never downloads it in
+full (bounded by `MAX_VIDEO_PROBE_BYTES`). Multi-gigabyte videos cost the same
+few megabytes as short clips.
 
-1. First requests are served from a range probe: `max-age=3600`, no `ETag`, nothing cached.
-2. Once a video accumulates `VIDEO_VERIFY_AFTER_MISSES` misses, one bounded background job downloads it in full, checks the hash, extracts the frame, and writes the original cache entry.
-3. Later requests find that verified original and are served `immutable` with an `ETag`, at any preset.
+The frame is therefore **not** checked against the Blossom SHA-256 — that
+would need the whole file. It is cached under `blob@origin` of the server that
+served the probe, and a request only looks up the origins in its own server
+list (`xs=` hints, `as=` author servers, `BLOSSOM_FALLBACK_SERVERS`, in that
+order). A hostile `xs=` origin can thus only ever poison the answer for
+requests that name it themselves. A frame obtained from a NIP-94-discovered
+URL (anyone may publish those) is served but never cached.
 
-A video requested only once therefore never costs a full download, and a video
-above `MAX_VERIFY_VIDEO_BYTES` is never fully downloaded at all — it keeps
-being range-probed per request.
+`/insecure` video frames are cached under their URL, exactly like images.
+HLS playlists sniffed behind a non-video Blossom name are not cached.
 
 ### General Cache Properties
 - **Atomic writes**: Create-new temporary files, `fsync`, then rename; zero-byte entries are misses
 - **Cleanup**: Runs every 60 seconds, applies the per-namespace TTL, and evicts oldest entries above `MAX_CACHE_BYTES`
-- **Cache headers**: Hash-verified derivatives are immutable; `/insecure` and not-yet-verified video responses are short-lived and carry no `ETag`
+- **Cache headers**: `/thumb` entries are immutable; `/insecure` responses are short-lived; anything not written to disk carries no `ETag`
 - **Hit/Miss indicator**: `X-Cache: hit`, `miss`, or `coalesced`
 
 ## Known Issues

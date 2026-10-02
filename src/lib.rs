@@ -20,7 +20,6 @@ pub mod signing;
 pub mod singleflight;
 pub mod thumbnail;
 pub mod transform;
-pub mod verify;
 
 /// Install the process-wide rustls [`CryptoProvider`].
 ///
