@@ -9,7 +9,7 @@ use ipnet::IpNet;
 use parking_lot::Mutex;
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, Ipv6Addr},
     time::{Duration, Instant},
 };
 
@@ -82,6 +82,7 @@ impl IpRateLimiter {
     /// Admit `cost` units for `ip`, or reject with [`SvcError::RateLimited`]
     /// once the current minute's budget for that IP is exhausted.
     pub fn admit(&self, ip: IpAddr, cost: u32) -> Result<(), SvcError> {
+        let ip = bucket(ip);
         let now = Instant::now();
         let mut windows = self.windows.lock();
         windows.retain(|_, window| now.duration_since(window.started) < WINDOW);
@@ -103,6 +104,18 @@ impl IpRateLimiter {
         });
         window.used = window.used.saturating_add(cost);
         Ok(())
+    }
+}
+
+/// Budget key for `ip`. An IPv6 host routinely owns a whole /64, so keying on
+/// the full address would let one client mint a fresh budget per request.
+fn bucket(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let [a, b, c, d, ..] = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+        }
+        v4 => v4,
     }
 }
 
@@ -222,6 +235,23 @@ mod tests {
         let b: IpAddr = "198.51.100.20".parse().unwrap();
         limiter.admit(a, 1).unwrap();
         assert!(limiter.admit(b, 1).is_ok());
+    }
+
+    #[test]
+    fn ipv6_addresses_in_one_slash64_share_a_budget() {
+        let limiter = IpRateLimiter::new(1);
+        limiter.admit(ip("2001:db8:1:2::1"), 1).unwrap();
+        assert!(matches!(
+            limiter.admit(ip("2001:db8:1:2:dead:beef:0:7"), 1),
+            Err(SvcError::RateLimited)
+        ));
+        assert!(limiter.admit(ip("2001:db8:1:3::1"), 1).is_ok());
+        // An IPv4-mapped peer is the IPv4 client, not a /64 bucket.
+        limiter.admit(ip("::ffff:203.0.113.10"), 1).unwrap();
+        assert!(matches!(
+            limiter.admit(ip("203.0.113.10"), 1),
+            Err(SvcError::RateLimited)
+        ));
     }
 
     #[test]
