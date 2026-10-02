@@ -75,9 +75,10 @@ ENV BIND_ADDR=0.0.0.0:8081 \
 # Expose port
 EXPOSE 8081
 
-# Health check
+# Health check. Follows BIND_ADDR's port, so a deployment overriding it
+# (e.g. 0.0.0.0:8080) does not leave the container permanently unhealthy.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8081/health || exit 1
+    CMD curl -f "http://127.0.0.1:${BIND_ADDR##*:}/health" || exit 1
 
 # Run the binary
 CMD ["/usr/local/bin/rust-imgproxy"]
