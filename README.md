@@ -352,6 +352,29 @@ being range-probed per request.
 - **Cache headers**: Hash-verified derivatives are immutable; `/insecure` and not-yet-verified video responses are short-lived and carry no `ETag`
 - **Hit/Miss indicator**: `X-Cache: hit`, `miss`, or `coalesced`
 
+## Known Issues
+
+### Anonymous callers can make FFmpeg decode media they choose (accepted risk)
+
+`/insecure/...` (any video URL) and `/v1/preset/...?xs=<server>` (any server
+for a video-extension hash, range-probed without hash verification) let an
+unauthenticated caller hand FFmpeg bytes it controls. A memory-safety bug in
+an FFmpeg demuxer/decoder is therefore the most realistic path to code
+execution in this service.
+
+Both stay open on purpose for now: `/insecure` is still needed for videos
+not hosted on Blossom, and video volume is low enough that content coverage
+wins over closing the route. Mitigations in place: explicit input demuxer,
+protocol whitelist, loopback-only network access for FFmpeg, `RLIMIT_AS` /
+`RLIMIT_CPU` / `RLIMIT_FSIZE`, one thread per process, a global FFmpeg
+semaphore, per-client video rate limit, and a non-root container (harden it
+further at deploy time: read-only root FS, `cap_drop: ALL`,
+`no-new-privileges`).
+
+Close it when video volume or risk grows: drop `xs=` for video extensions on
+the preset route, then turn `ALLOW_UNSIGNED_URLS` off once every caller signs
+its URLs.
+
 ## Dependencies
 
 - **axum** - Web framework
