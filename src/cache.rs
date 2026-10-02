@@ -481,6 +481,7 @@ mod tests {
             rate_ip_requests_per_min: 600,
             rate_ip_image_generations_per_min: 30,
             rate_ip_video_generations_per_min: 5,
+            trusted_proxies: Vec::new(),
         }
     }
 

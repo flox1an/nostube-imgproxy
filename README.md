@@ -241,6 +241,7 @@ Configure via environment variables:
 | `RATE_IP_REQUESTS_PER_MIN` | `600` | Per-IP budget across every image/thumb request, cache hit or miss |
 | `RATE_IP_IMAGE_GENERATIONS_PER_MIN` | `30` | Per-IP budget for cache-miss image decode/resize/encode work |
 | `RATE_IP_VIDEO_GENERATIONS_PER_MIN` | `5` | Per-IP budget for cache-miss FFmpeg video-thumbnail work |
+| `TRUSTED_PROXY_CIDRS` | unset | Comma-separated CIDRs/IPs of reverse proxies (e.g. Traefik's Docker network). Only when the TCP peer is inside this list is `X-Forwarded-For` read: the rate-limit identity becomes the rightmost hop that is not itself a trusted proxy. Unset: the TCP peer is the client. Invalid entries abort startup |
 | `RUST_LOG` | `info` | Log level |
 
 Boolean switches (`ALLOW_UNSIGNED_URLS`, `REQUIRE_SIGNED_URL_EXPIRY`, `PRESET_THUMBNAILS_ENABLED`) accept `true/false`, `1/0`, `yes/no` or `on/off` (case-insensitive); any other value aborts startup.

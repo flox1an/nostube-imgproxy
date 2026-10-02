@@ -2327,6 +2327,7 @@ dependencies = [
  "http",
  "hyper",
  "image",
+ "ipnet",
  "lazy_static",
  "libc",
  "lofty",

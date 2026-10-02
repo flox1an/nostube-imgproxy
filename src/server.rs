@@ -1,7 +1,9 @@
 use axum::{
     body::Body,
     error_handling::HandleErrorLayer,
-    extract::{ConnectInfo, MatchedPath, OriginalUri, Path as AxPath, Request, State},
+    extract::{
+        ConnectInfo, FromRequestParts, MatchedPath, OriginalUri, Path as AxPath, Request, State,
+    },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -232,7 +234,7 @@ struct PresetQuery {
 /// rate limiter every other image/thumb route uses.
 async fn handle_preset_thumb(
     State(state): State<CombinedState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     AxPath((preset, filename)): AxPath<(String, String)>,
     Query(params): Query<PresetQuery>,
     request_headers: HeaderMap,
@@ -249,10 +251,33 @@ async fn handle_preset_thumb(
         hints,
         request_headers,
         None,
-        peer.ip(),
+        client_ip,
     )
     .await
 }
+
+/// Rate-limit identity of the caller: the TCP peer, or behind a trusted
+/// reverse proxy the client it forwarded for (see [`crate::ratelimit::client_ip`]).
+struct ClientIp(IpAddr);
+
+impl FromRequestParts<CombinedState> for ClientIp {
+    type Rejection =
+        <ConnectInfo<std::net::SocketAddr> as FromRequestParts<CombinedState>>::Rejection;
+
+    async fn from_request_parts(
+        parts: &mut http::request::Parts,
+        state: &CombinedState,
+    ) -> Result<Self, Self::Rejection> {
+        let ConnectInfo(peer) =
+            ConnectInfo::<std::net::SocketAddr>::from_request_parts(parts, state).await?;
+        Ok(Self(crate::ratelimit::client_ip(
+            peer.ip(),
+            &parts.headers,
+            &state.app.cfg.trusted_proxies,
+        )))
+    }
+}
+
 /// Simple health check endpoint
 async fn health_check() -> &'static str {
     "OK"
@@ -745,23 +770,23 @@ fn blossom_blob_url(server: &str, hash: &str, ext: Option<&str>) -> String {
 /// `ALLOW_UNSIGNED_URLS=true` during the signed-URL migration.
 async fn handle_insecure(
     State(state): State<CombinedState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     AxPath(rest): AxPath<String>,
     request_headers: HeaderMap,
 ) -> Result<Response, SvcError> {
-    handle_image_request(state, rest, request_headers, None, peer.ip()).await
+    handle_image_request(state, rest, request_headers, None, client_ip).await
 }
 
 /// Versioned signed direct-media route.
 async fn handle_signed_image(
     State(state): State<CombinedState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     OriginalUri(uri): OriginalUri,
     AxPath((key_id, signature, rest)): AxPath<(String, String, String)>,
     request_headers: HeaderMap,
 ) -> Result<Response, SvcError> {
     let expiry = verify_signed_request(&state, &uri, &key_id, &signature, "/img/")?;
-    handle_image_request(state, rest, request_headers, expiry, peer.ip()).await
+    handle_image_request(state, rest, request_headers, expiry, client_ip).await
 }
 
 async fn handle_image_request(
@@ -859,7 +884,7 @@ async fn handle_image_request(
 /// `ALLOW_UNSIGNED_URLS=true` during the signed-URL migration.
 async fn handle_thumb(
     State(state): State<CombinedState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     AxPath(filename): AxPath<String>,
     Query(params): Query<ThumbQuery>,
     request_headers: HeaderMap,
@@ -876,7 +901,7 @@ async fn handle_thumb(
         hints,
         request_headers,
         None,
-        peer.ip(),
+        client_ip,
     )
     .await
 }
@@ -884,7 +909,7 @@ async fn handle_thumb(
 /// Versioned signed Blossom thumbnail route.
 async fn handle_signed_thumb(
     State(state): State<CombinedState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     OriginalUri(uri): OriginalUri,
     AxPath((key_id, signature, filename)): AxPath<(String, String, String)>,
     Query(params): Query<ThumbQuery>,
@@ -903,7 +928,7 @@ async fn handle_signed_thumb(
         hints,
         request_headers,
         expiry,
-        peer.ip(),
+        client_ip,
     )
     .await
 }

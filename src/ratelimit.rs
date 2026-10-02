@@ -4,6 +4,8 @@
 //! this state to shared TTL-capable infrastructure before relying on
 //! cluster-wide budgets, exactly like the cache and singleflight state.
 
+use http::{header::HeaderName, HeaderMap};
+use ipnet::IpNet;
 use parking_lot::Mutex;
 use std::{
     collections::HashMap,
@@ -12,6 +14,41 @@ use std::{
 };
 
 use crate::error::SvcError;
+
+static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+
+/// The address a request is charged to.
+///
+/// Behind a trusted reverse proxy the TCP peer is the proxy, so walk
+/// `X-Forwarded-For` from the right (each proxy appends the address it
+/// received from) and take the first hop that is not itself a trusted proxy.
+/// Entries left of it are client-supplied and ignored. A peer outside
+/// `trusted` gets no header trust at all, so the header cannot be spoofed
+/// by talking to the service directly.
+pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr {
+    let is_trusted = |ip: &IpAddr| trusted.iter().any(|net| net.contains(ip));
+    let peer = peer.to_canonical();
+    if !is_trusted(&peer) {
+        return peer;
+    }
+    let hops = headers
+        .get_all(&X_FORWARDED_FOR)
+        .iter()
+        .rev()
+        .flat_map(|value| value.to_str().unwrap_or_default().rsplit(','));
+    let mut client = peer;
+    for hop in hops {
+        // Garbage ends the trusted chain: nothing left of it can be believed.
+        let Ok(ip) = hop.trim().parse::<IpAddr>() else {
+            break;
+        };
+        client = ip.to_canonical();
+        if !is_trusted(&client) {
+            break;
+        }
+    }
+    client
+}
 
 /// Cap on distinct IPs tracked at once. Bounds memory under a many-source-IP
 /// attack; once full, unseen IPs are rejected rather than evicting a tracked
@@ -117,6 +154,57 @@ impl MediaRateLimiters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xff(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(&X_FORWARDED_FOR, value.parse().unwrap());
+        }
+        headers
+    }
+
+    fn ip(raw: &str) -> IpAddr {
+        raw.parse().unwrap()
+    }
+
+    #[test]
+    fn client_ip_ignores_the_header_from_an_untrusted_peer() {
+        let trusted = ["10.0.1.0/24".parse().unwrap()];
+        let headers = xff(&["198.51.100.7"]);
+        assert_eq!(
+            client_ip(ip("203.0.113.9"), &headers, &trusted),
+            ip("203.0.113.9")
+        );
+        assert_eq!(client_ip(ip("10.0.1.5"), &headers, &[]), ip("10.0.1.5"));
+    }
+
+    #[test]
+    fn client_ip_takes_the_rightmost_untrusted_hop_behind_a_trusted_proxy() {
+        let trusted = ["10.0.1.0/24".parse().unwrap()];
+        // The client spoofed "1.2.3.4"; the proxy appended the real address.
+        let headers = xff(&["1.2.3.4, 198.51.100.7"]);
+        assert_eq!(
+            client_ip(ip("10.0.1.5"), &headers, &trusted),
+            ip("198.51.100.7")
+        );
+        // Chained proxies: skip every trusted hop, across header lines too.
+        let headers = xff(&["1.2.3.4, 198.51.100.7", "10.0.1.9"]);
+        assert_eq!(
+            client_ip(ip("::ffff:10.0.1.5"), &headers, &trusted),
+            ip("198.51.100.7")
+        );
+    }
+
+    #[test]
+    fn client_ip_stops_at_garbage_and_falls_back_to_the_peer_without_a_header() {
+        let trusted = ["10.0.1.0/24".parse().unwrap()];
+        let headers = xff(&["198.51.100.7, not-an-ip"]);
+        assert_eq!(client_ip(ip("10.0.1.5"), &headers, &trusted), ip("10.0.1.5"));
+        assert_eq!(
+            client_ip(ip("10.0.1.5"), &HeaderMap::new(), &trusted),
+            ip("10.0.1.5")
+        );
+    }
 
     #[test]
     fn admits_up_to_the_configured_budget_then_rejects() {

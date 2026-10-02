@@ -114,6 +114,25 @@ pub struct AppCfg {
     /// Per-IP budget for cache-miss video-thumbnail FFmpeg work — the most
     /// expensive path per request, budgeted far below image generation.
     pub rate_ip_video_generations_per_min: u32,
+    /// Reverse proxies whose `X-Forwarded-For` is believed when they are the
+    /// TCP peer (`TRUSTED_PROXY_CIDRS`). Empty: every client is its peer IP.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+}
+
+/// `TRUSTED_PROXY_CIDRS`: comma-separated CIDRs or bare IPs. A typo would
+/// either collapse all clients onto the proxy's budget or trust a spoofable
+/// header, so an invalid entry aborts startup.
+fn parse_trusted_proxies(raw: &str) -> Vec<ipnet::IpNet> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .parse::<ipnet::IpNet>()
+                .or_else(|_| entry.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                .unwrap_or_else(|_| panic!("TRUSTED_PROXY_CIDRS: invalid entry {entry:?}"))
+        })
+        .collect()
 }
 
 /// Read a `usize`/`u32`/`u64` style setting, falling back on absent or
@@ -239,6 +258,9 @@ impl AppCfg {
                 5u32,
             )
             .max(1),
+            trusted_proxies: parse_trusted_proxies(
+                &std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
+            ),
         }
     }
 
@@ -336,6 +358,7 @@ mod tests {
         "RATE_IP_REQUESTS_PER_MIN",
         "RATE_IP_IMAGE_GENERATIONS_PER_MIN",
         "RATE_IP_VIDEO_GENERATIONS_PER_MIN",
+        "TRUSTED_PROXY_CIDRS",
     ];
 
     fn clear_managed_vars() {
@@ -528,6 +551,25 @@ mod tests {
     #[test]
     fn from_env_refuses_to_start_on_an_unrecognised_flag_value() {
         with_env(&[("ALLOW_UNSIGNED_URLS", "disabled")], || {
+            assert!(std::panic::catch_unwind(AppCfg::from_env).is_err());
+        });
+    }
+
+    #[test]
+    fn from_env_parses_trusted_proxies_and_refuses_invalid_entries() {
+        let cfg = with_env(
+            &[("TRUSTED_PROXY_CIDRS", " 10.0.1.0/24 , 172.18.0.5,fd00::/8 ")],
+            AppCfg::from_env,
+        );
+        let expected: Vec<ipnet::IpNet> = vec![
+            "10.0.1.0/24".parse().unwrap(),
+            "172.18.0.5/32".parse().unwrap(),
+            "fd00::/8".parse().unwrap(),
+        ];
+        assert_eq!(cfg.trusted_proxies, expected);
+        assert!(with_env(&[], AppCfg::from_env).trusted_proxies.is_empty());
+
+        with_env(&[("TRUSTED_PROXY_CIDRS", "10.0.1.0/33")], || {
             assert!(std::panic::catch_unwind(AppCfg::from_env).is_err());
         });
     }
