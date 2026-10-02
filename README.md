@@ -70,6 +70,10 @@ cargo build --release
 
 ### Docker
 
+Production deployments: container limits, hardening, reverse-proxy setup and
+resource sizing are in [`docs/operations.md`](docs/operations.md); the
+`docker-compose.yml` here is the hardened reference.
+
 ```bash
 # Build image
 docker build -t rust-imgproxy .
@@ -209,7 +213,8 @@ No other directive may be supplied on this route: `f`, `rs`, `q`, `width`, and `
 
 ## Configuration
 
-Configure via environment variables:
+Configure via environment variables (production recommendations:
+[`docs/operations.md`](docs/operations.md)):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
