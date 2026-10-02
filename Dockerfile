@@ -41,10 +41,12 @@ ENV SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always
 RUN touch src/main.rs && cargo build --release --locked
 
 # Stage 2: Runtime
-FROM debian:trixie-slim
+FROM debian:trixie-slim AS runtime
 
-# Install runtime dependencies (FFmpeg for video thumbnails, curl for health checks)
-RUN apt-get update && apt-get install -y \
+# Install runtime dependencies (FFmpeg for video thumbnails, curl for health checks).
+# `upgrade` pulls trixie-security fixes the base image does not ship yet
+# (e.g. OpenSSL CVE-2026-84782); CI rebuilds this stage uncached for the same reason.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     ca-certificates \
     ffmpeg \
     curl \
