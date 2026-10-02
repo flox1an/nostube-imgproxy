@@ -102,13 +102,19 @@ A Coolify **Docker-image Application** only applies these custom Docker options:
 ([docs](https://coolify.io/docs/applications/builds/custom-docker-options)).
 So:
 
-- `--cap-drop=ALL --security-opt=no-new-privileges:true` go into *Custom Docker Options*.
-- Memory/CPU go into *Resource Limits*.
-- `read_only`, `tmpfs` and `pids_limit` are **not** possible there; they need a
-  Docker Compose resource (use `docker-compose.yml` from this repo as the base).
-- Coolify deploys Docker-image apps with `docker compose up --force-recreate`
-  without pulling: keep `pull_policy: always` in the stored definition or the
-  old image keeps running.
+- `--cap-drop=ALL` goes into *Custom Docker Options*. Coolify (verified on
+  v4.3.23) turns these options into Compose keys with a regex that cuts every
+  value at its first hyphen: `--security-opt=no-new-privileges:true` becomes
+  `security_opt: "no"` and the deploy fails with `invalid security-opt: "no"`.
+- Memory/CPU go into *Resource Limits*. If the host has swap, set the swap
+  limit equal to the memory limit; `0` lets Docker add the same amount again
+  as swap.
+- `no-new-privileges`, `read_only`, `tmpfs` and `pids_limit` are **not**
+  possible there; they need a Docker Compose resource (use
+  `docker-compose.yml` from this repo as the base).
+- Coolify pulls the image on every deploy of a Docker-image app (deploy log:
+  "Pulling latest images from the registry"). Still compare the running
+  container's image ID with the pulled tag after a deploy.
 
 ## Reverse proxy
 
