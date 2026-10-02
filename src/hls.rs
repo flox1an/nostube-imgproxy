@@ -323,7 +323,7 @@ impl Drop for HlsMediaProxy {
 /// Debit `len` bytes from the shared probe budget; false once exhausted.
 fn spend_budget(remaining_bytes: &AtomicU64, len: u64) -> bool {
     remaining_bytes
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
             left.checked_sub(len)
         })
         .is_ok()
