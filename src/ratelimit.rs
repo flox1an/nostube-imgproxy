@@ -212,7 +212,10 @@ mod tests {
     fn client_ip_stops_at_garbage_and_falls_back_to_the_peer_without_a_header() {
         let trusted = ["10.0.1.0/24".parse().unwrap()];
         let headers = xff(&["198.51.100.7, not-an-ip"]);
-        assert_eq!(client_ip(ip("10.0.1.5"), &headers, &trusted), ip("10.0.1.5"));
+        assert_eq!(
+            client_ip(ip("10.0.1.5"), &headers, &trusted),
+            ip("10.0.1.5")
+        );
         assert_eq!(
             client_ip(ip("10.0.1.5"), &HeaderMap::new(), &trusted),
             ip("10.0.1.5")
