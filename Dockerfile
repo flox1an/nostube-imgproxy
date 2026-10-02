@@ -55,6 +55,12 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
 # Create non-root user
 RUN useradd -m -u 1000 imgproxy
 
+# No setuid/setgid binaries (su, mount, passwd, unix_chkpwd, ... in the Debian
+# base). Even with every capability dropped they would hand a compromised
+# process euid 0 over root-owned files. Stands in for no-new-privileges where
+# the platform cannot set it (Coolify Docker-image apps).
+RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +
+
 # Create cache directory
 RUN mkdir -p /cache/original /cache/processed && \
     chown -R imgproxy:imgproxy /cache

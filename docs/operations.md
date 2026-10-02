@@ -71,7 +71,7 @@ All of these work with the stock image; none needs a code change.
 |---|---|---|
 | Run as non-root | image default (`USER imgproxy`) | already in the Dockerfile |
 | Drop capabilities | `cap_drop: [ALL]` | the process needs none (port > 1024, no raw sockets) |
-| No privilege escalation | `security_opt: [no-new-privileges:true]` | blocks setuid binaries in the Debian base |
+| No privilege escalation | `security_opt: [no-new-privileges:true]` | blocks setuid binaries; the image also ships without setuid/setgid bits, which covers platforms that cannot set this flag |
 | Read-only root FS | `read_only: true` | the service writes only `CACHE_DIR` and the temp dir |
 | Temp dir | `tmpfs: /tmp:size=128m,mode=1777` | required with `read_only`; see Disk |
 | Cache volume | writable mount at `CACHE_DIR` | the only persistent state; safe to delete (cold cache) |
@@ -111,7 +111,13 @@ So:
   as swap.
 - `no-new-privileges`, `read_only`, `tmpfs` and `pids_limit` are **not**
   possible there; they need a Docker Compose resource (use
-  `docker-compose.yml` from this repo as the base).
+  `docker-compose.yml` from this repo as the base). The setuid part of
+  `no-new-privileges` is covered anyway: the image strips all setuid/setgid
+  bits.
+- Turn on Coolify's health check (path `/health`, port `8081`). Only then does
+  the rolling update wait for the new container to become healthy before it
+  stops the old one; without it Traefik answers `503` for a few seconds per
+  deploy. Compose resources get no rolling update at all.
 - Coolify pulls the image on every deploy of a Docker-image app (deploy log:
   "Pulling latest images from the registry"). Still compare the running
   container's image ID with the pulled tag after a deploy.
