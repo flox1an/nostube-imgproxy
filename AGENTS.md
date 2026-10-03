@@ -25,3 +25,17 @@
 - Follow the existing Conventional Commits style (`feat:`, `fix:`, `chore:`) visible in `git log`.
 - PRs must describe behavior changes, reference issue IDs when available, and include manual/automated test evidence (command output snippets or screenshots for HTTP probes).
 - Add configuration notes (env vars, cache paths, FFmpeg limits) to the PR body whenever they change runtime expectations.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues for `flox1an/nostube-imgproxy`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, each label string equal to its role name. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository. See `docs/agents/domain.md`.

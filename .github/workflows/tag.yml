@@ -1,0 +1,28 @@
+# After a merge to main, tag v<version from Cargo.toml> unless that tag exists.
+# Version bumps happen inside PRs (e.g. the audit automation); tagging stays deterministic.
+# Tags pushed with GITHUB_TOKEN do not trigger other workflows, so no semver image tags
+# are published from them; deployments use :main.
+name: Tag release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag version
+        run: |
+          v="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if git ls-remote --exit-code --tags origin "refs/tags/$v" >/dev/null; then
+            echo "$v already tagged"
+            exit 0
+          fi
+          git tag "$v"
+          git push origin "refs/tags/$v"
