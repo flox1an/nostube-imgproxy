@@ -3,8 +3,8 @@
 Everything a deployment needs to know about this service's runtime footprint,
 written so an operator (or an agent) can size limits and harden a deployment
 without reading the code. The executable reference is
-[`docker-compose.yml`](../docker-compose.yml); the full environment variable
-table is in the [README](../README.md#configuration).
+[`docker-compose.yml`](https://github.com/flox1an/nostube-imgproxy/blob/main/docker-compose.yml); the full environment variable
+table is in the [Configuration](./configuration.md) section.
 
 ## What the process does at runtime
 
@@ -15,7 +15,7 @@ table is in the [README](../README.md#configuration).
 | Outbound | HTTP/HTTPS to arbitrary **public** hosts and ports (Blossom servers, `/insecure` source URLs, NIP-94 locations); WSS to the Nostr seed relays in `src/blossom.rs` (`SEED_RELAYS`) for kind 10063/1063 lookups; DNS |
 | Never contacted | Private, loopback, link-local, CGNAT, documentation and reserved ranges, IPv4-mapped/NAT64/6to4 forms of them (`src/network_policy.rs`). Enforced per redirect hop and at DNS resolution; env/system proxies are ignored |
 | Writes | `CACHE_DIR` (cache entries and their temp files) and the temp dir (`$TMPDIR`, default `/tmp`) for FFmpeg's extracted frames |
-| Child processes | `ffmpeg` only, at most `MAX_FFMPEG_CONCURRENT` at once, never through a shell, each with `-threads 1` and `RLIMIT_AS` 1 GiB (Linux), `RLIMIT_CPU` ≈ `FFMPEG_TIMEOUT_SECS`, `RLIMIT_FSIZE` 32 MiB; killed on timeout or client disconnect |
+| Child processes | `ffmpeg` only, at most `MAX_FFMPEG_CONCURRENT` at once, never through a shell, each with `-threads 1` and `RLIMIT_AS` 1 GiB (Linux), `RLIMIT_CPU` ≈ `FFMPEG_TIMEOUT_SECS`, `RLIMIT_FSIZE` 32 MiB; killed on timeout or when its extraction task is dropped |
 | Video input | Range requests only, through a loopback gateway; at most `MAX_VIDEO_PROBE_BYTES` per thumbnail. Videos are never downloaded in full, whatever their size |
 
 ## Resource sizing
@@ -147,27 +147,85 @@ the "client".
 | `CACHE_DIR` | the mounted volume |
 | `TRUSTED_PROXY_CIDRS` | proxy network CIDR (see above) |
 | `RATE_IP_REQUESTS_PER_MIN` / `_IMAGE_GENERATIONS_` / `_VIDEO_GENERATIONS_` | defaults `600/30/5` are per real client once `TRUSTED_PROXY_CIDRS` is set |
-| `ALLOW_UNSIGNED_URLS` | `true` while clients use `/insecure` or `/thumb`; see Known Issues in the README |
+| `ALLOW_UNSIGNED_URLS` | Keep `true` while clients use legacy `/insecure` or `/thumb`; disable after migrating those callers to signed URLs. Public fixed presets are independent. |
 | `METRICS_BEARER_TOKEN` or `METRICS_BIND_ADDR` | one of them for Prometheus; the token is a secret |
 | `MAX_FFMPEG_CONCURRENT`, `MAX_CPU_CONCURRENT`, `MAX_CPU_QUEUE` | size against the memory limit (see Memory) |
 | `RUST_LOG` | `info` |
 
-Boolean flags accept `true/false`, `1/0`, `yes/no`, `on/off`; anything else,
-and any invalid `TRUSTED_PROXY_CIDRS` / `URL_SIGNING_KEYS` entry, aborts startup
-on purpose — check the container log if it restart-loops after a config change.
+Boolean flags accept `true/false`, `1/0`, `yes/no`, `on/off`
+(case-insensitive); empty uses the default. Other values and invalid
+`TRUSTED_PROXY_CIDRS` / `URL_SIGNING_KEYS` entries abort startup on purpose —
+check the container log if it restart-loops after a config change.
 
 **Removed variables** (ignored if still set; delete them from deployments):
 `MAX_VERIFY_VIDEO_BYTES`, `VIDEO_VERIFY_AFTER_MISSES`,
 `MAX_CONCURRENT_VIDEO_VERIFICATIONS`. Videos are no longer downloaded in full
-for hash verification; see "Video Thumbnails" in the README.
+for hash verification; see [video thumbnails](./guide/how-it-works.md#video-thumbnails).
 
 ## Supply chain
 
 - Images are built from the committed `Cargo.lock` with `--locked`; CI runs
   tests and `cargo audit` before `docker-build` may publish.
 - The `:main` tag moves on every push and on a daily scheduled rebuild (fresh
-  Debian/FFmpeg security updates). Pin `sha-<commit>` tags if deployments must
+  Debian/FFmpeg security updates). Pin an image digest if deployments must
   be reproducible; then schedule redeploys to pick up base-image fixes.
-- FFmpeg comes from Debian trixie in the runtime stage. Decoder bugs in FFmpeg
-  are the main residual risk of this service (README → Known Issues), so keep
-  the image fresh and the hardening above in place.
+- FFmpeg comes from Debian trixie in the runtime stage. Native decoder bugs
+  are a residual risk when processing anonymous users' media; keep the image
+  fresh and apply the hardening above.
+
+## Accepted decoder risk
+
+Legacy direct-video URLs and public preset server hints allow anonymous
+callers to supply media they control. The native FFmpeg demuxer/decoder is
+therefore exposed to untrusted bytes. Its explicit demuxer, protocol
+whitelist, loopback-only network access, process limits, single-threaded
+decode, global semaphore and client video budget are mitigations, not a
+sandbox guarantee.
+
+The current API keeps this coverage intentionally. If deployment policy
+requires closing it, disabling legacy unsigned routes alone does **not**
+close public video presets; restrict/disable those too. Consider dropping
+video `xs` hints only as an explicit API/product change, not as an operator
+setting that exists today.
+
+## Monitoring and troubleshooting
+
+The main `/health` endpoint returns `OK` when the HTTP service is responding.
+It does not prove FFmpeg is installed or that a particular upstream works.
+Probe a known image and video after deployment as well.
+
+Choose a private metrics listener or a bearer-protected public endpoint:
+
+```bash
+# With METRICS_BIND_ADDR=127.0.0.1:9101 (inside the same network namespace)
+curl -fsS http://127.0.0.1:9101/metrics
+
+# With METRICS_BEARER_TOKEN configured on the public listener
+curl -fsS -H "Authorization: Bearer $METRICS_BEARER_TOKEN" \
+  http://127.0.0.1:8080/metrics
+```
+
+The separate listener is token-free: bind it only on a management interface
+and do not publish it to the internet. Container loopback is not host
+loopback. To scrape from another container, use an isolated network/listener
+address or the token-protected main route.
+
+Import the repository's
+[`grafana-dashboard.json`](https://github.com/flox1an/nostube-imgproxy/blob/main/grafana-dashboard.json)
+into Grafana and point Prometheus at the endpoint you enabled.
+
+| Symptom | Check |
+|---|---|
+| Container unhealthy | The port in `BIND_ADDR`; image default is 8081, Compose sets 8080. Confirm the listener and healthcheck agree. |
+| Everyone receives `429` | `TRUSTED_PROXY_CIDRS`; otherwise users behind the same proxy share a client identity. |
+| `503` during bursts | CPU queue, FFmpeg permits, global in-flight cap and memory limit. Reduce admitted work or size deliberately; do not remove bounds. |
+| `408` or `502` for video | Source range support, FFmpeg logs, request/video/process deadlines and probe byte budget. A large source is not automatically downloadable in full. |
+| `500` on first generation | Cache volume permissions (UID 1000 in the image), free space, writable `/tmp` and FFmpeg availability. |
+| `400` for an image | Source decoder allowlist (JPEG/PNG/WebP/GIF), output dimensions, audio cover art or attempted preset overrides. AVIF is output-only. |
+| Unexpected old output | Client/CDN cache policy is separate from disk TTL. Direct URL sources can change; Blossom image sources must match their hash. |
+| Public `/metrics` is `404` | Configure a nonempty `METRICS_BEARER_TOKEN`, or scrape the separate metrics listener instead. |
+
+Use the [HTTP API](./reference/api.md#errors) for status semantics and
+[Configuration](./configuration.md) for all budgets. Cache files can be
+discarded with the service stopped; the next request regenerates them.
+Never remove a shared cache volume without checking what else uses it.
