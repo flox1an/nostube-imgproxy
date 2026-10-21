@@ -75,7 +75,7 @@ file-size rlimit, and kill-on-drop behavior when its extraction task is cancelle
 
 | Variable | Default | Description |
 |---|---|---|
-| `BLOSSOM_FALLBACK_SERVERS` | `https://cdn.satellite.earth,https://image.nostr.build,https://nostr.download,https://cdn.hzrd149.com` | Comma-separated fallback servers, tried after `xs=` hints and author servers. |
+| `BLOSSOM_FALLBACK_SERVERS` | Four servers, listed below | Comma-separated fallback servers, tried after `xs=` hints and author servers. |
 | `MAX_BLOB_CANDIDATES` | `8` | Maximum Blossom candidates (servers + NIP-94 discovered URLs) tried per request. Bounds third-party fan-out. |
 | `MAX_SERVER_HINTS` | `4` | Maximum `xs=` hints honoured per request. Surplus hints are dropped, not rejected. |
 | `BLOSSOM_SERVER_LIST_CACHE_TTL_HOURS` | `24` | How long a fetched kind-10063 author server list stays valid. |
@@ -85,6 +85,13 @@ file-size rlimit, and kill-on-drop behavior when its extraction task is cancelle
 | `BLOSSOM_NEGATIVE_CACHE_NOT_FOUND_TTL_SECS` | `900` (15 min) | Memory-cache TTL for candidates that answered 404/410. `0` disables the class. |
 | `BLOSSOM_NEGATIVE_CACHE_PERMANENT_TTL_SECS` | `3600` | Memory-cache TTL for 3xx and non-transient 4xx candidates. `0` disables the class. |
 | `BLOSSOM_NEGATIVE_CACHE_TRANSIENT_TTL_SECS` | `60` | Memory-cache TTL for timeouts, transport failures, 429 and 5xx candidates. `0` disables the class. |
+
+Default fallback servers, in order:
+
+- `https://cdn.satellite.earth`
+- `https://image.nostr.build`
+- `https://nostr.download`
+- `https://cdn.hzrd149.com`
 
 Negative-cache entries live in memory only (per candidate URL, up to 10,000
 entries). A repeated request skips an unexpired failed candidate but still
