@@ -172,6 +172,11 @@ for hash verification; see [video thumbnails](./guide/how-it-works.md#video-thum
 - FFmpeg comes from Debian trixie in the runtime stage. Native decoder bugs
   are a residual risk when processing anonymous users' media; keep the image
   fresh and apply the hardening above.
+- Brotli 1.2.1 is built from the checksum-pinned upstream archive in the
+  Dockerfile and installed in the dynamic loader's multiarch path, replacing
+  the vulnerable transitive Debian decoder during the image build. FFmpeg's
+  `libjxl` therefore resolves the CVE-2026-111497-fixed decoder. Rebuild
+  rather than replacing a library inside a running container.
 
 ## Accepted decoder risk
 

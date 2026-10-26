@@ -5,8 +5,11 @@
 # Base matches the trixie runtime stage so glibc lines up.
 FROM rust:1-slim-trixie AS builder
 
-# Install build dependencies for AVIF support (meson, ninja) and general tools
+# Install build dependencies for AVIF support, Brotli, and general tools
 RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    curl \
     pkg-config \
     libssl-dev \
     meson \
@@ -31,6 +34,35 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 # Build dependencies only (this layer will be cached)
 RUN cargo build --release --locked && rm -rf src
 
+# Debian trixie's FFmpeg dependency graph currently supplies Brotli 1.1.0,
+# which is affected by CVE-2026-111497. Build Google Brotli 1.2.1 from its
+# pinned release archive; the runtime stage gives these ABI-compatible
+# libraries precedence over the vulnerable distro copies.
+ARG BROTLI_VERSION=1.2.1
+ARG BROTLI_SHA256=98d35d11a78dc453aebb7d10c3748f3f73ff78c8267c0dc697b8631f67bf7e8f
+RUN curl --fail --location --silent --show-error \
+        --output /tmp/brotli.tar.gz \
+        "https://github.com/google/brotli/archive/refs/tags/v${BROTLI_VERSION}.tar.gz" && \
+    echo "${BROTLI_SHA256}  /tmp/brotli.tar.gz" | sha256sum --check --status && \
+    mkdir /tmp/brotli && \
+    tar --extract --gzip --file /tmp/brotli.tar.gz --strip-components=1 --directory /tmp/brotli && \
+    cmake -S /tmp/brotli -B /tmp/brotli-build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBROTLI_BUILD_TOOLS=OFF \
+        -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build /tmp/brotli-build --parallel && \
+    DESTDIR=/brotli-dist cmake --install /tmp/brotli-build && \
+    printf '%s\n' \
+        '#include <brotli/decode.h>' \
+        '#include <stdio.h>' \
+        'int main(void) { printf("%x %s\n", BrotliDecoderVersion(), BrotliDecoderErrorString(-17)); }' \
+        > /tmp/brotli-api-check.c && \
+    cc /tmp/brotli-api-check.c -I/tmp/brotli/c/include \
+        -L/brotli-dist/usr/local/lib -Wl,-rpath,/brotli-dist/usr/local/lib \
+        -lbrotlidec -o /tmp/brotli-api-check && \
+    test "$(/tmp/brotli-api-check)" = "1002001 _ERROR_FORMAT_BLOCK_SWITCH" && \
+    rm -rf /tmp/brotli /tmp/brotli-build /tmp/brotli.tar.gz /tmp/brotli-api-check /tmp/brotli-api-check.c
+
 # Now copy actual source code
 COPY src ./src
 
@@ -51,6 +83,14 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     ffmpeg \
     curl \
     && rm -rf /var/lib/apt/lists/*
+
+# FFmpeg pulls libjxl, which dynamically resolves libbrotlidec. Replace the
+# distro decoder files in the loader path with the ABI-compatible fixed build.
+COPY --from=builder /brotli-dist/usr/local/lib/ /usr/local/lib/
+RUN lib_dir="/lib/$(uname -m)-linux-gnu" && \
+    rm -f "${lib_dir}"/libbrotli*.so* && \
+    cp -a /usr/local/lib/libbrotli*.so* "${lib_dir}/" && \
+    ldconfig
 
 # Create non-root user
 RUN useradd -m -u 1000 imgproxy
