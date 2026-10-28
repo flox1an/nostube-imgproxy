@@ -75,13 +75,13 @@ RUN touch src/main.rs && cargo build --release --locked
 # Stage 2: Runtime
 FROM debian:trixie-slim AS runtime
 
-# Install runtime dependencies (FFmpeg for video thumbnails, curl for health checks).
+# Install runtime dependencies (FFmpeg for video thumbnails). No curl/wget: the
+# healthcheck is the binary itself, so a compromised process finds no HTTP client.
 # `upgrade` pulls trixie-security fixes the base image does not ship yet
 # (e.g. OpenSSL CVE-2026-84782); CI rebuilds this stage uncached for the same reason.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     ca-certificates \
     ffmpeg \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # FFmpeg pulls libjxl, which dynamically resolves libbrotlidec. Replace the
@@ -126,7 +126,7 @@ EXPOSE 8081
 # Health check. Follows BIND_ADDR's port, so a deployment overriding it
 # (e.g. 0.0.0.0:8080) does not leave the container permanently unhealthy.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f "http://127.0.0.1:${BIND_ADDR##*:}/health" || exit 1
+    CMD ["/usr/local/bin/rust-imgproxy", "--healthcheck"]
 
 # Run the binary
 CMD ["/usr/local/bin/rust-imgproxy"]

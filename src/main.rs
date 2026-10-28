@@ -1,10 +1,15 @@
-use std::{fs, sync::Arc, time::Duration};
+use std::{
+    fs,
+    io::{Read, Write},
+    sync::Arc,
+    time::Duration,
+};
 use tracing::info;
 
 use rust_imgproxy::{
     blossom::{BlossomState, CandidateFailureCache},
     cache::janitor_loop,
-    config::{AppCfg, AppState},
+    config::{AppCfg, AppState, DEFAULT_BIND_ADDR},
     init_crypto_provider,
     server::{create_metrics_router, create_router},
     thumbnail::ThumbnailState,
@@ -12,6 +17,11 @@ use rust_imgproxy::{
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--healthcheck") {
+        std::process::exit(if healthcheck() { 0 } else { 1 });
+    }
+    #[cfg(target_os = "linux")]
+    set_non_dumpable();
     init_crypto_provider();
     init_tracing();
 
@@ -137,4 +147,40 @@ async fn shutdown_signal() {
 fn init_tracing() {
     let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
+}
+
+/// FFmpeg children parse hostile media under this process's UID. Without this a
+/// compromised one could ptrace the server or read `/proc/<pid>/{mem,environ}`
+/// (signing keys, metrics token). Also suppresses core dumps of those secrets.
+/// Children are unaffected: `execve` resets the flag.
+#[cfg(target_os = "linux")]
+fn set_non_dumpable() {
+    // SAFETY: prctl with plain integer arguments touches no Rust memory.
+    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    assert_eq!(rc, 0, "prctl(PR_SET_DUMPABLE, 0) failed");
+}
+
+/// `rust-imgproxy --healthcheck`: GET /health on the local listener. Lets the
+/// runtime image ship without curl, an HTTP client an attacker could reuse.
+fn healthcheck() -> bool {
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());
+    let Some(port) = bind_addr
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    let timeout = Duration::from_secs(2);
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), timeout)
+    else {
+        return false;
+    };
+    let mut response = Vec::new();
+    stream.set_read_timeout(Some(timeout)).is_ok()
+        && stream
+            .write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .is_ok()
+        && stream.take(1024).read_to_end(&mut response).is_ok()
+        && String::from_utf8_lossy(&response).split_whitespace().nth(1) == Some("200")
 }

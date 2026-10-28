@@ -6,6 +6,9 @@ use crate::{
 use reqwest::Client;
 use std::{path::PathBuf, time::Duration};
 
+/// `BIND_ADDR` when unset; also read by the `--healthcheck` probe.
+pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+
 #[derive(Clone)]
 pub struct AppCfg {
     pub bind_addr: String,
@@ -186,7 +189,7 @@ impl AppCfg {
         }
 
         Self {
-            bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into()),
+            bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into()),
             cache_dir: PathBuf::from(std::env::var("CACHE_DIR").unwrap_or_else(|_| "cache".into())),
             cache_ttl: env_secs("CACHE_TTL_SECS", 86400),
             cache_ttl_immutable: env_secs("CACHE_TTL_IMMUTABLE_SECS", 30 * 24 * 3600),

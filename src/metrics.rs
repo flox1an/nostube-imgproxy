@@ -66,6 +66,14 @@ lazy_static! {
     )
     .unwrap();
 
+    /// FFmpeg processes killed by a signal: decoder crashes and rlimit hits.
+    pub static ref FFMPEG_CRASHES_TOTAL: CounterVec = register_counter_vec!(
+        "imgproxy_ffmpeg_crashes_total",
+        "FFmpeg processes terminated by a signal, by signal number",
+        &["signal"]
+    )
+    .unwrap();
+
     // Bytes transferred metrics
     pub static ref BYTES_DOWNLOADED_TOTAL: CounterVec = register_counter_vec!(
         "imgproxy_bytes_downloaded_total",
@@ -164,6 +172,13 @@ pub fn record_processing_error(error_type: &str) {
 pub fn record_ffmpeg_extraction(success: bool) {
     let status = if success { "success" } else { "failure" };
     FFMPEG_EXTRACTIONS_TOTAL.with_label_values(&[status]).inc();
+}
+
+/// Record an FFmpeg process terminated by `signal`
+pub fn record_ffmpeg_crash(signal: i32) {
+    FFMPEG_CRASHES_TOTAL
+        .with_label_values(&[&signal.to_string()])
+        .inc();
 }
 
 /// Record bytes downloaded

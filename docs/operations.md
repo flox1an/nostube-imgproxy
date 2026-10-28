@@ -15,7 +15,7 @@ table is in the [Configuration](./configuration.md) section.
 | Outbound | HTTP/HTTPS to arbitrary **public** hosts and ports (Blossom servers, `/insecure` source URLs, NIP-94 locations); WSS to the Nostr seed relays in `src/blossom.rs` (`SEED_RELAYS`) for kind 10063/1063 lookups; DNS |
 | Never contacted | Private, loopback, link-local, CGNAT, documentation and reserved ranges, IPv4-mapped/NAT64/6to4 forms of them (`src/network_policy.rs`). Enforced per redirect hop and at DNS resolution; env/system proxies are ignored |
 | Writes | `CACHE_DIR` (cache entries and their temp files) and the temp dir (`$TMPDIR`, default `/tmp`) for FFmpeg's extracted frames |
-| Child processes | `ffmpeg` only, at most `MAX_FFMPEG_CONCURRENT` at once, never through a shell, each with `-threads 1` and `RLIMIT_AS` 1 GiB (Linux), `RLIMIT_CPU` ≈ `FFMPEG_TIMEOUT_SECS`, `RLIMIT_FSIZE` 32 MiB; killed on timeout or when its extraction task is dropped |
+| Child processes | `ffmpeg` only, at most `MAX_FFMPEG_CONCURRENT` at once, never through a shell, each with `-threads 1`, an empty environment except `PATH` (no secrets), no `file` protocol, and `RLIMIT_AS` 1 GiB (Linux), `RLIMIT_CPU` ≈ `FFMPEG_TIMEOUT_SECS`, `RLIMIT_FSIZE` 32 MiB; killed on timeout or when its extraction task is dropped. The server marks itself non-dumpable (Linux), so a compromised FFmpeg under the same UID cannot ptrace it or read its `/proc/<pid>/environ` |
 | Video input | Range requests only, through a loopback gateway; at most `MAX_VIDEO_PROBE_BYTES` per thumbnail. Videos are never downloaded in full, whatever their size |
 
 ## Resource sizing
@@ -87,8 +87,9 @@ Verify on the host after deploying:
 ```bash
 docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} capdrop={{.HostConfig.CapDrop}} secopt={{.HostConfig.SecurityOpt}} pids={{.HostConfig.PidsLimit}} mem={{.HostConfig.Memory}} tmpfs={{.HostConfig.Tmpfs}}' <container>
 docker exec <container> sh -c 'touch /probe' # must fail: read-only file system
+docker exec <container> cat /proc/1/environ  # must fail: permission denied (non-dumpable)
+docker exec <container> rust-imgproxy --healthcheck && echo healthy
 curl -fsS https://<public-name>/health        # OK
-```
 
 Then request one image and one video thumbnail through the public name: both
 must return `200` (FFmpeg works without capabilities and with the read-only root).
@@ -114,10 +115,14 @@ So:
   `docker-compose.yml` from this repo as the base). The setuid part of
   `no-new-privileges` is covered anyway: the image strips all setuid/setgid
   bits.
-- Turn on Coolify's health check (path `/health`, port `8081`). Only then does
-  the rolling update wait for the new container to become healthy before it
-  stops the old one; without it Traefik answers `503` for a few seconds per
-  deploy. Compose resources get no rolling update at all.
+- Coolify's **HTTP** health check runs `curl`/`wget` inside the container,
+  and the image ships neither. For a Docker-image application choose check
+  type **CMD** with command `/usr/local/bin/rust-imgproxy --healthcheck`
+  ([docs](https://coolify.io/docs/applications/configuration/health-checks)).
+  Only with a health check does the rolling update wait for the new
+  container to become healthy before it stops the old one; without it
+  Traefik answers `503` for a few seconds per deploy. Compose resources get
+  no rolling update at all.
 - Coolify pulls the image on every deploy of a Docker-image app (deploy log:
   "Pulling latest images from the registry"). Still compare the running
   container's image ID with the pulled tag after a deploy.
@@ -218,6 +223,11 @@ address or the token-protected main route.
 Import the repository's
 [`grafana-dashboard.json`](https://github.com/flox1an/nostube-imgproxy/blob/main/grafana-dashboard.json)
 into Grafana and point Prometheus at the endpoint you enabled.
+
+`imgproxy_ffmpeg_crashes_total{signal}` counts FFmpeg processes killed by a
+signal (`11` SIGSEGV, `6` SIGABRT, `24` SIGXCPU, `25` SIGXFSZ, `9` usually
+the `RLIMIT_AS`/OOM path). Timeouts are not counted. Alert on any sustained
+rise: it is the earliest sign of decoder fuzzing or an exploit attempt.
 
 | Symptom | Check |
 |---|---|

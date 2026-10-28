@@ -511,13 +511,13 @@ async fn run_ffmpeg_extract(
             "error",
             // Explicit input demuxing below blocks playlist parsing from
             // introducing nested remote URLs under this otherwise narrow
-            // whitelist. For the loopback-proxy caller, `tcp` must be listed
+            // whitelist. For the loopback-proxy callers, `tcp` must be listed
             // explicitly: FFmpeg opens HTTP's transport through the `tcp`
             // protocol, and without it every range fetch fails with
             // "Protocol 'tcp' not on whitelist". `https`/`tls` stay excluded
-            // so the loopback proxy remains the only network path; the
-            // verified-local-file caller passes `file` only, so FFmpeg has no
-            // network access at all.
+            // so the loopback proxy remains the only network path, and `file`
+            // stays excluded so a hostile playlist or container cannot point
+            // FFmpeg at local files (`/proc/self/environ`, the cache).
             "-protocol_whitelist",
             protocol_whitelist,
             "-analyzeduration",
@@ -560,6 +560,11 @@ async fn run_ffmpeg_extract(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
+        // FFmpeg parses hostile media; it must not inherit the server's
+        // secrets (`URL_SIGNING_KEYS`, `METRICS_BEARER_TOKEN`). `PATH` is the
+        // only variable it needs, and only for resolving `ffmpeg` itself.
+        .env_clear()
+        .envs(std::env::var_os("PATH").map(|path| ("PATH", path)))
         .kill_on_drop(true);
     apply_ffmpeg_limits(&mut command, timeout)?;
 
@@ -584,6 +589,15 @@ async fn run_ffmpeg_extract(
     };
     let stderr = stderr_task.await.unwrap_or_else(|_| Vec::new());
     if !status.success() {
+        // A signal death (SIGSEGV, SIGABRT, rlimit SIGXCPU/SIGXFSZ) is never
+        // an ordinary bad input: our own timeout kill returns above, before
+        // `wait`. A rising rate is the early signal of fuzzing or an exploit
+        // attempt against the decoders.
+        #[cfg(unix)]
+        if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
+            metrics::record_ffmpeg_crash(signal);
+            warn!(signal, demuxer, "ffmpeg terminated by signal");
+        }
         metrics::record_ffmpeg_extraction(false);
         let stderr = String::from_utf8_lossy(&stderr);
         tracing::warn!(stderr = %log_value(&stderr), "ffmpeg thumbnail extraction failed");
@@ -670,7 +684,7 @@ async fn extract_thumbnail_with_ffmpeg(
         let proxy = LocalMediaProxy::start(source_url, http, deadline, max_probe_bytes).await?;
         run_ffmpeg_extract(
             &proxy.input_url,
-            "file,http,tcp",
+            "http,tcp",
             demuxer,
             max_image_bytes,
             timeout,

@@ -43,8 +43,8 @@ pub const HLS_DEMUXER: &str = "hls";
 
 /// AES-128 key fetches go through FFmpeg's `crypto` protocol; without it an
 /// encrypted playlist fails even though the key bytes flow through our
-/// gateway like any other target.
-pub const HLS_PROTOCOL_WHITELIST: &str = "file,http,tcp,crypto";
+/// gateway like any other target. No `file`: segments are loopback HTTP only.
+pub const HLS_PROTOCOL_WHITELIST: &str = "http,tcp,crypto";
 
 /// Playlist bodies above this are rejected outright: no real media playlist
 /// needs 4 MB, and the budget below is what bounds total work.
