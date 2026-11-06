@@ -134,9 +134,8 @@ image is already cached.
 - A semaphore bounds FFmpeg processes. Saturation returns `503` rather than
   building an unbounded video queue.
 - Per-client rate limits bound request admission and image/video generation.
-  Processed image hits return before these checks. Video requests may still
-  spend the general request budget before their origin-scoped cache lookup;
-  cache hits skip generation budgets. See [Configuration](../configuration.md).
+  Processed image and origin-matched video hits return before these checks.
+  See [Configuration](../configuration.md).
 - Rate-limit and single-flight state is local to one process; replicas do
   not share a global budget or in-flight work.
 

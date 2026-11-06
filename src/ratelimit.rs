@@ -121,12 +121,9 @@ fn bucket(ip: IpAddr) -> IpAddr {
 
 /// Three-tier per-IP budget for the image/thumbnail serving routes.
 ///
-/// A cache hit is cheap to serve, so `requests` is generous and covers every
-/// request regardless of outcome. Producing a fresh derivative is not: a
-/// cache miss additionally spends from `image_generations`, and a video
-/// thumbnail — which drives an FFmpeg process — spends from the much
-/// stricter `video_generations` instead. The tiers are independent budgets,
-/// not a hierarchy: exhausting one does not touch the others.
+/// Processed-cache hits bypass all tiers. A miss spends from `requests` and
+/// additionally from `image_generations` or `video_generations`. The tiers
+/// are independent budgets, not a hierarchy.
 pub struct MediaRateLimiters {
     requests: IpRateLimiter,
     image_generations: IpRateLimiter,
@@ -146,8 +143,7 @@ impl MediaRateLimiters {
         }
     }
 
-    /// Charge the general per-request budget. Call once per request, before
-    /// the cache lookup.
+    /// Charge the general per-request budget after a processed-cache miss.
     pub fn admit_request(&self, ip: IpAddr) -> Result<(), SvcError> {
         self.requests.admit(ip, 1)
     }

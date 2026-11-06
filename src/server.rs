@@ -893,10 +893,6 @@ async fn handle_thumb_request(
             return Ok(resp);
         }
     }
-    state
-        .media_rate_limits
-        .admit_request(peer_ip)
-        .inspect_err(|_| metrics::record_rate_limit_rejection("request"))?;
 
     // Get author servers if pubkey provided
     let author_servers = if let Some(pubkey) = hints.author_pubkey {
@@ -925,7 +921,9 @@ async fn handle_thumb_request(
         state.app.cfg.max_server_hints,
     );
 
-    if ext_is_video {
+    // A bare hash may also identify a video: try its origin-scoped entry
+    // before discovery, without making cache hits consume a request budget.
+    if ext_is_video || ext.is_none() {
         if let Some(resp) = serve_cached_video(
             &state,
             &blob_name,
@@ -939,6 +937,10 @@ async fn handle_thumb_request(
             return Ok(resp);
         }
     }
+    state
+        .media_rate_limits
+        .admit_request(peer_ip)
+        .inspect_err(|_| metrics::record_rate_limit_rejection("request"))?;
 
     let discovered = match state.blossom.discover_blob_urls(&hash).await {
         Ok(urls) => urls,
@@ -958,20 +960,6 @@ async fn handle_thumb_request(
     // those before defaulting to "image" and silently failing every video.
     let is_video =
         ext_is_video || (ext.is_none() && discovered.iter().any(|url| is_video_url(url)));
-    if is_video && !ext_is_video {
-        if let Some(resp) = serve_cached_video(
-            &state,
-            &blob_name,
-            &dirs,
-            &servers,
-            &request_headers,
-            hit_policy,
-        )
-        .await?
-        {
-            return Ok(resp);
-        }
-    }
     metrics::record_cache_miss("processed");
 
     state

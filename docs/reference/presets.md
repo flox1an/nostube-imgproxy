@@ -95,8 +95,7 @@ reintroduce it in a browser integration.
 
 There are three per-client budgets: general requests (`600/min`),
 image-generation misses (`30/min`) and video-generation misses (`5/min`).
-Processed image hits bypass these checks. Video cache hits skip generation
-but may consume the general request tier before origin lookup. A processed
+Processed image and origin-matched video hits bypass these checks. A processed
 miss can consume a generation budget even if the original is cached or it
 joins an existing flight. Budgets are local to one process.
 

@@ -97,6 +97,11 @@ Negative-cache entries live in memory only (per candidate URL, up to 10,000
 entries). A repeated request skips an unexpired failed candidate but still
 tries newly supplied or discovered ones.
 
+Author server lists and NIP-94 discovery results, including failed lookups,
+are cached in memory per process; entries are refreshed after their respective
+TTLs. A cold or expired author lookup may contact relays before a video cache
+hit can be identified.
+
 ## URL modes and signing
 
 | Variable | Default | Description |
@@ -118,7 +123,7 @@ See [HTTP API](./reference/api.md#signed-urls) for the exact signing payload.
 
 | Variable | Default | Description |
 |---|---|---|
-| `RATE_IP_REQUESTS_PER_MIN` | `600` | General per-client admission budget. Processed image hits bypass it; video requests can consume it before their origin-scoped cache lookup. |
+| `RATE_IP_REQUESTS_PER_MIN` | `600` | General per-client admission budget for processed-cache misses. Cached image and origin-matched video thumbnails bypass it. |
 | `RATE_IP_IMAGE_GENERATIONS_PER_MIN` | `30` | Per-client budget for cache-miss image decode/resize/encode work. |
 | `RATE_IP_VIDEO_GENERATIONS_PER_MIN` | `5` | Per-client budget for cache-miss FFmpeg video-thumbnail work — the most expensive path. |
 | `TRUSTED_PROXY_CIDRS` | unset | Comma-separated CIDRs/IPs of reverse proxies (for Docker/Traefik: the shared Docker network's subnet, which survives proxy re-creation). Only when the TCP peer is inside this list is `X-Forwarded-For` read; the client identity becomes the rightmost non-trusted hop. Unset, the TCP peer is the client. IPv6 clients are bucketed per /64. |
