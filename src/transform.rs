@@ -1,4 +1,7 @@
-use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, Limits};
+use std::cell::RefCell;
+
+use fast_image_resize::{FilterType as FirFilter, ResizeAlg, ResizeOptions, Resizer};
+use image::{DynamicImage, GenericImageView, ImageFormat, Limits};
 use percent_encoding::percent_decode_str;
 use rgb::FromSlice;
 
@@ -249,10 +252,13 @@ pub fn apply_resize(
 /// The one place a resize actually allocates, and therefore the one place the
 /// allocation is budgeted.
 ///
-/// `imageops::resize` allocates an `Rgba32F` intermediate of `src_w × new_h` at
-/// 16 bytes per pixel regardless of the source colour type, plus the destination
-/// buffer. Neither is covered by `Limits::max_alloc`, which only bounds the
-/// decoder's own framebuffer.
+/// `fast_image_resize` keeps its intermediate in a row buffer of about
+/// `src_w × new_h × 4` bytes (one output row per source column band), plus the
+/// destination buffer. Neither is covered by `Limits::max_alloc`, which only
+/// bounds the decoder's own framebuffer. The estimate below is the old
+/// `imageops::resize` bound (`Rgba32F`, 16 B/px) kept unchanged: it is 4x
+/// conservative for the new backend, and keeping it means the set of rejected
+/// targets does not silently widen.
 fn resize_checked(
     img: DynamicImage,
     new_w: u32,
@@ -281,7 +287,28 @@ fn resize_checked(
         }
     }
 
-    Ok(img.resize_exact(new_w, new_h, FilterType::Lanczos3))
+    let mut dst = DynamicImage::new(new_w, new_h, img.color());
+    RESIZER
+        .with(|resizer| {
+            // Lanczos3, same filter as before. The one visible difference from
+            // `imageops::resize` is `mul_div_alpha` (default on): RGBA sources
+            // are premultiplied before sampling, so transparent pixels no
+            // longer bleed their RGB into the edges of the opaque region.
+            resizer.borrow_mut().resize(
+                &img,
+                &mut dst,
+                &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FirFilter::Lanczos3)),
+            )
+        })
+        .map_err(|error| SvcError::InternalError(format!("resize failed: {error}")))?;
+    Ok(dst)
+}
+
+thread_local! {
+    /// One `Resizer` per `CpuPool` worker thread: it owns the scratch buffer
+    /// every resize writes through, so rebuilding it per request would
+    /// reallocate a `src_w × new_h` band on every call.
+    static RESIZER: RefCell<Resizer> = RefCell::new(Resizer::new());
 }
 
 /// Per-axis ceiling for a resize target, derived from the decoder limits so
@@ -845,6 +872,38 @@ mod tests {
             },
         );
         assert_eq!(out.dimensions(), (50, 40));
+    }
+
+    #[test]
+    fn resize_keeps_source_orientation() {
+        // Left-to-right ramp: value depends on x only. A transposed or flipped
+        // output buffer still has the requested dimensions, so geometry-only
+        // assertions cannot see it.
+        let ramp = DynamicImage::ImageRgb8(image::RgbImage::from_fn(256, 256, |x, _| {
+            image::Rgb([x as u8, x as u8, x as u8])
+        }));
+        let out = resized(
+            ramp,
+            &Resize {
+                mode: ResizeMode::Fit,
+                w: 64,
+                h: 64,
+            },
+        )
+        .to_rgb8();
+
+        let left = out.get_pixel(6, 32)[0];
+        let right = out.get_pixel(57, 32)[0];
+        assert!(left < 40, "left edge should stay dark, got {left}");
+        assert!(right > 215, "right edge should stay bright, got {right}");
+        // Constant along y by construction; allow 1 LSB of filter rounding.
+        for y in 0..64 {
+            let sample = out.get_pixel(32, y)[0];
+            assert!(
+                sample.abs_diff(out.get_pixel(32, 0)[0]) <= 1,
+                "column 32 varies with y at row {y}: {sample}"
+            );
+        }
     }
 
     #[test]
