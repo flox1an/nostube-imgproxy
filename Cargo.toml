@@ -11,7 +11,6 @@ tower = { version = "0.5", features = ["limit", "load-shed"] }
 tower-http = { version = "0.7", features = ["cors", "timeout", "trace", "limit", "catch-panic"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync", "process", "signal", "net"] }
 http = "1"
-hyper = { version = "1", features = ["http1", "server"] }
 # `rustls-no-provider` (not `rustls`) is deliberate: `rustls` pulls the
 # aws-lc-rs provider, while nostr-sdk's websocket stack pulls ring. Both
 # unify onto one rustls, leaving the process-level CryptoProvider ambiguous
@@ -54,12 +53,10 @@ ipnet = "2"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-mime = "0.3"
 walkdir = "2"
 tempfile = "3"
 nostr-sdk = "0.45"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 prometheus = "0.14"
 lazy_static = "1.5"
 # Direct dep for `O_NOFOLLOW` in `write_cache_atomic` symlink hardening

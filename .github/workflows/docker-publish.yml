@@ -49,6 +49,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+      # Fails on a dependency declared in Cargo.toml but never referenced in
+      # source (how fs2, hyper, mime and serde_json slipped in). False positive?
+      # List it under [package.metadata.cargo-machete] ignored = [...].
+      - name: Unused dependencies
+        run: |
+          cargo install cargo-machete --locked --version 0.10.1
+          cargo machete
+
       - name: Build
         run: cargo build --release --locked
 
