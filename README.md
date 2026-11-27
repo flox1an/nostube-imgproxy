@@ -72,4 +72,4 @@ in `docs/agents/` are intentionally excluded from the site.
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
