@@ -67,6 +67,17 @@ libc = "0.2"
 url = "2"
 lofty = "0.25.1"
 
+# Single source of truth for local `cargo clippy` and CI. `unsafe_code` is
+# `deny`, not `forbid`, so the two FFI sites (`prctl`, `pre_exec`) can opt out
+# with a written reason while any new `unsafe` still fails the build.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

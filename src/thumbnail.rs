@@ -752,6 +752,11 @@ where
     output
 }
 
+// `pre_exec` is `unsafe` because the closure runs between `fork` and `exec`.
+#[allow(
+    unsafe_code,
+    reason = "pre_exec; closure is async-signal-safe, see SAFETY below"
+)]
 #[cfg(unix)]
 fn apply_ffmpeg_limits(
     command: &mut tokio::process::Command,
@@ -760,6 +765,9 @@ fn apply_ffmpeg_limits(
     use std::os::unix::process::CommandExt;
 
     let cpu_seconds = timeout.as_secs().saturating_add(1).max(1);
+    // SAFETY: the closure runs in the forked child before `exec`, so it may only
+    // call async-signal-safe functions. It calls `setrlimit` (a plain syscall)
+    // and `last_os_error` (reads errno), and neither allocates or takes a lock.
     unsafe {
         command.as_std_mut().pre_exec(move || {
             // Darwin has no address-space rlimit: `setrlimit(RLIMIT_AS, …)`

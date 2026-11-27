@@ -154,6 +154,7 @@ fn init_tracing() {
 /// (signing keys, metrics token). Also suppresses core dumps of those secrets.
 /// Children are unaffected: `execve` resets the flag.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code, reason = "single prctl FFI call, see SAFETY below")]
 fn set_non_dumpable() {
     // SAFETY: prctl with plain integer arguments touches no Rust memory.
     let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
