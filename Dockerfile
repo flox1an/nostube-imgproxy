@@ -108,6 +108,9 @@ RUN mkdir -p /cache/original /cache/processed && \
 # Copy binary from builder
 COPY --from=builder /app/target/release/rust-imgproxy /usr/local/bin/rust-imgproxy
 
+# MIT requires the notice to accompany copies of the software, binary included.
+COPY LICENSE /usr/share/licenses/rust-imgproxy/LICENSE
+
 # Switch to non-root user
 USER imgproxy
 
