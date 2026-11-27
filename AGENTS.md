@@ -13,7 +13,9 @@
 
 ## Coding Style & Naming Conventions
 - Rust 2021 + async-first patterns; keep modules focused and avoid God files bigger than ~400 lines.
-- Run `cargo fmt --all` and `cargo clippy --all-targets --all-features` before pushing; fix clippy warnings instead of allowing them.
+- Run `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings` before pushing; CI runs the same and fails on any warning. Fix warnings instead of allowing them.
+- Lint levels live in `[lints]` in `Cargo.toml`. `unsafe_code` is `deny`: a new `unsafe` block needs `#[allow(unsafe_code, reason = "...")]` plus a `// SAFETY:` comment, as in `main.rs` (`prctl`) and `thumbnail.rs` (`pre_exec`).
+- `cargo deny check` enforces `deny.toml` (licence allowlist, crates.io-only sources, wildcard bans); a new licence needs a conscious entry there. `cargo machete` fails on an unused dependency; list a false positive under `[package.metadata.cargo-machete] ignored`.
 - Use snake_case for functions/modules, SCREAMING_SNAKE_CASE for env vars (`CACHE_TTL_SECS`), and prefer descriptive struct names like `CacheEntry` over abbreviations.
 
 ## Testing Guidelines

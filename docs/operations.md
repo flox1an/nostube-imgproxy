@@ -170,7 +170,8 @@ for hash verification; see [video thumbnails](./guide/how-it-works.md#video-thum
 ## Supply chain
 
 - Images are built from the committed `Cargo.lock` with `--locked`; CI runs
-  tests and `cargo audit` before `docker-build` may publish.
+  `rustfmt`, `clippy -D warnings`, `cargo-machete`, tests, `cargo audit` and
+  `cargo deny` (licences, sources, bans) before `docker-build` may publish.
 - The `:main` tag moves on every push and on a daily scheduled rebuild (fresh
   Debian/FFmpeg security updates). Pin an image digest if deployments must
   be reproducible; then schedule redeploys to pick up base-image fixes.

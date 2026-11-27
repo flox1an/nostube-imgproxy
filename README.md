@@ -43,7 +43,9 @@ commands and writable-cache permissions.
 ```bash
 cargo test --locked
 cargo fmt --all
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo deny check
+cargo machete
 ```
 
 The public preset API needs no signing or minting request. Arbitrary-directive
