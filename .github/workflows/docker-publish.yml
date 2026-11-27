@@ -39,6 +39,15 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: stable
+          components: rustfmt, clippy
+
+      # Lint gates run before the expensive release build so a style or clippy
+      # failure is reported in seconds. Lint levels live in [lints] in Cargo.toml.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Build
         run: cargo build --release --locked
