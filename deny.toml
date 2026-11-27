@@ -1,0 +1,52 @@
+# cargo-deny policy. Complements `cargo audit` (CVEs only) with licence, source
+# and duplicate-version checks. Run locally: `cargo deny check`.
+
+[graph]
+# Match what actually ships; avoids flagging crates only built for other OSes.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+# Default scope: unmaintained/unsound advisories only for direct dependencies.
+# Hard vulnerabilities are denied for the whole tree. The transitive
+# unmaintained/unsound warnings (paste via lofty, heapless via nostr-sdk ->
+# faster-hex) are reported by `cargo audit` in CI, whose ignore list stays in
+# .cargo/audit.toml. Switch to `unmaintained = "all"` / `unsound = "all"` here
+# once those upstreams are fixed, and the ignore moves into this file.
+
+[licenses]
+# Allowlist derived from `cargo deny list`; a new licence fails CI and needs a
+# conscious decision. Dual-licensed crates pass if any one option is allowed
+# (r-efi offers MIT OR Apache-2.0 OR LGPL; libfuzzer-sys is
+# (MIT OR Apache-2.0) AND NCSA, so NCSA is required).
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "NCSA",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+# Transitive duplicates (rand, getrandom, thiserror, tower-http via reqwest, ...)
+# come from nostr-sdk and reqwest and cannot be resolved from here. Warn so a
+# new one is visible in the output, but do not block on it.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
