@@ -106,10 +106,10 @@ RUN mkdir -p /cache/original /cache/processed && \
     chown -R imgproxy:imgproxy /cache
 
 # Copy binary from builder
-COPY --from=builder /app/target/release/rust-imgproxy /usr/local/bin/rust-imgproxy
+COPY --from=builder /app/target/release/nostube-imgproxy /usr/local/bin/nostube-imgproxy
 
 # MIT requires the notice to accompany copies of the software, binary included.
-COPY LICENSE /usr/share/licenses/rust-imgproxy/LICENSE
+COPY LICENSE /usr/share/licenses/nostube-imgproxy/LICENSE
 
 # Switch to non-root user
 USER imgproxy
@@ -129,8 +129,8 @@ EXPOSE 8081
 # Health check. Follows BIND_ADDR's port, so a deployment overriding it
 # (e.g. 0.0.0.0:8080) does not leave the container permanently unhealthy.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/rust-imgproxy", "--healthcheck"]
+    CMD ["/usr/local/bin/nostube-imgproxy", "--healthcheck"]
 
 # Run the binary
-CMD ["/usr/local/bin/rust-imgproxy"]
+CMD ["/usr/local/bin/nostube-imgproxy"]
 

@@ -23,9 +23,9 @@
       "version": "1.0.0"
     }
   ],
-  "uid": "rust-imgproxy",
-  "title": "rust-imgproxy",
-  "description": "Metrics for rust-imgproxy (nostube-imgproxy): traffic, latency, cache, processing, bytes, security.",
+  "uid": "nostube-imgproxy",
+  "title": "Nostube Image Proxy",
+  "description": "Metrics for nostube-imgproxy: traffic, latency, cache, processing, bytes, security.",
   "tags": ["imgproxy", "rust"],
   "timezone": "browser",
   "editable": true,

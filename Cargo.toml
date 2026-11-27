@@ -1,5 +1,5 @@
 [package]
-name = "rust-imgproxy"
+name = "nostube-imgproxy"
 version = "0.1.44"
 license = "MIT"
 edition = "2021"

@@ -88,7 +88,7 @@ Verify on the host after deploying:
 docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} capdrop={{.HostConfig.CapDrop}} secopt={{.HostConfig.SecurityOpt}} pids={{.HostConfig.PidsLimit}} mem={{.HostConfig.Memory}} tmpfs={{.HostConfig.Tmpfs}}' <container>
 docker exec <container> sh -c 'touch /probe' # must fail: read-only file system
 docker exec <container> cat /proc/1/environ  # must fail: permission denied (non-dumpable)
-docker exec <container> rust-imgproxy --healthcheck && echo healthy
+docker exec <container> nostube-imgproxy --healthcheck && echo healthy
 curl -fsS https://<public-name>/health        # OK
 
 Then request one image and one video thumbnail through the public name: both
@@ -117,7 +117,7 @@ So:
   bits.
 - Coolify's **HTTP** health check runs `curl`/`wget` inside the container,
   and the image ships neither. For a Docker-image application choose check
-  type **CMD** with command `/usr/local/bin/rust-imgproxy --healthcheck`
+  type **CMD** with command `/usr/local/bin/nostube-imgproxy --healthcheck`
   ([docs](https://coolify.io/docs/applications/configuration/health-checks)).
   Only with a health check does the rolling update wait for the new
   container to become healthy before it stops the old one; without it

@@ -49,8 +49,8 @@ use a private Docker network instead. See [Operations](../operations.md).
 To build the image locally instead of pulling the published image:
 
 ```bash
-docker build -t rust-imgproxy .
-docker run --rm -p 127.0.0.1:8080:8081 -v imgproxy-cache:/cache rust-imgproxy
+docker build -t nostube-imgproxy .
+docker run --rm -p 127.0.0.1:8080:8081 -v imgproxy-cache:/cache nostube-imgproxy
 ```
 
 ## Build the binary
@@ -80,7 +80,7 @@ directories at startup. Set environment variables before starting; no
 
 ```bash
 BIND_ADDR=127.0.0.1:3000 MAX_FFMPEG_CONCURRENT=4 \
-  ./target/release/rust-imgproxy
+  ./target/release/nostube-imgproxy
 ```
 
 ## Make a request

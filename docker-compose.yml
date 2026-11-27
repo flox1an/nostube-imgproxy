@@ -1,11 +1,11 @@
 services:
-  rust-imgproxy:
+  nostube-imgproxy:
     image: ghcr.io/flox1an/nostube-imgproxy:main
     pull_policy: always
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: rust-imgproxy
+    container_name: nostube-imgproxy
     restart: unless-stopped
     # Hardening — see docs/operations.md. The service writes only /cache and /tmp.
     read_only: true

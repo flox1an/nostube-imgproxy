@@ -1,8 +1,8 @@
-# CLAUDE.md - rust-imgproxy
+# CLAUDE.md - nostube-imgproxy
 
 ## Project Overview
 
-**rust-imgproxy** is a minimal, fast image resizing service written in Rust, inspired by imgproxy. It provides an imgproxy-compatible URL API (insecure mode) for on-the-fly image and video thumbnail processing.
+**nostube-imgproxy** is a minimal, fast image resizing service written in Rust, inspired by imgproxy. It provides an imgproxy-compatible URL API (insecure mode) for on-the-fly image and video thumbnail processing.
 
 ### Core Functionality
 - Image resizing and format conversion (JPEG, PNG, WebP, AVIF)
@@ -162,8 +162,8 @@ make cache-stats
 
 ```bash
 # Build and run
-docker build -t rust-imgproxy .
-docker run -p 8080:8080 -v $(pwd)/cache:/cache rust-imgproxy
+docker build -t nostube-imgproxy .
+docker run -p 8080:8080 -v $(pwd)/cache:/cache nostube-imgproxy
 
 # Or use docker-compose
 docker-compose up -d

@@ -281,7 +281,7 @@ impl AppState {
             .redirect(guarded_redirect_policy())
             .dns_resolver(public_dns_resolver())
             .no_proxy()
-            .user_agent("rust-imgproxy/0.1")
+            .user_agent("nostube-imgproxy/0.1")
             .build()
             .expect("reqwest client");
 

@@ -1819,6 +1819,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "nostube-imgproxy"
+version = "0.1.44"
+dependencies = [
+ "axum",
+ "axum-extra",
+ "base64 0.23.1",
+ "bytes",
+ "fast_image_resize",
+ "futures-util",
+ "hex",
+ "hmac",
+ "http",
+ "image",
+ "ipnet",
+ "lazy_static",
+ "libc",
+ "lofty",
+ "nostr-sdk",
+ "parking_lot",
+ "percent-encoding",
+ "prometheus",
+ "ravif",
+ "reqwest",
+ "rgb",
+ "rustls",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "walkdir",
+ "webp",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2329,47 +2370,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rust-imgproxy"
-version = "0.1.44"
-dependencies = [
- "axum",
- "axum-extra",
- "base64 0.23.1",
- "bytes",
- "fast_image_resize",
- "futures-util",
- "hex",
- "hmac",
- "http",
- "image",
- "ipnet",
- "lazy_static",
- "libc",
- "lofty",
- "nostr-sdk",
- "parking_lot",
- "percent-encoding",
- "prometheus",
- "ravif",
- "reqwest",
- "rgb",
- "rustls",
- "serde",
- "sha2",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http 0.7.1",
- "tracing",
- "tracing-subscriber",
- "url",
- "walkdir",
- "webp",
 ]
 
 [[package]]

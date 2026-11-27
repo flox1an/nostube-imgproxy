@@ -6,7 +6,7 @@ use std::{
 };
 use tracing::info;
 
-use rust_imgproxy::{
+use nostube_imgproxy::{
     blossom::{BlossomState, CandidateFailureCache},
     cache::janitor_loop,
     config::{AppCfg, AppState, DEFAULT_BIND_ADDR},
@@ -161,7 +161,7 @@ fn set_non_dumpable() {
     assert_eq!(rc, 0, "prctl(PR_SET_DUMPABLE, 0) failed");
 }
 
-/// `rust-imgproxy --healthcheck`: GET /health on the local listener. Lets the
+/// `nostube-imgproxy --healthcheck`: GET /health on the local listener. Lets the
 /// runtime image ship without curl, an HTTP client an attacker could reuse.
 fn healthcheck() -> bool {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());

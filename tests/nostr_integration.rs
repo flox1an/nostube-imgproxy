@@ -8,7 +8,7 @@
 //! with `cargo test -- --ignored --test-threads=1`.
 
 use nostr_sdk::prelude::*;
-use rust_imgproxy::blossom::{
+use nostube_imgproxy::blossom::{
     authoritative_server_list_events, best_event, blob_urls_from_events, combine_server_lists,
     extract_blossom_hash, normalize_server_url, parse_blossom_filename, parse_pubkey,
     servers_from_event,
@@ -538,7 +538,7 @@ async fn spawn_not_found_server() -> (
 
 #[tokio::test]
 async fn fetch_blob_truncates_candidate_list() {
-    use rust_imgproxy::blossom::{fetch_blob, CandidateFailureCache};
+    use nostube_imgproxy::blossom::{fetch_blob, CandidateFailureCache};
     use std::time::{Duration, Instant};
 
     // Five reachable (but 404-ing) hosts; the cap must limit the fan-out even
@@ -551,7 +551,7 @@ async fn fetch_blob_truncates_candidate_list() {
         counters.push(requests);
     }
 
-    rust_imgproxy::init_crypto_provider();
+    nostube_imgproxy::init_crypto_provider();
     let mut client = reqwest::Client::builder();
     let mut servers = Vec::new();
     for (index, address) in addresses.iter().enumerate() {
@@ -673,7 +673,7 @@ async fn live_relays_resolve_a_kind_10063_server_list() {
 #[tokio::test]
 #[ignore = "requires public relay network access"]
 async fn live_blossom_state_resolves_a_real_author_server_list() {
-    rust_imgproxy::init_crypto_provider();
+    nostube_imgproxy::init_crypto_provider();
 
     // Discover an author that actually publishes a kind-10063 list, so the
     // test does not depend on one hard-coded pubkey staying alive.
@@ -702,12 +702,12 @@ async fn live_blossom_state_resolves_a_real_author_server_list() {
         return;
     };
 
-    let state = rust_imgproxy::blossom::BlossomState::new(
+    let state = nostube_imgproxy::blossom::BlossomState::new(
         std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(10),
-        rust_imgproxy::blossom::CandidateFailureCache::new(
+        nostube_imgproxy::blossom::CandidateFailureCache::new(
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(60),

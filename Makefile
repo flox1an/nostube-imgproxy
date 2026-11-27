@@ -1,6 +1,6 @@
 .PHONY: build run test docker-build docker-run docker-compose-up docker-compose-down clean cve-check
 
-IMAGE ?= rust-imgproxy:latest
+IMAGE ?= nostube-imgproxy:latest
 
 # Build release binary
 build:
@@ -16,7 +16,7 @@ check:
 
 # Build Docker image
 docker-build:
-	docker build -t rust-imgproxy:latest .
+	docker build -t nostube-imgproxy:latest .
 
 # Fail on HIGH/CRITICAL OS CVEs that have a fixed package available (needs trivy)
 cve-check:
@@ -24,7 +24,7 @@ cve-check:
 
 # Run Docker container
 docker-run:
-	docker run -p 8080:8080 -v $$(pwd)/cache:/cache rust-imgproxy:latest
+	docker run -p 8080:8080 -v $$(pwd)/cache:/cache nostube-imgproxy:latest
 
 # Start with docker-compose
 docker-compose-up:

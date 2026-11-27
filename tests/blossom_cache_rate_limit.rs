@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use rust_imgproxy::{
+use nostube_imgproxy::{
     blossom::{BlossomState, CandidateFailureCache},
     cache::{cache_path_for, derivative_cache_key, THUMB_ROUTE},
     config::{AppCfg, AppState},

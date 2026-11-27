@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build script for rust-imgproxy
+# Build script for nostube-imgproxy
 # Ensures meson/ninja are in PATH for AVIF support
 
 # Add common locations for meson/ninja to PATH
